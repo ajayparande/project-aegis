@@ -9,8 +9,9 @@ Deliver: Python package, configuration validation, structured logging, SQLite sc
 Exit gate: clean install from documented instructions; CI passes.
 
 ## M2 — Market-data pipeline
-Deliver: provider adapter interface, one approved data source, instrument master handling, ingestion and quality checks.
-Exit gate: timestamps/timezones correct; duplicate/missing/stale data detected; provenance stored; source terms checked.
+Deliver: instrument master and local historical CSV ingestion with exact decimal prices, import provenance, row validation, deterministic duplicate handling, and dashboard visibility.
+Exit gate for local ingestion: migration preserves prior data; timestamps and decimal serialization are deterministic; malformed and duplicate records are diagnosed; imports are reproducible from their checksums.
+Remaining M2 gate: define an exchange calendar and stale-data policy, and verify permissions before selecting an external source. No provider adapter or external feed is introduced by the local CSV milestone.
 
 ## M3 — Strategy research laboratory
 Deliver: strategy specification format, baseline strategies for research, experiment registry and reproducible runs.

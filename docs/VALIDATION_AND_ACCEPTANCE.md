@@ -7,6 +7,18 @@
 - Reproducible environment and documented setup.
 - CI must pass before merge.
 
+## Historical CSV ingestion acceptance
+- Migrate a version 4 database transactionally to version 5 without changing existing instruments, imports, legacy market_data rows, or quality issues.
+- Store newly imported OHLC prices only as canonical decimal text in historical_candles; do not write imported prices to legacy REAL columns.
+- Reject non-positive or malformed prices, invalid OHLC relationships, invalid volume, naive/misaligned timestamps, unsupported intervals, unknown instruments, and inactive instruments.
+- Enforce tick alignment only when an exact, non-legacy tick size is present; otherwise report that tick validation was not applied.
+- Make imports idempotent through the candle identity constraint. Preserve previously accepted candles on duplicate or overlapping imports and report all duplicates.
+- Persist checksum, filename basename, instrument identity, interval, timestamps, status, row counts, rejected-row context, and import errors.
+- Roll back candle and row-issue writes on unexpected batch failure while retaining a failed import record.
+- Exercise local CSV fixtures and dashboard tests only with temporary database and log paths.
+
+This milestone does not claim missing-session, exchange-calendar, market-hours-close, or stale-feed validation. Those checks require explicit calendar/source policy before they can be acceptance criteria.
+
 ## Quantitative research quality
 Every candidate report must include:
 - Data source, licence/terms status, date range, interval and universe definition.

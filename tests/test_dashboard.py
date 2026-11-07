@@ -1,13 +1,15 @@
 """Smoke tests for the Aegis Streamlit dashboard."""
 
 import hashlib
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from aegis.database import initialize_database
+from aegis.database import get_connection, initialize_database
 from aegis.instruments import InstrumentInput, register_instrument
+from aegis.market_data import import_ohlcv_csv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_FILE = PROJECT_ROOT / "app.py"
@@ -44,6 +46,7 @@ def test_dashboard_starts_without_errors(isolated_app_paths) -> None:
     app = AppTest.from_file(str(APP_FILE)).run()
 
     assert not app.exception
+    assert any("No historical candles are stored yet" in item.value for item in app.info)
 
 
 def test_dashboard_displays_project_title(isolated_app_paths) -> None:
@@ -95,3 +98,50 @@ def test_dashboard_shows_instrument_master_summary_and_details(isolated_app_path
     assert metrics["Active Instruments"] == "1"
     assert metrics["Inactive Instruments"] == "0"
     assert len(app.dataframe) == 1
+
+
+def test_dashboard_shows_historical_csv_import_and_candle_overview(
+    isolated_app_paths, tmp_path
+) -> None:
+    database_path, _ = isolated_app_paths
+    initialize_database(database_path)
+    register_instrument(
+        database_path,
+        InstrumentInput(
+            exchange="NSE",
+            trading_symbol="TCS",
+            instrument_name="Tata Consultancy Services",
+            instrument_type="EQUITY",
+        ),
+    )
+    csv_path = tmp_path / "historical.csv"
+    csv_path.write_text(
+        "timestamp,open,high,low,close,volume\n"
+        "2026-01-05T09:15:00+05:30,100.10,101.20,99.90,100.50,1000\n",
+        encoding="utf-8",
+    )
+    result = import_ohlcv_csv(database_path, csv_path, "NSE", "TCS", "1m")
+    assert result.accepted_rows == 1
+    with closing(get_connection(database_path)) as connection:
+        instrument_id = connection.execute(
+            "SELECT id FROM instruments WHERE trading_symbol = 'TCS'"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO market_data (
+                   instrument_id, interval, candle_timestamp, open, high, low, close
+               ) VALUES (?, '1d', '2026-01-04T00:00:00Z', 100, 101, 99, 100)""",
+            (instrument_id,),
+        )
+        connection.commit()
+
+    app = AppTest.from_file(str(APP_FILE)).run(timeout=10)
+
+    assert not app.exception
+    assert "Historical Data / CSV Import" in [item.value for item in app.subheader]
+    metrics = {item.label: item.value for item in app.metric}
+    assert metrics["Historical Candles"] == "1"
+    assert metrics["Instrument / Interval Series"] == "1"
+    assert metrics["Legacy REAL Rows Preserved"] == "1"
+    assert any("excluded from the exact-decimal CSV view" in item.value for item in app.warning)
+    assert any("Recent CSV import history" in item.value for item in app.markdown)
+    assert len(app.dataframe) >= 3

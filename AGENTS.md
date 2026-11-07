@@ -49,23 +49,24 @@ Deterministic Python components handle market data, data validation, strategy re
 
 ## Current database
 
-- Schema version: 4.
-- Tables: `sources`, `hypotheses`, `strategies`, `experiments`, `runs`, `schema_metadata`, `instruments`, `data_imports`, `market_data`, and `data_quality_issues`.
+- Schema version: 5.
+- Tables: sources, hypotheses, strategies, experiments, runs, schema_metadata, instruments, data_imports, market_data, data_quality_issues, and historical_candles.
 - Preserve migration history and all existing records.
+- New historical OHLC prices belong in historical_candles as canonical decimal text; do not use SQLite REAL for new financial price storage.
+- The legacy market_data REAL table is preserved and is not used by the CSV importer.
+- Migrated REAL-derived instrument tick sizes cannot recover their original decimal input and require authoritative verification before financial use.
 
 ## Current development phase
 
 Phase 1 foundation is complete. Phase 2 Market Data Foundation is in progress.
 
-The provider-neutral Instrument Master for NSE and BSE is complete.
+The provider-neutral Instrument Master for NSE and BSE and local historical CSV OHLCV ingestion are complete.
 
 Next objectives:
 
-1. Historical OHLCV storage and retrieval.
-2. CSV/mock data ingestion.
-3. Data-quality validation.
-4. Import provenance.
-5. Dashboard integration for market data.
+1. Exchange-calendar and missing-bar validation.
+2. Stale-data policy for dependent workflows.
+3. Broader market-data dashboard and source-permission workflow.
 
 Do not implement Zerodha connectivity yet.
 

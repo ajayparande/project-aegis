@@ -3,7 +3,7 @@
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 PHASE_1_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -157,6 +157,46 @@ ON data_quality_issues (import_id, severity);
             "UPDATE instruments SET tick_size_decimal = CAST(tick_size AS TEXT) "
             "WHERE tick_size IS NOT NULL"
         ),
+    ),
+    4: (
+        "ALTER TABLE data_imports ADD COLUMN instrument_id INTEGER REFERENCES instruments(id)",
+        "ALTER TABLE data_imports ADD COLUMN original_filename TEXT",
+        "ALTER TABLE data_imports ADD COLUMN file_sha256 TEXT",
+        "ALTER TABLE data_imports ADD COLUMN requested_exchange TEXT",
+        "ALTER TABLE data_imports ADD COLUMN requested_trading_symbol TEXT",
+        "ALTER TABLE data_imports ADD COLUMN interval TEXT",
+        "ALTER TABLE data_imports ADD COLUMN total_rows INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE data_imports ADD COLUMN accepted_rows INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE data_imports ADD COLUMN rejected_rows INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE data_imports ADD COLUMN skipped_rows INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE data_imports ADD COLUMN duplicate_rows INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE data_imports ADD COLUMN same_file_reimport INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE data_imports ADD COLUMN error_summary TEXT",
+        "ALTER TABLE data_quality_issues ADD COLUMN source_row_number INTEGER",
+        """
+CREATE TABLE historical_candles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instrument_id INTEGER NOT NULL,
+    import_id INTEGER NOT NULL,
+    interval TEXT NOT NULL CHECK (interval IN ('1m', '5m', '15m', '1h', '1d')),
+    candle_timestamp TEXT NOT NULL,
+    open_decimal TEXT NOT NULL,
+    high_decimal TEXT NOT NULL,
+    low_decimal TEXT NOT NULL,
+    close_decimal TEXT NOT NULL,
+    volume INTEGER NOT NULL CHECK (typeof(volume) = 'integer' AND volume >= 0),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (instrument_id) REFERENCES instruments(id),
+    FOREIGN KEY (import_id) REFERENCES data_imports(id),
+    UNIQUE (instrument_id, interval, candle_timestamp)
+);
+
+CREATE INDEX idx_historical_candles_import
+ON historical_candles (import_id);
+
+CREATE INDEX idx_data_imports_file_identity
+ON data_imports (file_sha256, requested_exchange, requested_trading_symbol, interval, status);
+""",
     ),
 }
 
