@@ -1,7 +1,7 @@
 # Phase 2 — Market Data
 
 ## Goal
-Add a provider-neutral market-data interface and one verified, permitted source.
+Establish a provider-neutral, auditable market-data foundation. External data may only be used after its source, permitted use, licensing, and technical constraints have been verified.
 
 ## Tasks
 
@@ -21,16 +21,25 @@ Add a provider-neutral market-data interface and one verified, permitted source.
 - [x] Record file checksum, filename, instrument, interval, status, timestamps, row counts, and row-level quality issues.
 - [x] Add deterministic migration, validation, duplicate, rollback, provenance, and dashboard tests.
 
-### Remaining Phase 2 work
-- [ ] Define and verify permitted data-source use before using files from any external source.
-- [ ] Add an exchange calendar/session policy for missing bars, holidays, and market-hours validation.
-- [ ] Add stale-data rules for workflows that consume historical datasets.
-- [ ] Consider a provider adapter or read-only feed only after requirements and permitted use are reviewed.
+### Stage 4 — Exchange sessions and quality implemented
+- [x] Add local exchange/segment session configuration with explicit source, confidence, and date coverage.
+- [x] Support holidays, non-trading weekdays, breaks, exceptional sessions, and early closes without bundling fabricated calendar data.
+- [x] Calculate completed expected candle starts for supported intervals using Stage 3 timestamp semantics.
+- [x] Report confirmed/provisional missing and unexpected candles, invalid values, duplicates, and dataset coverage read-only.
+- [x] Add explicit-`as_of` staleness checks with configurable completed-candle thresholds.
+- [x] Add deterministic calendar, boundary, quality, staleness, read-only, and dashboard tests.
+
+### Remaining work
+- [ ] Verify and document the permitted use, licensing, entitlements, rate limits, and retention rules for any proposed external market-data source.
+- [ ] Verify and maintain an official calendar dataset before claiming official calendar coverage.
+- [ ] Add a provider adapter or read-only live feed only in a separately scoped milestone after source approval.
+- [ ] Integrate stale-data and calendar-confidence status with dependent strategy and execution workflows; fail closed when required data quality is insufficient.
 
 ## Acceptance criteria
 - Imported timestamps are timezone-aware, normalized to UTC, and checked against documented interval alignment.
-- Exchange-calendar gaps and stale feeds remain outstanding and must be visible or fail closed before dependent workflows are built.
+- Calendar-dependent results remain insufficient/provisional without complete verified calendar coverage; dependent workflows fail closed on that status.
 - Dataset provenance and source terms are documented.
 - Tests use mocks/fixtures and cannot submit broker orders.
+- No external data source is treated as free or permitted without verification.
 
-Stage 3 completes local CSV OHLCV ingestion, not all of Phase 2. Calendar-aware gap validation, stale-data policy, and source permissions remain outstanding.
+Stages 3 and 4 provide local CSV ingestion and a configurable calendar-aware quality engine. They do not provide an approved live market-data feed or complete official calendar coverage.

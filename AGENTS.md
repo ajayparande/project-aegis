@@ -55,18 +55,20 @@ Deterministic Python components handle market data, data validation, strategy re
 - New historical OHLC prices belong in historical_candles as canonical decimal text; do not use SQLite REAL for new financial price storage.
 - The legacy market_data REAL table is preserved and is not used by the CSV importer.
 - Migrated REAL-derived instrument tick sizes cannot recover their original decimal input and require authoritative verification before financial use.
+- Exchange calendars are local JSON in `config/exchange_calendars.json`; the checked-in configuration intentionally has no claimed official holiday coverage.
+- Calendar-dependent reports must preserve `CONFIGURED` versus `CONFIRMED` versus unavailable status and must not score incomplete coverage.
 
 ## Current development phase
 
 Phase 1 foundation is complete. Phase 2 Market Data Foundation is in progress.
 
-The provider-neutral Instrument Master for NSE and BSE and local historical CSV OHLCV ingestion are complete.
+The provider-neutral Instrument Master for NSE and BSE, local historical CSV OHLCV ingestion, and session-aware data-quality analysis are implemented. No verified exchange holiday dataset is bundled.
 
 Next objectives:
 
-1. Exchange-calendar and missing-bar validation.
-2. Stale-data policy for dependent workflows.
-3. Broader market-data dashboard and source-permission workflow.
+1. Maintain locally verified NSE/BSE session and holiday coverage before using confirmed completeness reports.
+2. Integrate freshness and quality gates into future dependent workflows.
+3. Verify market-data source permissions and extend the data-quality dashboard as needed.
 
 Do not implement Zerodha connectivity yet.
 

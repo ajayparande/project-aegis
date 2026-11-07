@@ -1,4 +1,4 @@
-﻿# Phase 1 — Foundation
+# Phase 1 — Foundation
 
 ## Goal
 Create a secure, reproducible local Python project skeleton. No market connection or trading functionality.

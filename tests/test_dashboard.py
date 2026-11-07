@@ -145,3 +145,35 @@ def test_dashboard_shows_historical_csv_import_and_candle_overview(
     assert any("excluded from the exact-decimal CSV view" in item.value for item in app.warning)
     assert any("Recent CSV import history" in item.value for item in app.markdown)
     assert len(app.dataframe) >= 3
+
+
+def test_dashboard_shows_unconfigured_calendar_without_claiming_completeness(
+    isolated_app_paths,
+) -> None:
+    database_path, _ = isolated_app_paths
+    initialize_database(database_path)
+    register_instrument(
+        database_path,
+        InstrumentInput(
+            exchange="NSE",
+            trading_symbol="TCS",
+            instrument_name="Tata Consultancy Services",
+            instrument_type="EQUITY",
+            segment="NSE",
+        ),
+    )
+    app = AppTest.from_file(str(APP_FILE)).run(timeout=10)
+
+    assert not app.exception
+    assert "Market Data Quality and Exchange Sessions" in [item.value for item in app.subheader]
+    assert any("Exchange calendars are unavailable" in item.value for item in app.warning)
+    analyze_button = next(
+        item for item in app.button if item.label == "Analyze market-data quality"
+    )
+    analyze_button.click().run(timeout=10)
+    assert not app.exception
+    assert any("NSE:TCS" in item.value for item in app.markdown)
+    assert any(
+        item.label == "Completeness" and item.value == "Insufficient information"
+        for item in app.metric
+    )

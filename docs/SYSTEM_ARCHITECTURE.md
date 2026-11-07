@@ -22,7 +22,7 @@ The local historical importer stores new OHLCV rows in the additive historical_c
 
 The CSV header is timestamp,open,high,low,close,volume. Exchange, trading symbol, and interval are import arguments. Prices use plain base-10 text without exponent notation; trailing fractional zeroes are removed for canonical storage without rounding. Volume is a non-negative base-10 integer within SQLite's signed integer range.
 
-Timestamps must be ISO-8601 date-times with an explicit UTC offset and whole-minute precision. They are converted to Asia/Kolkata for alignment, then stored as UTC ISO text in YYYY-MM-DDTHH:MM:SSZ form. Intraday intervals (1m, 5m, 15m, 1h) align from 09:15 Asia/Kolkata. Daily (1d) timestamps must be midnight Asia/Kolkata. No exchange-session calendar, holiday, gap, or stale-feed checks are made.
+Timestamps must be ISO-8601 date-times with an explicit UTC offset and whole-minute precision. They are converted to Asia/Kolkata for alignment, then stored as UTC ISO text in YYYY-MM-DDTHH:MM:SSZ form. Intraday intervals (1m, 5m, 15m, 1h) align from 09:15 Asia/Kolkata. Daily (1d) timestamps must be midnight Asia/Kolkata. Stage 4's separate quality analyzer evaluates these timestamps against local exchange/segment calendars; importing data does not itself prove calendar completeness.
 
 Only active registered instruments are imported. Tick alignment is checked only when an exact registry tick size is present and the legacy REAL tick_size is NULL. Migrated REAL-derived tick sizes are not considered reliable; alignment is skipped with that reason in the import result. Existing migrated values remain unchanged and must be verified against an authoritative source before financial use.
 
@@ -31,6 +31,14 @@ Duplicate policy is deterministic and non-overwriting: the first valid row for a
 Each import attempt stores the filename basename, SHA-256 checksum, requested and resolved instrument, interval, start/completion timestamps, status, row counts, duplicate counts, and error summary in data_imports. Rejected rows and duplicate rows are recorded in data_quality_issues with source row numbers. Candle inserts, row issues, and final import counts/status commit in one transaction. Unexpected transaction failures roll back the batch, then record the import as failed in a separate transaction.
 
 The dashboard labels this view historical CSV data, shows per-instrument/interval counts and coverage, recent import outcomes, quality issues, and a bounded exact-text candle table. It does not present the data as live.
+
+## Exchange sessions and market-data quality
+
+`src/aegis/market_quality.py` loads local, version-controlled exchange/segment calendar rules from `config/exchange_calendars.json`. The checked-in calendar list is empty because no verified official holiday/session dataset is available in the repository. The report distinguishes unavailable, configured-but-unverified, partially covered, and fully covered confirmed calendars. Calendar records retain their source note and declared coverage; an administrator is responsible for verification and updates. No holiday is inferred or fabricated.
+
+The analyzer is read-only against SQLite. It uses Stage 3's UTC start timestamps and 09:15 Asia/Kolkata intraday alignment, the exclusive session close, and midnight Asia/Kolkata daily labels. Early closes clip the final expected interval; an in-progress clipped candle is not counted until the close. Session breaks create separate windows. Ambiguous/nonexistent local session wall times and intraday sessions before the Stage 3 09:15 anchor fail analysis rather than being guessed or silently skipped.
+
+Missing/unexpected candle findings are confirmed only on dates covered by a confirmed calendar. Configured calendars produce provisional findings; uncovered dates are not called missing. A completeness percentage is calculated only with full confirmed coverage and a nonzero completed-candle denominator. Overall quality status follows the deterministic rules in `docs/EXCHANGE_CALENDAR_CONFIGURATION.md`. Freshness requires an explicit timezone-aware `as_of`; configurable thresholds count missing completed expected candles so closed hours, weekends, and configured holidays do not age data by wall-clock time. No external service or database migration is required.
 
 ## AI roles (logical roles, not necessarily separate models)
 - Research librarian: summarises cited educational material.

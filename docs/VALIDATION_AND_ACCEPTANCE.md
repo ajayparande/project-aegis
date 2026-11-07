@@ -17,7 +17,17 @@
 - Roll back candle and row-issue writes on unexpected batch failure while retaining a failed import record.
 - Exercise local CSV fixtures and dashboard tests only with temporary database and log paths.
 
-This milestone does not claim missing-session, exchange-calendar, market-hours-close, or stale-feed validation. Those checks require explicit calendar/source policy before they can be acceptance criteria.
+## Exchange calendar and market-data quality acceptance
+- Load local exchange-and-segment-specific calendar configuration without external dependencies; an empty calendar configuration is explicitly unavailable.
+- Do not infer official holidays or claim complete coverage without a declared, administrator-verified source and date range.
+- Calculate expected 1m, 5m, 15m, 1h, and 1d candle starts within configured sessions, breaks, holidays, and exceptional sessions while preserving Stage 3 timestamp labels.
+- Exclude in-progress intervals and handle clipped final intervals at early closes deterministically.
+- Analyze stored candle data read-only; report missing, unexpected, invalid, duplicate, and previously rejected/imported rows without changing candles or provenance.
+- Require an explicit timezone-aware `as_of`; use configurable completed-candle gap thresholds for freshness.
+- Return no completeness percentage when calendar coverage is unavailable, provisional, partial for the requested range, or has a zero expected denominator.
+- Run dashboard tests with isolated temporary database and log paths.
+
+Calendar results remain limited by administrator-supplied coverage and source verification. Calendar configuration does not establish external data permissions or official completeness by itself.
 
 ## Quantitative research quality
 Every candidate report must include:

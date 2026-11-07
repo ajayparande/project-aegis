@@ -1,6 +1,8 @@
 """Project Aegis - local research dashboard."""
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -17,6 +19,7 @@ from aegis.market_data import (
     list_quality_issues,
     list_recent_imports,
 )
+from aegis.market_quality import analyze_dataset, load_calendar_registry
 
 settings = get_settings()
 logger = setup_logging(
@@ -320,12 +323,179 @@ else:
 
 st.divider()
 
+st.subheader("Market Data Quality and Exchange Sessions")
+st.caption(
+    "Session-aware completeness and freshness analysis. Results depend on the local calendar's "
+    "declared coverage and verification status."
+)
+
+if database_healthy:
+    try:
+        calendar_path = Path(__file__).resolve().parent / "config" / "exchange_calendars.json"
+        calendar_registry = load_calendar_registry(calendar_path)
+        if not calendar_registry.calendars:
+            st.warning(
+                "Exchange calendars are unavailable. No holidays or session coverage are "
+                "assumed; missing-candle counts and completeness scores cannot be confirmed."
+            )
+        else:
+            st.caption(f"Loaded {len(calendar_registry.calendars)} exchange/segment calendar(s).")
+
+        active_instruments = [item for item in all_instruments if item.is_active]
+        quality_labels = {
+            f"{item.exchange}:{item.trading_symbol}": item for item in active_instruments
+        }
+        local_today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        with st.form("market_quality_analysis"):
+            quality_col, interval_col, date_col = st.columns([2, 1, 3])
+            quality_label = quality_col.selectbox(
+                "Quality instrument",
+                list(quality_labels) or ["No active instruments"],
+                disabled=not quality_labels,
+            )
+            quality_interval = interval_col.selectbox("Quality interval", SUPPORTED_INTERVALS)
+            selected_dates = date_col.date_input(
+                "Quality date range",
+                value=(local_today - timedelta(days=6), local_today),
+            )
+            quality_submitted = st.form_submit_button("Analyze market-data quality")
+
+        if quality_submitted:
+            if (
+                quality_label not in quality_labels
+                or not isinstance(selected_dates, tuple)
+                or len(selected_dates) != 2
+            ):
+                st.error("Select an active instrument and a complete start/end date range.")
+            else:
+                selected_quality_instrument = quality_labels[quality_label]
+                try:
+                    report = analyze_dataset(
+                        settings.database_path,
+                        selected_quality_instrument.exchange,
+                        selected_quality_instrument.trading_symbol,
+                        quality_interval,
+                        selected_dates[0],
+                        selected_dates[1],
+                        as_of=datetime.now(UTC),
+                        calendars=calendar_registry,
+                    )
+                except Exception:
+                    logger.exception("Market-data quality analysis failed")
+                    st.error("Quality analysis failed. Check the calendar configuration and logs.")
+                else:
+                    st.write(
+                        "**Selected dataset:**",
+                        f"{report.exchange}:{report.trading_symbol} · {report.interval} · "
+                        f"{report.requested_start} through {report.requested_end}",
+                    )
+                    st.write(
+                        "**Calendar:**",
+                        f"{report.calendar_status} coverage / {report.calendar_confidence} "
+                        f"confidence · source: {report.calendar_source or 'not configured'} · "
+                        f"{report.calendar_coverage_start or '—'} to "
+                        f"{report.calendar_coverage_end or '—'}",
+                    )
+                    quality_metrics = st.columns(4)
+                    expected_value = (
+                        str(report.expected_candles)
+                        if report.expected_candles is not None
+                        else (
+                            (
+                                f"Through as_of: {report.provisional_expected_candles}"
+                                if report.calendar_confidence == "CONFIRMED"
+                                else f"Provisional: {report.provisional_expected_candles}"
+                            )
+                            if report.provisional_expected_candles is not None
+                            else "Unavailable"
+                        )
+                    )
+                    quality_metrics[0].metric(
+                        "Expected Completed Candles",
+                        expected_value,
+                    )
+                    quality_metrics[1].metric("Actual Candles", report.actual_candles)
+                    quality_metrics[2].metric(
+                        "Missing / Unexpected",
+                        f"{len(report.missing_timestamps)} / {len(report.unexpected_timestamps)}"
+                        if report.calendar_confidence == "CONFIRMED"
+                        else f"Provisional {len(report.provisional_missing_timestamps)} / "
+                        f"{len(report.provisional_unexpected_timestamps)}",
+                    )
+                    quality_metrics[3].metric(
+                        "Completeness",
+                        f"{report.completeness_percentage}%"
+                        if report.completeness_percentage is not None
+                        else "Insufficient information",
+                    )
+                    st.write(
+                        "**Freshness:**",
+                        f"{report.staleness_status} · "
+                        f"{report.missing_completed_candles_since_latest if report.missing_completed_candles_since_latest is not None else '—'} "
+                        "completed expected candle(s) after the latest available one",
+                    )
+                    st.write("**Overall quality:**", report.overall_status)
+                    trading_day_label = (
+                        "**Expected trading days (confirmed):**"
+                        if report.calendar_confidence == "CONFIRMED"
+                        else "**Configured trading days (provisional):**"
+                        if report.calendar_confidence == "CONFIGURED"
+                        else "**Expected trading days:**"
+                    )
+                    st.write(
+                        trading_day_label,
+                        report.expected_trading_days
+                        if report.expected_trading_days is not None
+                        else "Unavailable",
+                        "· **Actual data days:**",
+                        report.actual_trading_days,
+                    )
+                    st.write(
+                        "**First / last valid candle:**",
+                        f"{report.first_candle_timestamp or '—'} / "
+                        f"{report.last_candle_timestamp or '—'}",
+                    )
+                    if report.reasons:
+                        for reason in report.reasons:
+                            st.caption(f"• {reason}")
+                    if report.missing_timestamps or report.provisional_missing_timestamps:
+                        shown_missing = (
+                            report.missing_timestamps or report.provisional_missing_timestamps
+                        )
+                        st.write(
+                            "**Missing expected candles (first 100):**", list(shown_missing[:100])
+                        )
+                    if report.unexpected_timestamps or report.provisional_unexpected_timestamps:
+                        shown_unexpected = (
+                            report.unexpected_timestamps or report.provisional_unexpected_timestamps
+                        )
+                        st.write(
+                            "**Unexpected candles (first 100):**", list(shown_unexpected[:100])
+                        )
+                    st.caption(
+                        "Duplicate identities: "
+                        f"{report.duplicate_identity_count}; duplicate imported rows: "
+                        f"{report.duplicate_import_row_count}; invalid stored candles: "
+                        f"{report.invalid_candle_count}; rejected import rows: "
+                        f"{report.rejected_import_row_count}; rejected rows without usable "
+                        f"timestamps: {report.unlocated_rejected_import_row_count}."
+                    )
+    except Exception:
+        logger.exception("Market-data quality view could not be initialized")
+        st.error(
+            "Market-data quality analysis is unavailable. Check calendar configuration and logs."
+        )
+else:
+    st.info("Market-data quality analysis is unavailable while the database is unavailable.")
+
+st.divider()
+
 st.subheader("Development Status")
 
 st.info(
     "Phase 2 Market Data Foundation in progress. "
-    "Instrument Master and local historical CSV ingestion are available. "
-    "Exchange-calendar gap checks and broader data workflows remain outstanding."
+    "Instrument Master, local historical CSV ingestion, and session-aware quality analysis are available. "
+    "Verified calendar coverage and broader data workflows remain outstanding."
 )
 
 st.caption("Project Aegis | Local development | No paid services required")

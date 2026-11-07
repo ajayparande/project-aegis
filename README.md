@@ -1,92 +1,44 @@
-# Project Aegis
-## AI-assisted quantitative trading research and paper-trading platform
+# Project Aegis — Task Index
 
-Project Aegis is a controlled research platform for Indian-market strategy research. AI agents assist with learning, hypothesis generation, experiment analysis, and software development. Deterministic Python components handle market-data processing, backtesting, risk checks, and simulated execution.
+This folder contains milestone-specific implementation instructions and acceptance criteria. The roadmap and architecture documents elsewhere in the repository remain the broader product-level references.
 
-**Initial objective:** Build a reproducible research and paper-trading system within an initial total budget ceiling of ₹10,000.
+## Intended execution order
 
-**Important:** Project Aegis starts in research-only mode. It must not place live orders. No strategy is assumed profitable. Live trading is out of scope until separate validation, regulatory/broker checks, and explicit human approval.
+| Order | Task file | Purpose |
+|---:|---|---|
+| 1 | `PHASE_01_FOUNDATION.md` | Local project foundation — completed |
+| 2 | `PHASE_02_MARKET_DATA.md` | Instrument Master, historical ingestion, exchange sessions and data quality |
+| 3 | `PHASE_03_STRATEGY_LAB.md` | Versioned strategy research and deterministic signals |
+| 4 | `PHASE_04_BACKTESTING.md` | Chronological simulation and performance measurement |
+| 5 | `PHASE_05_ML_RESEARCH.md` | Optional, evidence-gated ML research |
+| 6 | `PHASE_06_PAPER_TRADING.md` | Deterministic simulated broker and portfolio ledger |
+| 7 | `PHASE_07_AI_AGENT_AND_TOOL_FRAMEWORK.md` | Provider-independent LLM integration and controlled tool calling |
+| 8 | `PHASE_08_LIVE_DATA_FORWARD_PAPER_TRADING.md` | 30–60 trading days of live-data forward paper trading |
+| 9 | `PHASE_09_CLOUD_DEPLOYMENT_AND_RELIABILITY.md` | VPS deployment, monitoring, backups and recovery testing |
+| 10 | `PHASE_10_LIVE_READINESS.md` | Final independent go/no-go assessment; no automatic activation |
 
-## Non-negotiable principles
+## Execution and safety modes
 
-1. No live orders in the initial release.
-2. No claim of profitability without reproducible out-of-sample evidence.
-3. Include brokerage, taxes/charges where applicable, slippage, liquidity, and execution assumptions in tests.
-4. Never expose broker/API credentials in source code, logs, notebooks, prompts, or Git history.
-5. AI agents cannot change risk limits, approve their own work, or enable live execution.
-6. All experiments, datasets, code versions, assumptions, and results must be recorded.
-7. Fail closed: stale data, missing data, API errors, unexpected state, or failed checks stop the relevant workflow.
-8. Preserve the ₹10,000 budget ceiling. No paid service is activated without a documented need and user approval.
+**`RESEARCH_ONLY` is the only currently available application mode.** The application
+does not connect to a broker and has no live order-placement path.
 
-## Default technical decisions
+- `PAPER_TRADING` is planned for a later phase and is not implemented or available.
+- `LIVE_TRADING` is not implemented and remains unavailable. Phase 10 is an assessment,
+  not authorization or activation; any implementation would require a separate, explicit
+  approval.
 
-- Language: Python.
-- Development: local computer first.
-- Source control: Git and GitHub.
-- Data/analysis: pandas, NumPy, scikit-learn.
-- Storage: SQLite initially; PostgreSQL only if justified later.
-- Dashboard: Streamlit.
-- Agent orchestration: begin with simple Python workflows; evaluate LangGraph only when workflows need it.
-- LLM: one low-cost API model with hard usage limits; model-provider adapter keeps it replaceable.
-- Broker: Zerodha Kite Connect may be integrated for data after current pricing, API access, data-use, and regulatory requirements are verified.
-- Initial execution: custom paper-trading simulator; no live order endpoint.
+No AI agent, automated workflow, deployment, or configuration update may switch the
+application to paper or live execution.
 
-## Milestone sequence
+## Cross-cutting rules
 
-1. Requirements, repository, and secure development foundation.
-2. Market-data ingestion and data-quality controls.
-3. Strategy research and experiment registry.
-4. Event-aware backtesting with costs.
-5. Out-of-sample validation and robustness checks.
-6. Paper trading with live market data.
-7. Monitoring, reporting, and operational review.
-8. Separate live-readiness assessment (not automatic activation).
-
-See `docs/DEVELOPMENT_ROADMAP.md` and `tasks/` for acceptance criteria.
-
-## Start here
-
-Read these in order:
-
-1. `docs/PROJECT_VISION.md`
-2. `docs/PRODUCT_REQUIREMENTS.md`
-3. `docs/SYSTEM_ARCHITECTURE.md`
-4. `docs/BUDGET_AND_COST_CONTROLS.md`
-5. `docs/RISK_MANAGEMENT.md`
-6. `docs/VALIDATION_AND_ACCEPTANCE.md`
-7. `docs/DEVELOPMENT_ROADMAP.md`
-
-## Current status
-
-**Phase 1 — Foundation: implementation completed; local tests and quality checks passed, and GitHub Actions CI reported green.**
-
-Implemented foundation includes:
-
-- Python package and project configuration.
-- `.gitignore` and safe `.env.example`.
-- Typed configuration restricted to `RESEARCH_ONLY`.
-- Structured JSON logging with basic secret redaction.
-- SQLite database schema for research records, instruments, and market-data storage.
-- Streamlit system-status dashboard.
-- Automated pytest tests.
-- Ruff linting and formatting, and MyPy type checks.
-- GitHub Actions CI with Gitleaks secret scanning and `.gitignore` validation.
-
-**Current development phase: Phase 2 — Market Data Foundation.**
-
-The provider-neutral Instrument Master is implemented for NSE and BSE. It supports equities, indexes, futures, and options; registration, lookup, filtering, metadata updates, search, and validated bulk import; and exact decimal text storage for tick size and strike price. The dashboard shows instrument counts, exchange distribution, filters, search, and instrument details.
-
-Local historical OHLCV CSV ingestion is implemented for registered active NSE/BSE instruments. Stage 3 adds version 5 of the SQLite schema and stores newly imported candles in the historical_candles table using canonical decimal text. The earlier market_data table and its REAL values are preserved unchanged; the CSV importer does not write to that legacy table.
-
-CSV columns are timestamp, open, high, low, close, and volume; select exchange, symbol, and interval when importing. Prices must be plain base-10 decimal strings (no exponent notation), and volume must be a non-negative integer. Example:
-
-    timestamp,open,high,low,close,volume
-    2026-01-05T09:15:00+05:30,100.10,101.20,99.90,100.50,1200
-
-Timestamps require an ISO-8601 timezone offset. Intraday starts are aligned from 09:15 Asia/Kolkata for 1m, 5m, 15m, and 1h intervals; 1d timestamps must be midnight Asia/Kolkata. Stored timestamps are UTC ISO text ending in Z. The importer checks OHLC relationships, positive prices, integer volume, interval alignment, and—only for exact registry tick sizes that are not legacy REAL-derived—price alignment to tick size.
-
-Within one CSV, the first valid row for a candle identity wins. Existing candles are never overwritten: duplicate identities are skipped and counted. Reimporting identical file bytes is identified by SHA-256; overlapping files are identified by candle identity, so new candles can still be added. Import history stores filename (not its absolute path), checksum, requested and resolved instrument, interval, row counts, status, timestamps, and error summary. Invalid rows and duplicates are retained in data-quality issue records with source row numbers.
-
-This is local historical file ingestion only. No market calendar, exchange holiday, missing-session/gap, or stale-feed validation is implemented. Users are responsible for verifying source permissions and confirming migrated legacy tick sizes against an authoritative source before financial use. Stage 3 does not complete all Phase 2 work.
-
-No broker connection, live market-data integration, live orders, or automated trading is enabled.
+- Python services are authoritative for calculations, portfolio accounting, risk checks and execution controls.
+- LLMs provide bounded reasoning, research assistance and explanations; they cannot bypass deterministic controls.
+- Keep LLM providers interchangeable and external model inference optional.
+- Do not assume market data, APIs, hosting, or other services are free or permitted; verify terms and costs first.
+- Keep local Windows development supported and design for later cloud deployment without requiring cloud infrastructure now.
+- Do not introduce unnecessary GPUs, Kubernetes, distributed services, or paid dependencies without a demonstrated need and explicit approval.
+- Preserve reproducibility, provenance, auditability, strategy versioning and fail-closed behaviour.
+- Never claim profitability based only on backtesting or a limited paper-trading sample.
+- A task marked incomplete must not be represented as implemented. Update checkboxes only after implementation and verification.
+- Do not commit or push unless explicitly authorised.
