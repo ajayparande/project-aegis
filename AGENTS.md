@@ -49,7 +49,7 @@ Deterministic Python components handle market data, data validation, strategy re
 
 ## Current database
 
-- Schema version: 5.
+- Schema version: 6.
 - Tables: sources, hypotheses, strategies, experiments, runs, schema_metadata, instruments, data_imports, market_data, data_quality_issues, and historical_candles.
 - Preserve migration history and all existing records.
 - New historical OHLC prices belong in historical_candles as canonical decimal text; do not use SQLite REAL for new financial price storage.
@@ -60,7 +60,8 @@ Deterministic Python components handle market data, data validation, strategy re
 
 ## Current development phase
 
-Phase 1 foundation is complete. Phase 2 Market Data Foundation is in progress.
+Phase 1 foundation is complete. Phase 2 Market Data Foundation remains in progress, and
+Phase 3 Strategy Lab is in progress.
 
 The provider-neutral Instrument Master for NSE and BSE, local historical CSV OHLCV ingestion, and session-aware data-quality analysis are implemented. No verified exchange holiday dataset is bundled.
 
@@ -69,6 +70,7 @@ Next objectives:
 1. Maintain locally verified NSE/BSE session and holiday coverage before using confirmed completeness reports.
 2. Integrate freshness and quality gates into future dependent workflows.
 3. Verify market-data source permissions and extend the data-quality dashboard as needed.
+4. Complete deferred Phase 3 AI-assisted hypothesis drafting and isolated generated-code review only under its separately scoped safety controls.
 
 Do not implement Zerodha connectivity yet.
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -99,6 +100,7 @@ class CalendarRegistry:
 
     calendars: tuple[ExchangeCalendar, ...]
     staleness_policy: StalenessPolicy = StalenessPolicy()
+    configuration_sha256: str | None = None
 
     def resolve(self, exchange: str, segment: str | None) -> ExchangeCalendar | None:
         """Resolve by exact exchange/segment, then that exchange's explicit wildcard."""
@@ -321,7 +323,8 @@ def load_calendar_registry(config_path: Path) -> CalendarRegistry:
     if not config_path.exists():
         return CalendarRegistry(())
     try:
-        document = json.loads(config_path.read_text(encoding="utf-8"))
+        config_bytes = config_path.read_bytes()
+        document = json.loads(config_bytes.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CalendarConfigError(f"Cannot read calendar configuration: {exc}") from exc
     root = _required_mapping(document, "calendar configuration")
@@ -348,7 +351,11 @@ def load_calendar_registry(config_path: Path) -> CalendarRegistry:
         policy = StalenessPolicy(cast(int, potential_after), cast(int, stale_after))
     except ValueError as exc:
         raise CalendarConfigError(str(exc)) from exc
-    return CalendarRegistry(calendars, policy)
+    return CalendarRegistry(
+        calendars,
+        policy,
+        hashlib.sha256(config_bytes).hexdigest(),
+    )
 
 
 def _strict_local_datetime(day: date, local_time: time, timezone: ZoneInfo) -> datetime:

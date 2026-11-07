@@ -18,7 +18,7 @@ The Instrument Master is implemented in `src/aegis/instruments.py`. New registry
 
 ## Historical CSV ingestion
 
-The local historical importer stores new OHLCV rows in the additive historical_candles table introduced by schema version 5. Open, high, low, and close values use canonical decimal text; parsing, OHLC comparisons, and reliable tick checks use Decimal. The importer never writes imported prices to SQLite REAL columns. The pre-existing market_data table, including its REAL columns and records, remains untouched for compatibility and preservation.
+The local historical importer stores new OHLCV rows in the additive historical_candles table introduced by schema version 5. Schema version 6 adds nullable experiment-configuration hash and hash-origin columns. Open, high, low, and close values use canonical decimal text; parsing, OHLC comparisons, and reliable tick checks use Decimal. The importer never writes imported prices to SQLite REAL columns. The pre-existing market_data table, including its REAL columns and records, remains untouched for compatibility and preservation.
 
 The CSV header is timestamp,open,high,low,close,volume. Exchange, trading symbol, and interval are import arguments. Prices use plain base-10 text without exponent notation; trailing fractional zeroes are removed for canonical storage without rounding. Volume is a non-negative base-10 integer within SQLite's signed integer range.
 
@@ -31,6 +31,80 @@ Duplicate policy is deterministic and non-overwriting: the first valid row for a
 Each import attempt stores the filename basename, SHA-256 checksum, requested and resolved instrument, interval, start/completion timestamps, status, row counts, duplicate counts, and error summary in data_imports. Rejected rows and duplicate rows are recorded in data_quality_issues with source row numbers. Candle inserts, row issues, and final import counts/status commit in one transaction. Unexpected transaction failures roll back the batch, then record the import as failed in a separate transaction.
 
 The dashboard labels this view historical CSV data, shows per-instrument/interval counts and coverage, recent import outcomes, quality issues, and a bounded exact-text candle table. It does not present the data as live.
+
+## Strategy Lab (Phase 3)
+
+`src/aegis/strategy_lab.py` currently provides a versioned SMA-crossover specification and
+deterministic, Decimal-based long-only signal generation. SMA division uses a local precision
+of `max(28, integer_places + fractional_places + digits_in_input_count + 12)` significant
+digits and explicit `ROUND_HALF_EVEN`; non-terminating averages therefore have deterministic
+finite Decimal representations. Under Python's default Decimal context this pins the existing
+half-even behavior, while preventing callers' ambient rounding mode from changing signals.
+
+The runner consumes completed candles only and emits informational entry/exit signals at
+candle close; it does not calculate returns, simulate fills, size positions, alter risk
+limits, or submit orders. Registered specifications, experiment configuration snapshots,
+and run results use `strategies`, `hypotheses`, `experiments`, and `runs`. Schema version 6
+adds nullable `experiments.configuration_sha256` and `configuration_hash_origin` columns.
+New registrations store a SHA-256 of the canonical complete configuration separately from
+the JSON. A run verifies that hash and verifies that the duplicated strategy identity,
+instrument, interval, and dates agree before it creates a run record. Hashes detect a
+configuration edit when the separately stored hash is unchanged; they do not protect against
+a privileged actor changing both values. Existing Phase 3 configurations have no historical
+integrity guarantee: their hash remains NULL until the first structurally valid run attempt
+backfills it (even if the later market-quality gate blocks that attempt), and the run records
+`FIRST_RUN_BACKFILL` rather than claiming prior verification.
+
+Successful run provenance records strategy-spec and experiment-configuration hashes,
+strategy, market-quality, and historical-ingestion implementation source hashes, the raw
+calendar configuration hash and effective resolved calendar/session hash, dataset and
+source-file hashes, execution parameters, quality details, and a Git commit only when Git reports a clean worktree. Dirty
+or unavailable revision state is recorded explicitly without inventing a commit. Source
+hashes are calculated from files on disk; a running Python process may already have loaded
+code before those files change, so a disk hash is not guaranteed to identify the exact
+in-memory code that executed. Git revision and source hashes improve traceability but are
+not a complete executable-artifact attestation mechanism. Hashes also do not reconstruct
+source files, calendar snapshots, or candle data that are later lost or changed; preserve
+the corresponding versioned files and database backups for replay.
+Strategy versions remain immutable through the application registration API within their
+instrument and interval scope.
+
+Execution is fail-closed: a run requires a fully covered CONFIRMED calendar, COMPLETE
+quality status, 100% expected candle completeness, FRESH data, and no invalid or duplicate
+candles. The checked-in calendar is unconfigured, so runs are currently blocked until
+verified calendar coverage is maintained. Instrument selection reflects current registry
+membership only; historical index membership and survivorship-bias correction are not
+implemented. AI hypothesis drafting and generated-code evaluation are deferred; no generated
+code is executed.
+
+### Interrupted run reconciliation
+
+Run creation and completion are separate transactions so the database remains usable during
+analysis. An abrupt process termination can leave a `RUNNING` row. The application does not
+automatically fail such rows because another process may still own them. Since run rows do
+not record process IDs, first identify the run ID and `started_at` in `runs`, confirm that
+all Aegis application processes capable of owning it have terminated, and inspect the logs.
+Only then update that specific row with a statement constrained by both its ID and
+`status = 'RUNNING'`. Record that reconciliation was manual in `error_message`; never
+bulk-update RUNNING rows based only on age.
+
+After confirming termination, the targeted reconciliation has this form:
+
+```sql
+UPDATE runs
+SET status = 'FAILED', completed_at = CURRENT_TIMESTAMP,
+    error_message = 'Manually reconciled after confirming process termination'
+WHERE id = ? AND status = 'RUNNING';
+```
+
+### Manual strategy change review
+
+Before registering changed rules, write a change proposal with rationale and a new semantic
+version; independently review its specification and mathematical behavior; run unit and
+regression tests; confirm complete, fresh, valid data under a fully covered CONFIRMED
+calendar; obtain human approval for research registration; and link the proposal to the prior
+strategy version in the review record. Registration itself does not constitute approval.
+AI-generated code, autonomous approval, and execution are not part of this workflow.
 
 ## Exchange sessions and market-data quality
 

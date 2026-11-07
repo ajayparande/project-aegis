@@ -177,3 +177,41 @@ def test_dashboard_shows_unconfigured_calendar_without_claiming_completeness(
         item.label == "Completeness" and item.value == "Insufficient information"
         for item in app.metric
     )
+
+
+def test_dashboard_displays_research_only_strategy_lab(isolated_app_paths) -> None:
+    app = AppTest.from_file(str(APP_FILE)).run(timeout=10)
+
+    assert not app.exception
+    assert "Strategy Lab" in [item.value for item in app.subheader]
+    assert any("research signals only" in item.value for item in app.caption)
+    assert any("checked-in calendar is unconfigured" in item.value for item in app.caption)
+
+
+def test_dashboard_registers_experiment_in_isolated_database(isolated_app_paths) -> None:
+    database_path, _ = isolated_app_paths
+    initialize_database(database_path)
+    register_instrument(
+        database_path,
+        InstrumentInput(
+            exchange="NSE",
+            trading_symbol="TCS",
+            instrument_name="Tata Consultancy Services",
+            instrument_type="EQUITY",
+            segment="NSE",
+        ),
+    )
+
+    app = AppTest.from_file(str(APP_FILE)).run(timeout=10)
+    hypothesis_input = next(item for item in app.text_input if item.label == "Research hypothesis")
+    hypothesis_input.set_value("A deterministic dashboard hypothesis.")
+    register_button = next(
+        item for item in app.button if item.label == "Register SMA crossover experiment"
+    )
+    register_button.click().run(timeout=10)
+
+    assert not app.exception
+    assert any("Registered experiment" in item.value for item in app.success)
+    with closing(get_connection(database_path)) as connection:
+        experiment_count = connection.execute("SELECT COUNT(*) FROM experiments").fetchone()[0]
+    assert experiment_count == 1

@@ -1,6 +1,7 @@
 """Project Aegis - local research dashboard."""
 
-from datetime import UTC, datetime, timedelta
+import sqlite3
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -20,6 +21,13 @@ from aegis.market_data import (
     list_recent_imports,
 )
 from aegis.market_quality import analyze_dataset, load_calendar_registry
+from aegis.strategy_lab import (
+    StrategyLabError,
+    create_sma_crossover_spec,
+    list_strategy_experiments,
+    register_experiment,
+    run_strategy_experiment,
+)
 
 settings = get_settings()
 logger = setup_logging(
@@ -490,12 +498,190 @@ else:
 
 st.divider()
 
+st.subheader("Strategy Lab")
+st.caption(
+    "Phase 3 produces deterministic research signals only. It does not create orders, fills, "
+    "positions, returns, or profitability claims."
+)
+
+if database_healthy:
+    try:
+        eligible_instruments = [
+            instrument
+            for instrument in list_instruments(settings.database_path, is_active=True)
+            if instrument.instrument_type in {"EQUITY", "INDEX"}
+        ]
+        instrument_by_label = {
+            f"{instrument.exchange}:{instrument.trading_symbol} — {instrument.instrument_name}": instrument
+            for instrument in eligible_instruments
+        }
+        local_today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        with st.form("strategy_experiment_registration"):
+            register_col1, register_col2, register_col3 = st.columns([2, 1, 1])
+            selected_instrument_label = register_col1.selectbox(
+                "Strategy instrument",
+                list(instrument_by_label),
+                disabled=not instrument_by_label,
+            )
+            strategy_interval = register_col2.selectbox(
+                "Strategy interval", SUPPORTED_INTERVALS, index=2
+            )
+            fast_window = register_col3.number_input(
+                "Fast SMA window", min_value=2, max_value=500, value=5, step=1
+            )
+            slow_window = st.number_input(
+                "Slow SMA window", min_value=3, max_value=1000, value=20, step=1
+            )
+            hypothesis_text = st.text_input(
+                "Research hypothesis",
+                value="A short-window average crossing above a long-window average is a testable trend signal.",
+            )
+            evidence_text = st.text_area(
+                "Evidence references (optional; one URL or reference per line)", value=""
+            )
+            date_range_value = st.date_input(
+                "Historical experiment date range",
+                value=(local_today - timedelta(days=30), local_today),
+            )
+            register_submitted = st.form_submit_button(
+                "Register SMA crossover experiment", disabled=not instrument_by_label
+            )
+
+        if register_submitted:
+            if not isinstance(date_range_value, tuple) or len(date_range_value) != 2:
+                st.error("Select both a start and end date for the experiment.")
+            else:
+                selected_instrument = instrument_by_label[selected_instrument_label]
+                try:
+                    spec = create_sma_crossover_spec(
+                        exchange=selected_instrument.exchange,
+                        trading_symbol=selected_instrument.trading_symbol,
+                        instrument_type=selected_instrument.instrument_type,
+                        interval=strategy_interval,
+                        fast_window=int(fast_window),
+                        slow_window=int(slow_window),
+                        hypothesis=hypothesis_text,
+                        evidence_references=tuple(
+                            line.strip() for line in evidence_text.splitlines() if line.strip()
+                        ),
+                    )
+                    registration = register_experiment(
+                        settings.database_path,
+                        spec,
+                        start_date=date_range_value[0],
+                        end_date=date_range_value[1],
+                    )
+                except (StrategyLabError, sqlite3.Error) as exc:
+                    st.error(f"Experiment could not be registered: {exc}")
+                else:
+                    st.success(
+                        f"Registered experiment {registration.experiment_id}: "
+                        f"{registration.experiment_name}"
+                    )
+
+        experiments = list_strategy_experiments(settings.database_path)
+        if experiments:
+            experiment_by_id = {int(item["id"]): item for item in experiments}
+            with st.form("strategy_experiment_run"):
+                selected_experiment_id = st.selectbox(
+                    "Registered strategy experiment",
+                    list(experiment_by_id),
+                    format_func=lambda experiment_id: str(experiment_by_id[experiment_id]["name"]),
+                )
+                run_submitted = st.form_submit_button("Generate research signals")
+            if run_submitted:
+                selected_experiment = experiment_by_id[selected_experiment_id]
+                selected_instrument = next(
+                    (
+                        instrument
+                        for instrument in eligible_instruments
+                        if instrument.exchange == selected_experiment["exchange"]
+                        and instrument.trading_symbol == selected_experiment["trading_symbol"]
+                    ),
+                    None,
+                )
+                calendar_path = (
+                    Path(__file__).resolve().parent / "config" / "exchange_calendars.json"
+                )
+                calendar_registry = load_calendar_registry(calendar_path)
+                calendar = (
+                    calendar_registry.resolve(
+                        str(selected_experiment["exchange"]),
+                        selected_instrument.segment if selected_instrument is not None else None,
+                    )
+                    if selected_instrument is not None
+                    else None
+                )
+                timezone = ZoneInfo(
+                    calendar.timezone_name if calendar is not None else "Asia/Kolkata"
+                )
+                end_date = date.fromisoformat(str(selected_experiment["end_date"]))
+                now = datetime.now(UTC)
+                today = now.astimezone(timezone).date()
+                as_of = (
+                    now
+                    if end_date >= today
+                    else datetime.combine(end_date, time(23, 59, 59), tzinfo=timezone).astimezone(
+                        UTC
+                    )
+                )
+                try:
+                    run_result = run_strategy_experiment(
+                        settings.database_path,
+                        int(selected_experiment_id),
+                        calendars=calendar_registry,
+                        as_of=as_of,
+                    )
+                except Exception:
+                    logger.exception("Strategy signal research failed")
+                    st.error("Strategy run failed. Check the run record and application logs.")
+                else:
+                    if run_result.status == "BLOCKED":
+                        st.warning(
+                            f"Strategy run blocked by the data-quality gate: {run_result.reason}"
+                        )
+                    else:
+                        st.success(
+                            f"Run {run_result.run_id} completed with {len(run_result.signals)} "
+                            "research signal(s). No orders or fills were created."
+                        )
+                        st.dataframe(
+                            [
+                                {
+                                    "Timestamp (UTC)": signal.timestamp,
+                                    "Signal": signal.action,
+                                    "Close": str(signal.close),
+                                    "Fast SMA": str(signal.fast_sma),
+                                    "Slow SMA": str(signal.slow_sma),
+                                }
+                                for signal in run_result.signals
+                            ],
+                            hide_index=True,
+                            width="stretch",
+                        )
+        else:
+            st.info(
+                "Register an SMA crossover experiment to create an immutable research configuration."
+            )
+    except Exception:
+        logger.exception("Strategy Lab dashboard view failed")
+        st.error("Strategy Lab is unavailable. Check the application logs.")
+else:
+    st.info("Strategy Lab is unavailable while the database is unavailable.")
+
+st.caption(
+    "Runs require complete CONFIRMED calendar coverage and FRESH, 100% complete data. "
+    "The checked-in calendar is unconfigured, so current experiments will be blocked until verified coverage is supplied."
+)
+
+st.divider()
+
 st.subheader("Development Status")
 
 st.info(
-    "Phase 2 Market Data Foundation in progress. "
-    "Instrument Master, local historical CSV ingestion, and session-aware quality analysis are available. "
-    "Verified calendar coverage and broader data workflows remain outstanding."
+    "Phase 2 Market Data Foundation remains in progress; Phase 3 Strategy Lab is in progress. "
+    "Strategy Lab emits research signals only and requires verified calendar coverage. "
+    "No execution or profitability analysis is available."
 )
 
 st.caption("Project Aegis | Local development | No paid services required")

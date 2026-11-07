@@ -29,6 +29,15 @@
 
 Calendar results remain limited by administrator-supplied coverage and source verification. Calendar configuration does not establish external data permissions or official completeness by itself.
 
+## Strategy Lab reproducibility and auditability
+- Migrate schema version 5 to 6 additively by adding nullable experiment configuration hash and origin columns; retain all existing rows and leave legacy hashes unset until the first structurally valid run attempt (which may later be blocked by the data-quality gate).
+- Hash the canonical full experiment configuration separately from its JSON and verify it, plus internal identity consistency, before every run. A first-run legacy backfill establishes a baseline only from that point forward and must be labelled as such.
+- Persist SHA-256 hashes for the configuration, strategy specification and implementation, market-quality implementation, calendar input and effective session rules, dataset, and source files. Record the Git commit only for a clean worktree; explicitly identify unavailable or uncommitted revision state.
+- A hash can detect changed content when the stored hash is unchanged; it cannot protect against a privileged actor changing both, nor reconstruct files, calendar inputs, or market data that have been lost.
+- SMA uses a local Decimal precision of `max(28, integer_places + fractional_places + digits_in_input_count + 12)` significant digits and explicit `ROUND_HALF_EVEN`. Non-terminating averages are finite Decimal approximations at this precision; calculations do not quantize to tick size.
+- Do not automatically fail a `RUNNING` record based only on age. Reconcile manually only after confirming its owning process has stopped; update only the selected run ID conditional on its status remaining `RUNNING`, and record the manual reconciliation in its error message.
+- Changed strategy rules require a new version, written rationale, independent technical review, mathematical and regression testing, confirmed data-quality prerequisites, human approval, and a traceable link to the prior version before registration.
+
 ## Quantitative research quality
 Every candidate report must include:
 - Data source, licence/terms status, date range, interval and universe definition.

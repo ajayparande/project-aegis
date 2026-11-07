@@ -3,7 +3,7 @@
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 PHASE_1_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -197,6 +197,10 @@ ON historical_candles (import_id);
 CREATE INDEX idx_data_imports_file_identity
 ON data_imports (file_sha256, requested_exchange, requested_trading_symbol, interval, status);
 """,
+    ),
+    5: (
+        "ALTER TABLE experiments ADD COLUMN configuration_sha256 TEXT",
+        "ALTER TABLE experiments ADD COLUMN configuration_hash_origin TEXT",
     ),
 }
 
