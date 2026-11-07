@@ -3,9 +3,9 @@
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
-SCHEMA = """
+PHASE_1_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -60,6 +60,104 @@ CREATE TABLE IF NOT EXISTS schema_metadata (
 );
 """
 
+MIGRATIONS: dict[int, tuple[str, ...]] = {
+    1: (
+        """
+CREATE TABLE IF NOT EXISTS instruments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    exchange TEXT NOT NULL,
+    trading_symbol TEXT NOT NULL,
+    instrument_token TEXT,
+    instrument_name TEXT NOT NULL,
+    instrument_type TEXT NOT NULL,
+    segment TEXT,
+    lot_size INTEGER NOT NULL DEFAULT 1,
+    tick_size REAL,
+    expiry_date TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (exchange, trading_symbol)
+);
+
+CREATE TABLE IF NOT EXISTS data_imports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER,
+    import_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'CREATED',
+    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT,
+    records_received INTEGER NOT NULL DEFAULT 0,
+    records_inserted INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (source_id) REFERENCES sources(id)
+);
+
+CREATE TABLE IF NOT EXISTS market_data (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instrument_id INTEGER NOT NULL,
+    import_id INTEGER,
+    interval TEXT NOT NULL,
+    candle_timestamp TEXT NOT NULL,
+    open REAL NOT NULL,
+    high REAL NOT NULL,
+    low REAL NOT NULL,
+    close REAL NOT NULL,
+    volume INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (instrument_id) REFERENCES instruments(id),
+    FOREIGN KEY (import_id) REFERENCES data_imports(id),
+    UNIQUE (instrument_id, interval, candle_timestamp),
+    CHECK (open > 0),
+    CHECK (high > 0),
+    CHECK (low > 0),
+    CHECK (close > 0),
+    CHECK (volume >= 0),
+    CHECK (high >= low),
+    CHECK (high >= open AND high >= close),
+    CHECK (low <= open AND low <= close)
+);
+
+CREATE TABLE IF NOT EXISTS data_quality_issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id INTEGER,
+    instrument_id INTEGER,
+    interval TEXT,
+    issue_type TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'WARNING',
+    description TEXT NOT NULL,
+    affected_timestamp TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TEXT,
+    FOREIGN KEY (import_id) REFERENCES data_imports(id),
+    FOREIGN KEY (instrument_id) REFERENCES instruments(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_data_timestamp
+ON market_data (candle_timestamp);
+
+CREATE INDEX IF NOT EXISTS idx_data_imports_status
+ON data_imports (status);
+
+CREATE INDEX IF NOT EXISTS idx_quality_issues_import
+ON data_quality_issues (import_id, severity);
+""",
+    ),
+    2: (
+        "DROP INDEX IF EXISTS idx_market_data_lookup",
+        "DROP INDEX IF EXISTS idx_instruments_exchange",
+    ),
+}
+
+
+def _execute_statements(connection: sqlite3.Connection, script: str) -> None:
+    """Execute a semicolon-delimited schema script within the caller's transaction."""
+
+    for statement in script.split(";"):
+        if statement.strip():
+            connection.execute(statement)
+
 
 def get_connection(database_path: Path) -> sqlite3.Connection:
     """Create a safe SQLite connection and ensure its parent exists."""
@@ -76,18 +174,63 @@ def get_connection(database_path: Path) -> sqlite3.Connection:
 
 
 def initialize_database(database_path: Path) -> None:
-    """Create the Aegis database schema if it does not exist."""
+    """Create or upgrade the Aegis database schema."""
 
-    with get_connection(database_path) as connection:
-        connection.executescript(SCHEMA)
+    connection = get_connection(database_path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        table_names = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
 
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO schema_metadata (version)
-            VALUES (?)
-            """,
-            (SCHEMA_VERSION,),
-        )
+        if "schema_metadata" not in table_names:
+            existing_tables = table_names - {"sqlite_sequence"}
+            if existing_tables:
+                raise RuntimeError(
+                    "Database has tables but no schema_metadata; refusing to infer its version."
+                )
+            _execute_statements(connection, PHASE_1_SCHEMA)
+            connection.execute("INSERT INTO schema_metadata (version) VALUES (1)")
+
+        version_rows = connection.execute(
+            "SELECT version FROM schema_metadata ORDER BY version"
+        ).fetchall()
+        if not version_rows:
+            raise RuntimeError("Database schema_metadata contains no applied version.")
+
+        current_version = int(version_rows[-1]["version"])
+        if current_version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Database schema version {current_version} is newer than supported "
+                f"version {SCHEMA_VERSION}."
+            )
+        if current_version < 1:
+            raise RuntimeError(f"Unsupported database schema version {current_version}.")
+
+        while current_version < SCHEMA_VERSION:
+            statements = MIGRATIONS.get(current_version)
+            if statements is None:
+                raise RuntimeError(
+                    f"No migration is available from schema version {current_version}."
+                )
+            for statement in statements:
+                _execute_statements(connection, statement)
+            current_version += 1
+            connection.execute(
+                "INSERT INTO schema_metadata (version) VALUES (?)",
+                (current_version,),
+            )
+
+        connection.commit()
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def get_database_status(database_path: Path) -> dict[str, object]:
@@ -100,7 +243,8 @@ def get_database_status(database_path: Path) -> dict[str, object]:
             "tables": [],
         }
 
-    with get_connection(database_path) as connection:
+    connection = get_connection(database_path)
+    try:
         version_row = connection.execute(
             "SELECT MAX(version) AS version FROM schema_metadata"
         ).fetchone()
@@ -120,3 +264,5 @@ def get_database_status(database_path: Path) -> dict[str, object]:
             "schema_version": version_row["version"],
             "tables": [row["name"] for row in table_rows],
         }
+    finally:
+        connection.close()
