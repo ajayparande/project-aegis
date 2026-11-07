@@ -1,0 +1,94 @@
+# Project Aegis Development Instructions
+
+These instructions apply to all future development work in this repository.
+
+## Project purpose
+
+Project Aegis is a local, AI-assisted quantitative trading research and paper-trading platform for Indian markets.
+
+Deterministic Python components handle market data, data validation, strategy research, backtesting, risk management, and simulated execution. AI may assist with research, hypothesis generation, experiment analysis, and development. AI must never independently authorize or execute trades.
+
+## Mandatory safety rules
+
+- Keep the application in `RESEARCH_ONLY` mode.
+- Do not connect to Zerodha or another broker unless a separate live-readiness phase has been explicitly approved.
+- Never place live orders.
+- Never access, expose, or request broker credentials.
+- Never weaken risk controls.
+- Do not spend money or subscribe to paid services without explicit approval.
+- Never claim profitability or guaranteed returns.
+- Do not commit or push unless explicitly requested.
+- Never delete or recreate the user's database.
+- Protect existing research data.
+
+## Development environment
+
+- Windows 11 and PowerShell.
+- Python 3.11.
+- VS Code.
+- Local SQLite database.
+- Streamlit dashboard.
+- Use the existing project virtual environment.
+- Do not require Docker, WSL, Node.js, Kubernetes, or PostgreSQL.
+
+## Architecture and coding standards
+
+- Follow the existing `src/aegis` package structure.
+- Use type hints and clear docstrings.
+- Use `pathlib` for filesystem paths.
+- Use parameterized SQL queries.
+- Write deterministic, isolated tests.
+- Keep database access and business logic separate from the dashboard.
+- Never hardcode secrets.
+- Keep `.env.example` free of real credentials.
+- Use appropriate financial precision; do not rely on binary floating-point for financial calculations.
+- Review database migrations for transactional safety and data preservation.
+- Add tests for every new feature and regression.
+- Avoid unnecessary dependencies.
+- Dashboard tests must use temporary database and log paths and must not modify `data/aegis.db` or `logs/aegis.log`.
+
+## Current database
+
+- Schema version: 4.
+- Tables: `sources`, `hypotheses`, `strategies`, `experiments`, `runs`, `schema_metadata`, `instruments`, `data_imports`, `market_data`, and `data_quality_issues`.
+- Preserve migration history and all existing records.
+
+## Current development phase
+
+Phase 1 foundation is complete. Phase 2 Market Data Foundation is in progress.
+
+The provider-neutral Instrument Master for NSE and BSE is complete.
+
+Next objectives:
+
+1. Historical OHLCV storage and retrieval.
+2. CSV/mock data ingestion.
+3. Data-quality validation.
+4. Import provenance.
+5. Dashboard integration for market data.
+
+Do not implement Zerodha connectivity yet.
+
+## Required quality checks
+
+Run these before declaring a feature complete:
+
+```powershell
+python -m pytest -v
+python -m ruff check .
+python -m ruff format --check .
+python -m mypy src
+```
+
+Report actual results. Never claim a check passed unless it was executed.
+
+## Working method
+
+- Inspect existing code before editing.
+- Work incrementally.
+- Explain the implementation plan before substantial changes.
+- Modify only files necessary for the task.
+- Inspect the final Git diff.
+- Report modified files, tests, limitations, and risks.
+- Never silently overwrite existing user work.
+- Do not commit or push without explicit permission.

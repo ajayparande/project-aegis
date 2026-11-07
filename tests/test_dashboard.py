@@ -6,6 +6,9 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from aegis.database import initialize_database
+from aegis.instruments import InstrumentInput, register_instrument
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_FILE = PROJECT_ROOT / "app.py"
 DEVELOPMENT_FILES = (
@@ -68,3 +71,27 @@ def test_dashboard_does_not_modify_development_database_or_log(isolated_app_path
     assert not app.exception
     assert database_path.exists()
     assert _development_file_snapshot() == before
+
+
+def test_dashboard_shows_instrument_master_summary_and_details(isolated_app_paths) -> None:
+    database_path, _ = isolated_app_paths
+    initialize_database(database_path)
+    register_instrument(
+        database_path,
+        InstrumentInput(
+            exchange="NSE",
+            trading_symbol="TCS",
+            instrument_name="Tata Consultancy Services",
+            instrument_type="EQUITY",
+        ),
+    )
+
+    app = AppTest.from_file(str(APP_FILE)).run(timeout=10)
+
+    assert not app.exception
+    assert "Instrument Master" in [item.value for item in app.subheader]
+    metrics = {item.label: item.value for item in app.metric}
+    assert metrics["Total Instruments"] == "1"
+    assert metrics["Active Instruments"] == "1"
+    assert metrics["Inactive Instruments"] == "0"
+    assert len(app.dataframe) == 1

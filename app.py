@@ -4,6 +4,7 @@ import streamlit as st
 
 from aegis.config import get_settings
 from aegis.database import get_database_status, initialize_database
+from aegis.instruments import list_instruments, search_instruments
 from aegis.logging_config import setup_logging
 
 settings = get_settings()
@@ -89,6 +90,103 @@ if database_healthy:
         st.write(f"• {table}")
 else:
     st.error("Database is unavailable. Check the application logs.")
+
+st.divider()
+
+st.subheader("Instrument Master")
+
+if database_healthy:
+    try:
+        all_instruments = list_instruments(settings.database_path)
+        active_count = sum(instrument.is_active for instrument in all_instruments)
+        inactive_count = len(all_instruments) - active_count
+
+        total_col, active_col, inactive_col = st.columns(3)
+        total_col.metric("Total Instruments", len(all_instruments))
+        active_col.metric("Active Instruments", active_count)
+        inactive_col.metric("Inactive Instruments", inactive_count)
+
+        exchange_distribution: dict[str, int] = {}
+        for instrument in all_instruments:
+            exchange_distribution[instrument.exchange] = (
+                exchange_distribution.get(instrument.exchange, 0) + 1
+            )
+        st.write("**Exchange distribution:**", exchange_distribution or "No instruments")
+
+        search_col, exchange_col, type_col, status_col = st.columns(4)
+        search_query = search_col.text_input("Search symbol or name")
+        exchange_filter = exchange_col.selectbox(
+            "Exchange",
+            ["All", *sorted({instrument.exchange for instrument in all_instruments})],
+        )
+        type_filter = type_col.selectbox(
+            "Instrument type",
+            [
+                "All",
+                *sorted({instrument.instrument_type for instrument in all_instruments}),
+            ],
+        )
+        status_filter = status_col.selectbox("Status", ["All", "Active", "Inactive"])
+
+        selected_exchange = exchange_filter if exchange_filter != "All" else None
+        selected_type = type_filter if type_filter != "All" else None
+        selected_active = None if status_filter == "All" else status_filter == "Active"
+
+        if search_query.strip():
+            displayed_instruments = search_instruments(
+                settings.database_path,
+                search_query,
+                exchange=selected_exchange,
+                instrument_type=selected_type,
+                is_active=selected_active,
+            )
+        else:
+            displayed_instruments = list_instruments(
+                settings.database_path,
+                exchange=selected_exchange,
+                instrument_type=selected_type,
+                is_active=selected_active,
+            )
+
+        if displayed_instruments:
+            st.dataframe(
+                [
+                    {
+                        "Exchange": instrument.exchange,
+                        "Symbol": instrument.trading_symbol,
+                        "Name": instrument.instrument_name,
+                        "Type": instrument.instrument_type,
+                        "Segment": instrument.segment or "",
+                        "ISIN": instrument.isin or "",
+                        "Lot size": instrument.lot_size,
+                        "Tick size": (
+                            str(instrument.tick_size) if instrument.tick_size is not None else ""
+                        ),
+                        "Expiry": (
+                            instrument.expiry_date.isoformat()
+                            if instrument.expiry_date is not None
+                            else ""
+                        ),
+                        "Strike": (
+                            str(instrument.strike_price)
+                            if instrument.strike_price is not None
+                            else ""
+                        ),
+                        "Option type": instrument.option_type or "",
+                        "Active": instrument.is_active,
+                    }
+                    for instrument in displayed_instruments
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+        else:
+            st.info("No instruments match the selected filters.")
+    except Exception:
+        logger.exception("Instrument master dashboard view failed")
+        st.error("Instrument Master is unavailable. Check the application logs.")
+else:
+    st.info("Instrument Master is unavailable while the database is unavailable.")
 
 st.divider()
 

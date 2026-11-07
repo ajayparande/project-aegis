@@ -81,6 +81,50 @@ def _create_version_2_database(database_path) -> None:
         connection.close()
 
 
+def _create_version_3_database(database_path) -> None:
+    """Create the version 3 schema with a legacy REAL tick size and data."""
+
+    _create_version_2_database(database_path)
+    connection = sqlite3.connect(database_path)
+    try:
+        for statement in database.MIGRATIONS[2]:
+            connection.execute(statement)
+        connection.execute("INSERT INTO schema_metadata (version) VALUES (3)")
+        instrument = connection.execute(
+            "INSERT INTO instruments "
+            "(exchange, trading_symbol, instrument_name, instrument_type, tick_size) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("NSE", "LEGACY", "Legacy Instrument", "EQUITY", 0.05),
+        )
+        imported = connection.execute(
+            "INSERT INTO data_imports (source_id, import_type) VALUES (?, ?)",
+            (1, "fixture"),
+        )
+        connection.execute(
+            "INSERT INTO market_data "
+            "(instrument_id, import_id, interval, candle_timestamp, open, high, low, close) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                instrument.lastrowid,
+                imported.lastrowid,
+                "1d",
+                "2026-01-01T00:00:00Z",
+                100,
+                101,
+                99,
+                100.5,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO data_quality_issues "
+            "(import_id, instrument_id, issue_type, description) VALUES (?, ?, ?, ?)",
+            (imported.lastrowid, instrument.lastrowid, "fixture", "Preserve this issue"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def _add_metadata_insert_failure(database_path, version: int) -> None:
     connection = sqlite3.connect(database_path)
     try:
@@ -107,14 +151,14 @@ def test_fresh_database_initialization(tmp_path) -> None:
     status = get_database_status(database_path)
 
     assert status["exists"] is True
-    assert status["schema_version"] == 3
+    assert status["schema_version"] == 4
 
     assert set(status["tables"]) == ALL_TABLES
     with closing(get_connection(database_path)) as connection:
         versions = connection.execute(
             "SELECT version FROM schema_metadata ORDER BY version"
         ).fetchall()
-    assert [row["version"] for row in versions] == [1, 2, 3]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4]
 
 
 def test_version_1_migration_preserves_phase_1_records(tmp_path) -> None:
@@ -124,7 +168,7 @@ def test_version_1_migration_preserves_phase_1_records(tmp_path) -> None:
     initialize_database(database_path)
 
     status = get_database_status(database_path)
-    assert status["schema_version"] == 3
+    assert status["schema_version"] == 4
     assert ALL_TABLES.issubset(set(status["tables"]))
     with closing(get_connection(database_path)) as connection:
         versions = connection.execute(
@@ -136,7 +180,7 @@ def test_version_1_migration_preserves_phase_1_records(tmp_path) -> None:
             table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in ("sources", "hypotheses", "strategies", "experiments", "runs")
         }
-    assert [row["version"] for row in versions] == [1, 2, 3]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4]
     assert source["name"] == "Existing source"
     assert hypothesis["title"] == "Existing hypothesis"
     assert hypothesis["description"] == "Preserve this record"
@@ -151,13 +195,13 @@ def test_database_initialization_is_repeatable(tmp_path) -> None:
 
     status = get_database_status(database_path)
 
-    assert status["schema_version"] == 3
+    assert status["schema_version"] == 4
     with closing(get_connection(database_path)) as connection:
         versions = connection.execute(
             "SELECT version FROM schema_metadata ORDER BY version"
         ).fetchall()
         sources_count = connection.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
-    assert [row["version"] for row in versions] == [1, 2, 3]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4]
     assert sources_count == 0
 
 
@@ -255,7 +299,7 @@ def test_expected_phase_2_indexes_exist_without_unique_duplicates(tmp_path) -> N
     assert ("instrument_id", "interval", "candle_timestamp") in unique_index_columns["market_data"]
 
 
-def test_existing_version_2_migrates_to_version_3_and_removes_redundant_indexes(
+def test_existing_version_2_migrates_to_version_4_and_removes_redundant_indexes(
     tmp_path,
 ) -> None:
     database_path = tmp_path / "test_aegis.db"
@@ -264,7 +308,7 @@ def test_existing_version_2_migrates_to_version_3_and_removes_redundant_indexes(
     initialize_database(database_path)
 
     status = get_database_status(database_path)
-    assert status["schema_version"] == 3
+    assert status["schema_version"] == 4
     with closing(get_connection(database_path)) as connection:
         versions = connection.execute(
             "SELECT version FROM schema_metadata ORDER BY version"
@@ -280,7 +324,7 @@ def test_existing_version_2_migrates_to_version_3_and_removes_redundant_indexes(
             table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in ("sources", "hypotheses", "strategies", "experiments", "runs")
         }
-    assert [row["version"] for row in versions] == [1, 2, 3]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4]
     assert source["name"] == "Existing source"
     assert ALL_TABLES.issubset(set(status["tables"]))
     assert set(phase_1_counts.values()) == {1}
@@ -291,6 +335,46 @@ def test_existing_version_2_migrates_to_version_3_and_removes_redundant_indexes(
         "idx_data_imports_status",
         "idx_quality_issues_import",
     }.issubset(indexes)
+
+
+def test_existing_version_3_migrates_to_version_4_preserving_data(tmp_path) -> None:
+    database_path = tmp_path / "version_3.db"
+    _create_version_3_database(database_path)
+
+    initialize_database(database_path)
+
+    status = get_database_status(database_path)
+    assert status["schema_version"] == 4
+    assert ALL_TABLES.issubset(set(status["tables"]))
+    with closing(get_connection(database_path)) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_metadata ORDER BY version"
+        ).fetchall()
+        instrument = connection.execute(
+            "SELECT id, trading_symbol, tick_size, tick_size_decimal, isin, strike_price "
+            "FROM instruments WHERE trading_symbol = ?",
+            ("LEGACY",),
+        ).fetchone()
+        phase_1_counts = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("sources", "hypotheses", "strategies", "experiments", "runs")
+        }
+        phase_2_counts = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("instruments", "data_imports", "market_data", "data_quality_issues")
+        }
+        instrument_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(instruments)").fetchall()
+        }
+    assert [row["version"] for row in versions] == [1, 2, 3, 4]
+    assert instrument["trading_symbol"] == "LEGACY"
+    assert instrument["tick_size"] == 0.05
+    assert instrument["tick_size_decimal"] == "0.05"
+    assert instrument["isin"] is None
+    assert instrument["strike_price"] is None
+    assert set(phase_1_counts.values()) == {1}
+    assert set(phase_2_counts.values()) == {1}
+    assert "isin" in instrument_columns
 
 
 def test_failed_migration_rolls_back_ddl_and_metadata(tmp_path, monkeypatch) -> None:
@@ -321,9 +405,61 @@ def test_failed_migration_rolls_back_ddl_and_metadata(tmp_path, monkeypatch) -> 
     assert source["name"] == "Existing source"
 
 
+def test_version_3_migration_ddl_failure_rolls_back_columns_and_preserves_records(
+    tmp_path, monkeypatch
+) -> None:
+    database_path = tmp_path / "version_3_ddl_failure.db"
+    _create_version_3_database(database_path)
+    with closing(get_connection(database_path)) as connection:
+        original_instrument = tuple(
+            connection.execute(
+                "SELECT * FROM instruments WHERE trading_symbol = ?", ("LEGACY",)
+            ).fetchone()
+        )
+        original_market_data = tuple(connection.execute("SELECT * FROM market_data").fetchone())
+    monkeypatch.setitem(
+        database.MIGRATIONS,
+        3,
+        (
+            "ALTER TABLE instruments ADD COLUMN isin TEXT",
+            "ALTER TABLE instruments ADD COLUMN tick_size_decimal TEXT",
+            "THIS IS NOT VALID SQL",
+        ),
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match='near "THIS": syntax error'):
+        initialize_database(database_path)
+
+    with closing(get_connection(database_path)) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_metadata ORDER BY version"
+        ).fetchall()
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(instruments)").fetchall()
+        }
+        instrument = tuple(
+            connection.execute(
+                "SELECT * FROM instruments WHERE trading_symbol = ?", ("LEGACY",)
+            ).fetchone()
+        )
+        market_data = tuple(connection.execute("SELECT * FROM market_data").fetchone())
+        connection.execute(
+            "INSERT INTO sources (name, source_type) VALUES (?, ?)",
+            ("Usability check", "test"),
+        )
+        connection.commit()
+        source_count = connection.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+
+    assert [row["version"] for row in versions] == [1, 2, 3]
+    assert not {"isin", "tick_size_decimal", "strike_price", "option_type"} & columns
+    assert instrument == original_instrument
+    assert market_data == original_market_data
+    assert source_count == 2
+
+
 @pytest.mark.parametrize(
     ("previous_version", "target_version"),
-    [(1, 2), (2, 3)],
+    [(1, 2), (2, 3), (3, 4)],
 )
 def test_metadata_insert_failure_rolls_back_migration(
     tmp_path, previous_version: int, target_version: int
@@ -331,8 +467,10 @@ def test_metadata_insert_failure_rolls_back_migration(
     database_path = tmp_path / f"schema_{previous_version}.db"
     if previous_version == 1:
         _create_version_1_database(database_path)
-    else:
+    elif previous_version == 2:
         _create_version_2_database(database_path)
+    else:
+        _create_version_3_database(database_path)
     _add_metadata_insert_failure(database_path, target_version)
 
     with pytest.raises(sqlite3.IntegrityError, match="injected metadata insertion failure"):
@@ -355,13 +493,18 @@ def test_metadata_insert_failure_rolls_back_migration(
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             ).fetchall()
         }
+        instrument_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(instruments)").fetchall()
+        }
     assert [row["version"] for row in versions] == list(range(1, previous_version + 1))
     assert source["name"] == "Existing source"
     if previous_version == 1:
         assert "instruments" not in table_names
-    else:
+    elif previous_version == 2:
         assert "idx_market_data_lookup" in index_names
         assert "idx_instruments_exchange" in index_names
+    else:
+        assert "isin" not in instrument_columns
 
 
 def test_unsupported_future_schema_version_is_rejected(tmp_path) -> None:
@@ -378,7 +521,7 @@ def test_unsupported_future_schema_version_is_rejected(tmp_path) -> None:
     finally:
         connection.close()
 
-    with pytest.raises(RuntimeError, match="newer than supported version 3"):
+    with pytest.raises(RuntimeError, match="newer than supported version 4"):
         initialize_database(database_path)
 
 

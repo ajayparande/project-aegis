@@ -1,17 +1,20 @@
 # System Architecture
 
 ## High-level components
-1. **Data adapters:** retrieve permitted historical/live market data.
-2. **Data validation:** check timestamps, missing bars, duplicates, outliers and stale feeds.
-3. **Research workspace:** store references, hypotheses and strategy specifications.
-4. **Strategy engine:** deterministic signal generation.
-5. **Backtest engine:** chronological event simulation with costs.
-6. **Validation engine:** out-of-sample, walk-forward and sensitivity analysis.
-7. **Paper broker:** simulated orders, fills, positions and cash ledger.
-8. **Risk engine:** hard limits and fail-closed controls for simulation.
-9. **Experiment registry:** reproducibility metadata and results.
-10. **AI orchestration:** bounded tools for research, coding assistance and report explanations.
-11. **Dashboard/monitoring:** status, results, errors and cost reporting.
+1. **Instrument master:** provider-neutral exchange, symbol, contract metadata, and active status stored in SQLite.
+2. **Data adapters:** retrieve permitted historical/live market data.
+3. **Data validation:** check timestamps, missing bars, duplicates, outliers and stale feeds.
+4. **Research workspace:** store references, hypotheses and strategy specifications.
+5. **Strategy engine:** deterministic signal generation.
+6. **Backtest engine:** chronological event simulation with costs.
+7. **Validation engine:** out-of-sample, walk-forward and sensitivity analysis.
+8. **Paper broker:** simulated orders, fills, positions and cash ledger.
+9. **Risk engine:** hard limits and fail-closed controls for simulation.
+10. **Experiment registry:** reproducibility metadata and results.
+11. **AI orchestration:** bounded tools for research, coding assistance and report explanations.
+12. **Dashboard/monitoring:** status, results, errors and cost reporting.
+
+The Instrument Master is implemented in `src/aegis/instruments.py`. New registry operations accept tick sizes and strike prices as `Decimal`, integer, or decimal text and store them as decimal text; floating-point inputs are rejected. The legacy `tick_size REAL` column remains to preserve old records. Migration 3 to 4 copies legacy values to `tick_size_decimal` using SQLite text conversion. This provides a usable text representation of the value stored in SQLite, but cannot recover the exact original decimal supplied before conversion to `REAL`. Do not automatically overwrite or delete legacy values. Verify migrated values against an authoritative source before relying on them in financial calculations.
 
 ## AI roles (logical roles, not necessarily separate models)
 - Research librarian: summarises cited educational material.

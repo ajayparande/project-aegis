@@ -66,7 +66,7 @@ Implemented foundation includes:
 - `.gitignore` and safe `.env.example`.
 - Typed configuration restricted to `RESEARCH_ONLY`.
 - Structured JSON logging with basic secret redaction.
-- SQLite database schema for sources, hypotheses, strategies, experiments, and runs.
+- SQLite database schema for research records, instruments, and market-data storage.
 - Streamlit system-status dashboard.
 - Automated pytest tests.
 - Ruff linting and formatting, and MyPy type checks.
@@ -74,6 +74,8 @@ Implemented foundation includes:
 
 **Current development phase: Phase 2 — Market Data Foundation.**
 
-Planned Phase 2 work includes instrument and symbol management, historical OHLCV ingestion, local storage, data-quality validation, and market-data visualization.
+The provider-neutral Instrument Master is implemented for NSE and BSE. It supports equities, indexes, futures, and options; registration, lookup, filtering, metadata updates, search, and validated bulk import; and exact decimal text storage for tick size and strike price. The dashboard shows instrument counts, exchange distribution, filters, search, and instrument details.
+
+Historical OHLCV ingestion, import provenance, data-quality validation, and market-data visualization remain planned Phase 2 work.
 
 No broker connection, live market-data integration, live orders, or automated trading is enabled.

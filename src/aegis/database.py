@@ -3,7 +3,7 @@
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 PHASE_1_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -147,6 +147,16 @@ ON data_quality_issues (import_id, severity);
     2: (
         "DROP INDEX IF EXISTS idx_market_data_lookup",
         "DROP INDEX IF EXISTS idx_instruments_exchange",
+    ),
+    3: (
+        "ALTER TABLE instruments ADD COLUMN isin TEXT",
+        "ALTER TABLE instruments ADD COLUMN tick_size_decimal TEXT",
+        "ALTER TABLE instruments ADD COLUMN strike_price TEXT",
+        "ALTER TABLE instruments ADD COLUMN option_type TEXT",
+        (
+            "UPDATE instruments SET tick_size_decimal = CAST(tick_size AS TEXT) "
+            "WHERE tick_size IS NOT NULL"
+        ),
     ),
 }
 
