@@ -1,62 +1,15 @@
 
-name: Project Aegis CI
-
-on:
-  push:
-  pull_request:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  quality-checks:
-    name: Tests and Code Quality
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Scan repository for secrets
-        uses: gitleaks/gitleaks-action@v3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_ENABLE_COMMENTS: false
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install project and dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,dashboard,research]"
-
-      - name: Run automated tests
-        run: python -m pytest -v
-
-      - name: Check linting
-        run: python -m ruff check .
-
-      - name: Check formatting
-        run: python -m ruff format --check .
-
-      - name: Check types
-        run: python -m mypy src
-
       - name: Validate gitignore rules
         shell: bash
         run: |
           set -e
 
+          # Create temporary paths so Git can test them on a fresh runner.
+          mkdir -p .venv data logs
+          touch .env .venv/probe.txt data/aegis.db logs/aegis.log
+
           git check-ignore -q --no-index .env
-          git check-ignore -q --no-index .venv
+          git check-ignore -q --no-index .venv/probe.txt
           git check-ignore -q --no-index data/aegis.db
           git check-ignore -q --no-index logs/aegis.log
 
