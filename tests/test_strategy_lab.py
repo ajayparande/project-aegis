@@ -264,7 +264,7 @@ def test_experiment_registry_uses_existing_schema_and_freezes_strategy_version(
     experiments = list_strategy_experiments(database_path)
     assert len(experiments) == 2
     assert all(item["strategy_spec_sha256"] for item in experiments)
-    assert get_database_status(database_path)["schema_version"] == 6
+    assert get_database_status(database_path)["schema_version"] == 7
 
 
 def test_experiment_registry_scopes_versions_by_instrument_and_interval(

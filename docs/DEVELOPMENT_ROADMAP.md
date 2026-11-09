@@ -8,8 +8,8 @@ This roadmap maps the ten numbered implementation phases in the root `README.md`
 | M0 — Planning and repository foundation | Phase 1 — Foundation | **Complete** |
 | M1 — Local application foundation | Phase 1 — Foundation | **Complete** |
 | M2 — Market-data pipeline | Phase 2 — Market Data | **In progress** |
-| M3 — Strategy research laboratory | Phase 3 — Strategy Research Laboratory | **In progress** |
-| M4 — Backtesting | Phase 4 — Backtesting | **Planned** |
+| M3 — Strategy research laboratory | Phase 3 — Strategy Research Laboratory | **Deterministic core complete; AI assistance deferred** |
+| M4 — Backtesting | Phase 4 — Backtesting | **In progress** |
 | M5 — Validation and ML research | Phase 5 — ML Research (optional, evidence-gated) | **Planned** |
 | M6 — Paper execution | Phase 6 — Paper Execution Foundation | **Planned** |
 | M7 — AI controls, forward paper testing, and operational reliability | Phases 7, 8, and 9 — AI Agent and Tool Framework; Live-Data Forward Paper Trading; Cloud Deployment and Reliability | **Planned** |
@@ -22,12 +22,13 @@ integration in dependent workflows. The checked-in calendar configuration is int
 empty. No verified official holiday dataset, approved external feed, or provider adapter is
 included.
 
-Phase 3 now includes a versioned SMA-crossover research specification, experiment/run
-records, Decimal-based deterministic signal generation, provenance fingerprints, and a
-dashboard. It remains in progress: AI-assisted hypothesis drafting and isolated generated-
-code evaluation are deferred, and runs remain blocked until Phase 2 supplies confirmed
-calendar coverage and complete, fresh data. This work does not implement backtesting or
-execution; those belong to Phases 4 and 6 onward.
+Phase 3's deterministic Strategy Lab milestone includes a versioned SMA-crossover research
+specification, experiment/run records, Decimal-based signal generation, provenance
+fingerprints, and a dashboard. AI-assisted hypothesis drafting and isolated generated-code
+evaluation are deferred to a separately scoped milestone and are not prerequisites for
+backtesting. Strategy runs remain blocked until Phase 2 supplies confirmed calendar coverage
+and complete, fresh data. Phase 4 backtesting is under development and does not authorize
+paper or live execution.
 
 ## Planning estimates
 

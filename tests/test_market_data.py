@@ -60,7 +60,7 @@ def test_fresh_schema_has_exact_decimal_candle_storage(database_path: Path) -> N
 
     candle_columns = {row["name"]: row["type"] for row in candle_info}
     market_columns = {row["name"]: row["type"] for row in market_info}
-    assert version == 6
+    assert version == 7
     assert {
         "open_decimal": "TEXT",
         "high_decimal": "TEXT",

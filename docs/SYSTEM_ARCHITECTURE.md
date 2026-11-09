@@ -18,7 +18,7 @@ The Instrument Master is implemented in `src/aegis/instruments.py`. New registry
 
 ## Historical CSV ingestion
 
-The local historical importer stores new OHLCV rows in the additive historical_candles table introduced by schema version 5. Schema version 6 adds nullable experiment-configuration hash and hash-origin columns. Open, high, low, and close values use canonical decimal text; parsing, OHLC comparisons, and reliable tick checks use Decimal. The importer never writes imported prices to SQLite REAL columns. The pre-existing market_data table, including its REAL columns and records, remains untouched for compatibility and preservation.
+The local historical importer stores new OHLCV rows in the additive historical_candles table introduced by schema version 5. Schema version 6 adds nullable experiment-configuration hash and hash-origin columns. Schema version 7 adds `data_imports.source_use_status`, defaulting existing and new imports to `UNVERIFIED`, and source-use declaration history. Open, high, low, and close values use canonical decimal text; parsing, OHLC comparisons, and reliable tick checks use Decimal. The importer never writes imported prices to SQLite REAL columns. The pre-existing market_data table, including its REAL columns and records, remains untouched for compatibility and preservation.
 
 The CSV header is timestamp,open,high,low,close,volume. Exchange, trading symbol, and interval are import arguments. Prices use plain base-10 text without exponent notation; trailing fractional zeroes are removed for canonical storage without rounding. Volume is a non-negative base-10 integer within SQLite's signed integer range.
 
@@ -30,12 +30,17 @@ Duplicate policy is deterministic and non-overwriting: the first valid row for a
 
 Each import attempt stores the filename basename, SHA-256 checksum, requested and resolved instrument, interval, start/completion timestamps, status, row counts, duplicate counts, and error summary in data_imports. Rejected rows and duplicate rows are recorded in data_quality_issues with source row numbers. Candle inserts, row issues, and final import counts/status commit in one transaction. Unexpected transaction failures roll back the batch, then record the import as failed in a separate transaction.
 
+Source-use permission is tracked at the import/dataset level because the CSV importer does not create or require a reusable `sources` row; `data_imports.source_id` is optional and is not populated by this flow. Imports default to `UNVERIFIED`, including records migrated from older schemas. An explicit user/administrator declaration records `VERIFIED_PERMITTED`, `UNVERIFIED`, or `PROHIBITED`, along with the actor, rationale, and timestamp in `import_source_use_history`. This records a declaration only; it does not automatically verify licences or determine legal rights. Before declaring actual data permitted, the user must independently verify that the source terms allow the intended research/backtesting use. Every import contributing candles to a backtest must be `VERIFIED_PERMITTED`; unverified and prohibited data fail closed, and no override is provided. Completed runs retain their status snapshot if a declaration later changes.
+
 The dashboard labels this view historical CSV data, shows per-instrument/interval counts and coverage, recent import outcomes, quality issues, and a bounded exact-text candle table. It does not present the data as live.
 
 ## Strategy Lab (Phase 3)
 
 `src/aegis/strategy_lab.py` currently provides a versioned SMA-crossover specification and
-deterministic, Decimal-based long-only signal generation. SMA division uses a local precision
+deterministic, Decimal-based long-only signal generation. Its strategy specification exposes
+the minimum candle history needed for consecutive slow-window SMA comparisons. Strategy Lab
+listing excludes explicitly typed backtesting experiments while retaining validation of
+malformed Strategy Lab records. SMA division uses a local precision
 of `max(28, integer_places + fractional_places + digits_in_input_count + 12)` significant
 digits and explicit `ROUND_HALF_EVEN`; non-terminating averages therefore have deterministic
 finite Decimal representations. Under Python's default Decimal context this pins the existing
@@ -76,6 +81,28 @@ verified calendar coverage is maintained. Instrument selection reflects current 
 membership only; historical index membership and survivorship-bias correction are not
 implemented. AI hypothesis drafting and generated-code evaluation are deferred; no generated
 code is executed.
+
+The Phase 4 engine is a deterministic research simulator, not an order-routing or paper-broker
+integration. Signals are generated at completed candle close and execute at the next eligible
+session candle open. All-or-none order capacity uses the previous completed candle's volume;
+the execution candle's eventual volume is unavailable to the decision. The baseline is
+long-only, single-position, fixed-quantity, and leaves final open positions marked to market
+with estimated adverse liquidation costs reported separately. Charges and slippage are
+configurable assumptions, not official fee schedules. Runs also require sufficient strategy
+history, snapshot the exact registered instrument/tick inputs and contributing import
+permissions, and label runs lacking legacy provenance as `LEGACY_INCOMPLETE`; no missing
+historical instrument or permission information is fabricated.
+
+Public backtest calculations use explicit local Decimal contexts for simulation, benchmark,
+and relative-return arithmetic. Market-quality completeness percentages use integer
+half-up rounding, so caller Decimal precision and rounding settings do not affect a run or
+change the caller's context. Backtest listings include typed `BACKTEST_REGISTERED` records;
+the canonical configuration hash, backtest configuration, strategy snapshot types and
+specification, linked Strategy Lab experiment, and relational strategy/hypothesis references
+are validated before listing. Invalid registrations raise a `BacktestError` identifying the
+experiment instead of being silently omitted. Unrelated null-strategy records remain
+excluded; pre-status typed backtest rows with a null relational strategy link retain their
+legacy listing path and are validated against the referenced strategy snapshot.
 
 ### Interrupted run reconciliation
 

@@ -70,6 +70,12 @@ class StrategySpec:
     slippage_assumptions: str
     known_limitations: tuple[str, ...]
 
+    @property
+    def minimum_history_candles(self) -> int:
+        """Return the candle count required to compare consecutive slow-window SMAs."""
+
+        return self.slow_window + 1
+
     def __post_init__(self) -> None:
         exchange = self.exchange.strip().upper()
         symbol = self.trading_symbol.strip().upper()
@@ -691,12 +697,19 @@ def list_strategy_experiments(database_path: Path) -> list[dict[str, object]]:
         rows = connection.execute(
             """SELECT id, name, status, configuration_json, configuration_sha256,
                       configuration_hash_origin, created_at
-               FROM experiments WHERE strategy_id IS NOT NULL ORDER BY id DESC"""
+               FROM experiments
+               WHERE strategy_id IS NOT NULL AND status != 'BACKTEST_REGISTERED'
+               ORDER BY id DESC"""
         ).fetchall()
     result: list[dict[str, object]] = []
     for row in rows:
         try:
             configuration = json.loads(row["configuration_json"])
+            if (
+                isinstance(configuration, dict)
+                and configuration.get("experiment_type") == "BACKTEST"
+            ):
+                continue
             spec = _parse_spec(configuration["strategy_spec"])
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise StrategyLabError(f"Experiment {row['id']} has malformed configuration.") from exc
@@ -771,7 +784,7 @@ def _load_completed_candles(
     end_date: date,
     timezone_name: str,
     completed_timestamps: set[str],
-) -> tuple[list[StrategyCandle], str, tuple[str, ...]]:
+) -> tuple[list[StrategyCandle], str, tuple[str, ...], tuple[dict[str, object], ...]]:
     """Read exact rows from the selected local-date range and fingerprint their sources."""
 
     try:
@@ -800,16 +813,26 @@ def _load_completed_candles(
         clauses.append("c.candle_timestamp < ?")
         parameters.append(upper_text)
     query = f"""SELECT c.candle_timestamp, c.open_decimal, c.high_decimal,
-                       c.low_decimal, c.close_decimal, c.volume, d.file_sha256
+                       c.low_decimal, c.close_decimal, c.volume, d.id AS source_import_id,
+                       d.file_sha256, d.source_use_status,
+                       h.id AS source_use_declaration_id, h.declared_by,
+                       h.rationale AS source_use_rationale, h.declared_at
                 FROM historical_candles AS c
                 JOIN instruments AS i ON i.id = c.instrument_id
                 LEFT JOIN data_imports AS d ON d.id = c.import_id
+                LEFT JOIN import_source_use_history AS h
+                  ON h.id = (
+                      SELECT MAX(history.id)
+                      FROM import_source_use_history AS history
+                      WHERE history.import_id = d.id
+                  )
                 WHERE {" AND ".join(clauses)}
                 ORDER BY c.candle_timestamp"""
     timezone = ZoneInfo(timezone_name)
     candles: list[StrategyCandle] = []
     records: list[dict[str, object]] = []
     import_hashes: set[str] = set()
+    source_imports: dict[int, dict[str, object]] = {}
     with closing(_readonly_connection(database_path)) as connection:
         rows = connection.execute(query, parameters).fetchall()
     for row in rows:
@@ -851,8 +874,25 @@ def _load_completed_candles(
         file_hash = row["file_sha256"]
         if isinstance(file_hash, str) and file_hash:
             import_hashes.add(file_hash)
+        import_id = row["source_import_id"]
+        if import_id is None:
+            raise StrategyLabError("A historical candle has no resolvable source import.")
+        source_imports[int(import_id)] = {
+            "import_id": int(import_id),
+            "file_sha256": file_hash,
+            "source_use_status": row["source_use_status"] or "UNVERIFIED",
+            "declaration_id": row["source_use_declaration_id"],
+            "declared_by": row["declared_by"],
+            "rationale": row["source_use_rationale"],
+            "declared_at": row["declared_at"],
+        }
     dataset_sha = _sha256(_canonical_json(records))
-    return candles, dataset_sha, tuple(sorted(import_hashes))
+    return (
+        candles,
+        dataset_sha,
+        tuple(sorted(import_hashes)),
+        tuple(source_imports[key] for key in sorted(source_imports)),
+    )
 
 
 def run_strategy_experiment(
@@ -976,7 +1016,7 @@ def run_strategy_experiment(
         if uncovered:
             raise DataQualityGateError("Calendar coverage is incomplete for the experiment range.")
         completed_timestamps = {item.timestamp for item in completed_candles}
-        candles, dataset_sha, source_hashes = _load_completed_candles(
+        candles, dataset_sha, source_hashes, _ = _load_completed_candles(
             database_path,
             exchange=spec.exchange,
             trading_symbol=spec.trading_symbol,

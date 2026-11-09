@@ -3,7 +3,7 @@
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 PHASE_1_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -201,6 +201,35 @@ ON data_imports (file_sha256, requested_exchange, requested_trading_symbol, inte
     5: (
         "ALTER TABLE experiments ADD COLUMN configuration_sha256 TEXT",
         "ALTER TABLE experiments ADD COLUMN configuration_hash_origin TEXT",
+    ),
+    6: (
+        """
+        ALTER TABLE data_imports
+        ADD COLUMN source_use_status TEXT NOT NULL DEFAULT 'UNVERIFIED'
+        CHECK (source_use_status IN ('VERIFIED_PERMITTED', 'UNVERIFIED', 'PROHIBITED'))
+        """,
+        """
+        CREATE TABLE import_source_use_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            import_id INTEGER NOT NULL,
+            previous_status TEXT CHECK (
+                previous_status IS NULL OR previous_status IN (
+                    'VERIFIED_PERMITTED', 'UNVERIFIED', 'PROHIBITED'
+                )
+            ),
+            new_status TEXT NOT NULL CHECK (
+                new_status IN ('VERIFIED_PERMITTED', 'UNVERIFIED', 'PROHIBITED')
+            ),
+            declared_by TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            declared_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (import_id) REFERENCES data_imports(id)
+        )
+        """,
+        """
+        CREATE INDEX idx_import_source_use_history_import
+        ON import_source_use_history (import_id, id)
+        """,
     ),
 }
 

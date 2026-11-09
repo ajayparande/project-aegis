@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from aegis.database import get_connection
@@ -31,6 +32,14 @@ _INDIA_TZ = ZoneInfo("Asia/Kolkata")
 
 class CSVImportError(ValueError):
     """Raised when a CSV file cannot be read as a valid import input."""
+
+
+class SourceUseStatusError(ValueError):
+    """Raised when a source-use declaration is invalid or targets no import."""
+
+
+SourceUseStatus = Literal["VERIFIED_PERMITTED", "UNVERIFIED", "PROHIBITED"]
+_SOURCE_USE_STATUSES = frozenset({"VERIFIED_PERMITTED", "UNVERIFIED", "PROHIBITED"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -700,6 +709,51 @@ def import_ohlcv_csv(
     )
 
 
+def declare_import_source_use_status(
+    database_path: Path,
+    import_id: int,
+    status: SourceUseStatus,
+    *,
+    declared_by: str,
+    rationale: str,
+) -> int:
+    """Record an explicit user/admin source-use declaration for one imported dataset.
+
+    This records a declaration; it does not determine legal rights or verify a licence.
+    No status is inferred from a filename, URL, or successful import.
+    """
+
+    if isinstance(import_id, bool) or not isinstance(import_id, int) or import_id < 1:
+        raise SourceUseStatusError("import_id must be a positive integer.")
+    if not isinstance(status, str) or status not in _SOURCE_USE_STATUSES:
+        raise SourceUseStatusError("Unsupported source-use status.")
+    if not isinstance(declared_by, str) or not declared_by.strip():
+        raise SourceUseStatusError("declared_by must identify the user or administrator.")
+    if not isinstance(rationale, str) or not rationale.strip():
+        raise SourceUseStatusError("rationale must explain the explicit declaration.")
+
+    with _transaction(database_path) as connection:
+        row = connection.execute(
+            "SELECT source_use_status FROM data_imports WHERE id = ?",
+            (import_id,),
+        ).fetchone()
+        if row is None:
+            raise SourceUseStatusError(f"Data import {import_id} was not found.")
+        cursor = connection.execute(
+            """INSERT INTO import_source_use_history
+               (import_id, previous_status, new_status, declared_by, rationale)
+               VALUES (?, ?, ?, ?, ?)""",
+            (import_id, row["source_use_status"], status, declared_by.strip(), rationale.strip()),
+        )
+        connection.execute(
+            "UPDATE data_imports SET source_use_status = ? WHERE id = ?",
+            (status, import_id),
+        )
+        if cursor.lastrowid is None:
+            raise RuntimeError("SQLite did not return a source-use declaration identifier.")
+        return int(cursor.lastrowid)
+
+
 def list_historical_overview(database_path: Path) -> list[dict[str, object]]:
     """Return exact candle counts and UTC date coverage per instrument and interval."""
 
@@ -736,7 +790,7 @@ def list_recent_imports(database_path: Path, limit: int = 20) -> list[dict[str, 
             SELECT id, instrument_id, original_filename, file_sha256, requested_exchange,
                    requested_trading_symbol, interval, started_at, completed_at, status,
                    total_rows, accepted_rows, rejected_rows, skipped_rows, duplicate_rows,
-                   same_file_reimport, error_summary
+                   same_file_reimport, error_summary, source_use_status
             FROM data_imports
             WHERE import_type = 'CSV_OHLCV'
             ORDER BY id DESC LIMIT ?

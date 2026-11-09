@@ -31,12 +31,28 @@ Calendar results remain limited by administrator-supplied coverage and source ve
 
 ## Strategy Lab reproducibility and auditability
 - Migrate schema version 5 to 6 additively by adding nullable experiment configuration hash and origin columns; retain all existing rows and leave legacy hashes unset until the first structurally valid run attempt (which may later be blocked by the data-quality gate).
+- Migrate schema version 6 to 7 additively by defaulting existing and new data imports to `UNVERIFIED` and adding declaration history; preserve all imports, candles, quality issues, and existing run results.
+- Require an explicit actor and rationale for source-use status changes. Do not infer permission from a filename, source row, or metadata; block backtests unless every contributing import is explicitly `VERIFIED_PERMITTED`, and preserve the declaration used by completed runs.
+- Require a strategy's declared minimum history before execution; do not generate SMA crossover signals from a dataset too short to compare consecutive slow-window averages.
+- Keep generic Strategy Lab experiment listings distinct from typed backtest registrations without hiding malformed Strategy Lab configurations.
+- Snapshot exchange, symbol, instrument type/segment, lot size, exact decimal tick size, and deterministic instrument hash in backtest provenance. Clearly label legacy runs lacking source or instrument snapshots as incomplete rather than reconstructing unknown historic values.
 - Hash the canonical full experiment configuration separately from its JSON and verify it, plus internal identity consistency, before every run. A first-run legacy backfill establishes a baseline only from that point forward and must be labelled as such.
 - Persist SHA-256 hashes for the configuration, strategy specification and implementation, market-quality implementation, calendar input and effective session rules, dataset, and source files. Record the Git commit only for a clean worktree; explicitly identify unavailable or uncommitted revision state.
 - A hash can detect changed content when the stored hash is unchanged; it cannot protect against a privileged actor changing both, nor reconstruct files, calendar inputs, or market data that have been lost.
 - SMA uses a local Decimal precision of `max(28, integer_places + fractional_places + digits_in_input_count + 12)` significant digits and explicit `ROUND_HALF_EVEN`. Non-terminating averages are finite Decimal approximations at this precision; calculations do not quantize to tick size.
 - Do not automatically fail a `RUNNING` record based only on age. Reconcile manually only after confirming its owning process has stopped; update only the selected run ID conditional on its status remaining `RUNNING`, and record the manual reconciliation in its error message.
 - Changed strategy rules require a new version, written rationale, independent technical review, mathematical and regression testing, confirmed data-quality prerequisites, human approval, and a traceable link to the prior version before registration.
+
+## Backtesting safety and accounting acceptance
+- Verify causal timing: completed candle signals use only prior/completed information and execute at the next eligible open; volume capacity uses only the prior completed candle's volume.
+- Verify cash, open-position marks, realized/unrealized P&L, and estimated liquidation costs reconcile. Do not silently liquidate open positions at the end of the dataset.
+- Verify per-order brokerage cap and fee rounding under multiple Decimal contexts; costs, spread, and slippage remain assumptions, not official schedules.
+- Run the public backtest API under default and altered Decimal precision/rounding contexts; successful results must match and the caller context must remain unchanged, including blocked runs.
+- Require malformed registered backtest JSON/schema/configuration, snapshot field types or relationships, and missing/malformed/mismatched canonical configuration hashes to produce experiment-specific diagnostics; preserve legacy typed backtests and unrelated null-strategy record handling.
+- Verify benchmark behavior for valid, unaffordable, and flat-price inputs, and preserve explicit unavailable status when the benchmark cannot be computed.
+- Verify the metrics contract for no closed trades, breakeven trades, profit-factor denominator, drawdown, and insufficient/zero-variance daily returns.
+- Exercise migration rollback and preservation on temporary databases. Never run schema migration tests against the user's normal database.
+- Keep the dashboard and all execution surfaces in `RESEARCH_ONLY`; no broker connection or live-order path is permitted.
 
 ## Quantitative research quality
 Every candidate report must include:

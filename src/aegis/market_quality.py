@@ -9,7 +9,7 @@ import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -502,6 +502,16 @@ def _valid_candle_values(row: sqlite3.Row) -> bool:
         return False
 
 
+def _completeness_percentage(present: int, expected: int) -> Decimal:
+    """Return a two-place percentage rounded half-up without ambient Decimal context."""
+
+    hundredths, remainder = divmod(present * 10_000, expected)
+    if remainder * 2 >= expected:
+        hundredths += 1
+    whole, fractional = divmod(hundredths, 100)
+    return Decimal(f"{whole}.{fractional:02d}")
+
+
 def _calendar_coverage(
     calendar: ExchangeCalendar | None, start_date: date, end_date: date
 ) -> tuple[str, int]:
@@ -777,9 +787,7 @@ def analyze_dataset(
     if assessable_as_of_range and provisional_expected:
         completed_set = {item.timestamp for item in completed}
         present = len(valid_times & completed_set)
-        completeness = (Decimal(present) * Decimal(100) / Decimal(provisional_expected)).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
+        completeness = _completeness_percentage(present, provisional_expected)
     if invalid_timestamp_count:
         reasons.append(
             f"{invalid_timestamp_count} stored candle(s) have invalid timestamps and cannot be assigned to the requested dates."
