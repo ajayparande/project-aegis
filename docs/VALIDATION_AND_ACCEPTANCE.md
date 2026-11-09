@@ -7,6 +7,30 @@
 - Reproducible environment and documented setup.
 - CI must pass before merge.
 
+## Phase 5 research-library acceptance
+- Keep candlestick detection read-only and separate from strategy generation, backtesting, brokers, and execution. Outputs are descriptive research artifacts, never BUY/SELL instructions.
+- Reject incomplete bars, non-finite/non-positive OHLC values, OHLC values outside the candle range, malformed or timezone-naive timestamps, duplicate UTC instants, invalid volume, and invalid configuration.
+- Compare timestamps by UTC instant while preserving source timestamp text. Sort only through the explicit normalization option.
+- Run all arithmetic in a documented local Decimal context and compare complete serialized result collections under multiple caller contexts.
+- Confirm pivots only after the configured right-side window. Build HH/HL/LH/LL and trend summaries only from confirmed swings; report event and confirmation timestamps separately.
+- Form support/resistance only from multiple confirmed swing touches. Breakout, retest, failure, and double-top/bottom outputs must use previously confirmed levels and completed closes.
+- Require the actual Mother Bar → Inside Bar → false break → close-back-inside sequence for Fakey. Require complete, session-scoped expected bars for opening-range results; do not infer exchange sessions or holidays.
+- Version every detector definition and include the exact detection configuration and any supplied session context in JSON-safe result metadata.
+- Require positive examples for every approved detector ID, with negative and inclusive/exclusive boundary fixtures for shared predicate families and confirmed multi-candle events.
+- Coverage interpretation: the positive-example requirement applies to each approved detector ID. Negative and inclusive/exclusive boundary examples apply to shared predicate families and confirmed multi-candle events; this criterion does not require a separate negative and boundary test for every detector or every mathematical input edge. Document remaining test-depth limitations without treating them as implementation defects when the required shared-family and event evidence is present.
+- Define consolidation using both a relative width ceiling and bounded first-to-last close drift so a narrow percentage band alone cannot label a monotonic trend as consolidation.
+- Bound recurring scans and test deterministic behavior, prefix/truncation invariance, positive and negative formations, invalid inputs, session boundaries, and measured large inputs.
+- Label continuous-market candle variants, swing-level touch counts, pullbacks, and OHLCV supply/demand as approximations where they do not prove canonical market context or order-book liquidity.
+- Do not mark the milestone accepted until its implementation report enumerates each requirement, maps it to code and an exact test, reports executed results, and identifies all deferred or approximated scope.
+
+## Phase 6 technical-indicator acceptance
+- Treat the Phase 6 task as a planned specification; do not claim implementation or approval of candidate formulas/defaults until each design decision is reviewed.
+- For every indicator, document formula, input, parameters, minimum history, warm-up, initialization/smoothing, missing and zero-denominator behavior, units/range, numeric precision/rounding, and an independent reference convention.
+- Test each indicator with positive, negative, boundary, and multi-point golden-value fixtures, plus temporal prefix invariance and batch/incremental parity.
+- Require deterministic calculations independent of ambient Decimal context, no fabricated warm-up, no future-data leakage, and no SQLite REAL storage for derived financial values.
+- Validate 1m, 5m, 15m, and daily inputs; completed higher-timeframe alignment; session-aware VWAP; explicit anchored-VWAP semantics; and serialization/API versioning.
+- Measure performance and memory on reproducible large sequences. Keep calculations separate from dashboard/database layers and do not add strategy, BUY/SELL, ML, LLM, broker, or live-execution behavior.
+
 ## Historical CSV ingestion acceptance
 - Migrate a version 4 database transactionally to version 5 without changing existing instruments, imports, legacy market_data rows, or quality issues.
 - Store newly imported OHLC prices only as canonical decimal text in historical_candles; do not write imported prices to legacy REAL columns.
