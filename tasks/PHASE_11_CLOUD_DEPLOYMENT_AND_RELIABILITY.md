@@ -1,4 +1,4 @@
-# Phase 9 â€” Cloud Deployment and Reliability
+# Phase 11 â€” Cloud Deployment and Reliability
 
 ## Goal
 Prove that the same Project Aegis application can be deployed and operated securely on a modest VPS or equivalent host before any unattended live-trading consideration.
@@ -18,6 +18,11 @@ Cloud deployment is not a prerequisite for local development or the initial 30â€
 - [ ] Verify that deployment and restart cannot change execution mode or enable live orders.
 - [ ] Use GitHub for source control and CI/CD orchestration only; the VPS or host supplies runtime compute.
 - [ ] Document deployment costs and obtain explicit approval before incurring any paid hosting or service charges.
+- [ ] Define least-privilege operating-system and application permissions for the deployment.
+- [ ] Protect backups and secrets against unauthorized access; document backup encryption and retention.
+- [ ] Define recovery-point and recovery-time objectives based on the paper-trading workload.
+- [ ] Verify deployment artifacts and dependencies against the reviewed release; document rollback triggers.
+- [ ] Test that restored backups preserve ledger consistency, experiment identity, and idempotency state.
 
 ## Acceptance criteria
 - A reviewed release can be deployed reproducibly without copying local secrets or development databases.
@@ -28,3 +33,7 @@ Cloud deployment is not a prerequisite for local development or the initial 30â€
 - Remote access is authenticated and secured.
 - Resource sizing is supported by measured workload data.
 - No live broker connection, live credentials, or real order placement is introduced.
+- Recovery-point and recovery-time objectives are documented and demonstrated through restore tests.
+- Secrets are not embedded in source code, deployment artifacts, logs, or backups in plaintext.
+- Deployment rollback cannot silently downgrade database state or discard committed paper-ledger transactions.
+- Host access, service permissions, and network exposure follow documented least-privilege controls.

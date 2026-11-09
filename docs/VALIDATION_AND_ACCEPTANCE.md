@@ -24,14 +24,15 @@
 - Do not mark the milestone accepted until its implementation report enumerates each requirement, maps it to code and an exact test, reports executed results, and identifies all deferred or approximated scope.
 
 ## Phase 6 technical-indicator acceptance
-- Treat the Phase 6 task as a planned specification; do not claim implementation or approval of candidate formulas/defaults until each design decision is reviewed.
-- For every indicator, document formula, input, parameters, minimum history, warm-up, initialization/smoothing, missing and zero-denominator behavior, units/range, numeric precision/rounding, and an independent reference convention.
-- Test each indicator with positive, negative, boundary, and multi-point golden-value fixtures, plus temporal prefix invariance and batch/incremental parity.
+- Use the Phase 6 task's explicitly approved v1 subset as the implementation scope. Other rows in its preserved candidate catalog, including anchored VWAP and higher-timeframe integration, are deferred proposals and are not v1 acceptance requirements.
+- For every approved indicator, document formula, input, parameters, minimum history, warm-up, initialization/smoothing, missing and zero-denominator behavior, units/range, numeric precision/rounding, and an independent reference convention.
+- Test each approved indicator with positive, negative, boundary, and multi-point golden-value fixtures, plus temporal prefix consistency as candles arrive.
 - Require deterministic calculations independent of ambient Decimal context, no fabricated warm-up, no future-data leakage, and no SQLite REAL storage for derived financial values.
-- Validate 1m, 5m, 15m, and daily inputs; completed higher-timeframe alignment; session-aware VWAP; explicit anchored-VWAP semantics; and serialization/API versioning.
+- Validate 1m, 5m, 15m, and daily timestamp sequences; document session-aware VWAP reset and session-start metadata; and version result serialization/API exports. Higher-timeframe aggregation and anchored VWAP require separate approval.
 - Measure performance and memory on reproducible large sequences. Keep calculations separate from dashboard/database layers and do not add strategy, BUY/SELL, ML, LLM, broker, or live-execution behavior.
 
 ## Historical CSV ingestion acceptance
+- Migrate schema version 3 to 4 transactionally; preserve legacy instrument records and REAL tick_size values, populate tick_size_decimal without claiming recovery of the original pre-REAL decimal precision, and verify rollback on failure using temporary databases.
 - Migrate a version 4 database transactionally to version 5 without changing existing instruments, imports, legacy market_data rows, or quality issues.
 - Store newly imported OHLC prices only as canonical decimal text in historical_candles; do not write imported prices to legacy REAL columns.
 - Reject non-positive or malformed prices, invalid OHLC relationships, invalid volume, naive/misaligned timestamps, unsupported intervals, unknown instruments, and inactive instruments.
@@ -77,6 +78,20 @@ Calendar results remain limited by administrator-supplied coverage and source ve
 - Verify the metrics contract for no closed trades, breakeven trades, profit-factor denominator, drawdown, and insufficient/zero-variance daily returns.
 - Exercise migration rollback and preservation on temporary databases. Never run schema migration tests against the user's normal database.
 - Keep the dashboard and all execution surfaces in `RESEARCH_ONLY`; no broker connection or live-order path is permitted.
+
+## Phase 7 ML research acceptance
+
+- Build features only from information available at the decision timestamp and completed candles.
+- Generate labels strictly from future observations; purge overlapping target windows across chronological train, validation and test partitions.
+- Keep the test partition untouched during feature selection, model selection, sensitivity analysis and threshold selection.
+- Compare ML results against deterministic training-majority and SMA20/50 classification baselines.
+- Use validation data for sensitivity analysis; report expanding walk-forward results where available.
+- Record dataset and source fingerprints, declared provenance, feature definitions, library versions, model parameters and partition boundaries.
+- Require independently verified permitted data and complete, fresh market-quality coverage before empirical acceptance.
+- Require strategy-level evaluation after realistic transaction costs, slippage, turnover, liquidity and capacity assumptions before claiming research value.
+- Synthetic tests establish implementation correctness only; they are not evidence of predictive performance.
+- Do not persist or deploy models, connect them to execution, or change execution mode without separate approval.
+- Phase 7 acceptance remains pending until the implementation report maps every criterion to evidence and demonstrates cost-aware, untouched out-of-sample results.
 
 ## Quantitative research quality
 Every candidate report must include:

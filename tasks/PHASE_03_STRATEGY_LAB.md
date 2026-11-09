@@ -15,8 +15,9 @@ Create versioned, testable strategy hypotheses and deterministic signal generato
 - [x] Keep registered strategy versions immutable; changed rules require a new version and the documented manual review workflow.
 
 AI-assisted hypothesis drafting and generated-code isolation are not implemented in this
-milestone. Generated code is not executed. These items remain deferred to the separately
-scoped AI/tool phase and require review and isolated testing before any future execution.
+milestone. Generated code is not executed. These items remain deferred to Phase 9 — AI
+Agent and Controlled Tool Framework, and require review and isolated testing before any
+future execution.
 
 Existing experiment configurations created before schema version 6 have no provable
 historical integrity hash. Their nullable hash is established on the first structurally valid

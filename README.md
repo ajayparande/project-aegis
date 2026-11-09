@@ -7,15 +7,17 @@ This folder contains milestone-specific implementation instructions and acceptan
 | Order | Task file | Purpose |
 |---:|---|---|
 | 1 | `PHASE_01_FOUNDATION.md` | Local project foundation — completed |
-| 2 | `PHASE_02_MARKET_DATA.md` | Instrument Master, historical ingestion, exchange sessions and data quality |
-| 3 | `PHASE_03_STRATEGY_LAB.md` | Versioned strategy research and deterministic signals |
-| 4 | `PHASE_04_BACKTESTING.md` | Chronological simulation and performance measurement |
-| 5 | `PHASE_05_ML_RESEARCH.md` | Optional, evidence-gated ML research |
-| 6 | `PHASE_06_PAPER_TRADING.md` | Deterministic simulated broker and portfolio ledger |
-| 7 | `PHASE_07_AI_AGENT_AND_TOOL_FRAMEWORK.md` | Provider-independent LLM integration and controlled tool calling |
-| 8 | `PHASE_08_LIVE_DATA_FORWARD_PAPER_TRADING.md` | 30–60 trading days of live-data forward paper trading |
-| 9 | `PHASE_09_CLOUD_DEPLOYMENT_AND_RELIABILITY.md` | VPS deployment, monitoring, backups and recovery testing |
-| 10 | `PHASE_10_LIVE_READINESS.md` | Final independent go/no-go assessment; no automatic activation |
+| 2 | `PHASE_02_MARKET_DATA.md` | Instrument Master, Historical OHLCV Ingestion, Exchange Calendar and Market Data Quality |
+| 3 | `PHASE_03_STRATEGY_LAB.md` | Strategy Lab |
+| 4 | `PHASE_04_BACKTESTING.md` | Backtesting Engine |
+| 5 | `PHASE_05_CANDLESTICK_PRICE_ACTION.md` | Candlestick Patterns and Price Action — accepted with documented research and operational limitations |
+| 6 | `PHASE_06_TECHNICAL_INDICATORS.md` | Technical Indicators — accepted with documented limitations |
+| 7 | `PHASE_07_ML_RESEARCH.md` | Optional, evidence-gated ML research |
+| 8 | `PHASE_08_PAPER_TRADING.md` | Deterministic simulated broker and portfolio ledger |
+| 9 | `PHASE_09_AI_AGENT_AND_TOOL_FRAMEWORK.md` | Provider-independent LLM integration and controlled tool calling |
+| 10 | `PHASE_10_LIVE_DATA_FORWARD_PAPER_TRADING.md` | 30–60 trading days of live-data forward paper trading |
+| 11 | `PHASE_11_CLOUD_DEPLOYMENT_AND_RELIABILITY.md` | VPS deployment, monitoring, backups and recovery testing |
+| 12 | `PHASE_12_LIVE_READINESS.md` | Final independent go/no-go assessment; no automatic activation |
 
 ## Execution and safety modes
 
@@ -23,7 +25,7 @@ This folder contains milestone-specific implementation instructions and acceptan
 does not connect to a broker and has no live order-placement path.
 
 - `PAPER_TRADING` is planned for a later phase and is not implemented or available.
-- `LIVE_TRADING` is not implemented and remains unavailable. Phase 10 is an assessment,
+- `LIVE_TRADING` is not implemented and remains unavailable. Phase 12 is an assessment,
   not authorization or activation; any implementation would require a separate, explicit
   approval.
 

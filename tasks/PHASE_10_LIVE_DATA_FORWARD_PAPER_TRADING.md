@@ -1,4 +1,4 @@
-# Phase 8 — Live-Data Forward Paper Trading
+# Phase 10 — Live-Data Forward Paper Trading
 
 ## Goal
 Run the approved strategy and paper-execution system against current permitted market data for 30–60 trading days, without placing real broker orders or risking real trading capital.
@@ -29,6 +29,10 @@ This is forward testing, not historical backtesting. The objective is to measure
 - [ ] Test internet interruption, provider outage, stale feed, process restart, system restart, database errors, duplicate events, and reconciliation failures.
 - [ ] Preserve immutable experiment settings during the observation period. Proposed changes must create a new strategy/experiment version rather than silently altering the running experiment.
 - [ ] Export reports to a reviewable format such as CSV/XLSX without making spreadsheets the authoritative transaction ledger.
+- [ ] Verify that the selected data provider permits automated strategy evaluation, storage, derived data, and report export for the intended use.
+- [ ] Define the authoritative exchange-session calendar and behaviour for holidays, special sessions, and unscheduled closures.
+- [ ] Verify that restart recovery resumes the same experiment without duplicating signals, orders, fills, or observation intervals.
+- [ ] Define minimum data-quality and observation-coverage thresholds before starting the 30–60 trading-day measurement period.
 
 ## Evaluation metrics
 - Net simulated P&L after itemised estimated costs.
@@ -50,3 +54,6 @@ This is forward testing, not historical backtesting. The objective is to measure
 - Laptop resource and reliability measurements demonstrate whether the local machine can sustain the tested workload.
 - Positive simulated P&L alone is not a pass. Statistical limitations, drawdown, costs, benchmark comparison, and operational reliability must be reviewed.
 - No automatic transition to live trading is permitted after this phase.
+- Observation days count only when the configured strategy, instruments, data feed, and paper-execution pipeline were operational for the required session coverage.
+- The observation period is restarted or explicitly qualified if a material strategy, configuration, data-source, or execution-model change invalidates comparability.
+- All exported reports preserve experiment identifiers and clearly distinguish estimated values from actual market or broker transactions.

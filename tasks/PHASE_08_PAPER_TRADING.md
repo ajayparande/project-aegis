@@ -1,4 +1,4 @@
-# Phase 6 — Paper Execution Foundation
+# Phase 8 — Paper Execution Foundation
 
 ## Goal
 Implement a deterministic simulated broker and portfolio ledger. This phase establishes the paper-execution machinery; the later forward-testing phase runs it against live market data for an extended observation period.
@@ -12,7 +12,9 @@ Implement a deterministic simulated broker and portfolio ledger. This phase esta
 - [ ] Add daily reports and dashboard views.
 - [ ] Run failure drills and compare paper behaviour with backtest assumptions.
 - [ ] Add duplicate-request protection and deterministic order identifiers.
+- [ ] Persist enough order and ledger history to reproduce and audit each simulation cycle.
 - [ ] Clearly distinguish signal time, order-submission time, simulated fill time, and fill price.
+- [ ] Test restart recovery, partial failures, duplicate requests, and interrupted reconciliation using isolated temporary databases.
 
 ## Acceptance criteria
 - Runtime path contains no broker order-placement calls.
@@ -20,3 +22,8 @@ Implement a deterministic simulated broker and portfolio ledger. This phase esta
 - Fail-closed behaviour is tested.
 - Simulated values are clearly labelled and never presented as actual profit.
 - The simulator does not assume fills at a price that was unavailable after the signal decision.
+- Use deterministic Decimal accounting for cash, positions, fees, and realized/unrealized P&L.
+- Reject duplicate order requests without creating duplicate simulated orders or fills.
+- Reconcile positions, cash, open orders, and fills after restart.
+- Require explicit risk configuration and fail closed when risk settings are missing or invalid.
+- Keep the application in RESEARCH_ONLY until paper execution is explicitly implemented, tested, and separately approved.

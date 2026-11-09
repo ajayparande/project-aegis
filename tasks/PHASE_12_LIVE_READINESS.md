@@ -1,4 +1,4 @@
-# Phase 10 — Live Readiness Assessment (No Automatic Activation)
+# Phase 12 — Live Readiness Assessment (No Automatic Activation)
 
 ## Goal
 Produce an independent, documented go/no-go decision after strategy research, backtesting, paper-execution validation, AI-agent controls, forward paper trading, and deployment/reliability testing. This task does not authorise live trading.
@@ -20,8 +20,20 @@ Produce an independent, documented go/no-go decision after strategy research, ba
 - [ ] Disclose expected infrastructure/API/brokerage costs and capital at risk in plain language.
 - [ ] Define restricted instruments, position limits, daily loss limits, and staged capital limits for any separately proposed live implementation.
 - [ ] Obtain explicit user approval for a separate live-trading implementation milestone.
+- [ ] Independently verify that all evidence used in the assessment is reproducible, traceable, and based on permitted data.
+- [ ] Review the completeness and effectiveness of the paper-trading risk controls, including loss limits, exposure limits, kill switch, and reconciliation.
+- [ ] Review operational ownership, support arrangements, and the consequences of unattended failures.
+- [ ] Confirm that all material findings, unresolved risks, assumptions, and accepted limitations are documented.
+- [ ] Verify that the proposed live implementation has a separate rollback and emergency-disable plan.
 
 ## Default decision
 **NO-GO** unless every applicable requirement is satisfied and independently reviewed.
 
 Passing this assessment does not guarantee profitability or authorise automatic activation. Any live broker integration and live execution must be implemented in a separate, explicitly approved milestone with its own acceptance tests. No AI agent, deployment pipeline, or configuration change may activate live trading.
+
+## Acceptance criteria
+- The assessment report identifies each requirement as passed, failed, not applicable, or unresolved, with supporting evidence.
+- Any unresolved critical safety, regulatory, data-licensing, or financial risk results in NO-GO.
+- Approval applies only to the reviewed strategy, instruments, limits, infrastructure, broker integration, and software release.
+- Any material change after approval requires reassessment before live activation.
+- Live execution remains disabled until the separate implementation milestone passes its own acceptance tests and receives explicit user authorization.

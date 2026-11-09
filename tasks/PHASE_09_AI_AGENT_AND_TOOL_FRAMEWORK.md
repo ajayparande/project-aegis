@@ -1,4 +1,4 @@
-# Phase 7 — AI Agent and Controlled Tool Framework
+# Phase 9 — AI Agent and Controlled Tool Framework
 
 ## Goal
 Introduce an AI agent that reasons over market/research information and calls explicitly permitted Python tools. Project Aegis is an AI-assisted trading platform, not an LLM that directly controls a broker.
@@ -22,6 +22,10 @@ Introduce an AI agent that reasons over market/research information and calls ex
 - [ ] Add explicit uncertainty, evidence references, and rationale to recommendations.
 - [ ] Add tests for malformed model output, provider outage, timeout, prompt injection in retrieved data, and unauthorized tool calls.
 - [ ] Ensure AI-generated code cannot be executed without isolation, review, and explicit approval.
+- [ ] Enforce tool permissions in Python independently of model-generated instructions or requested tool names.
+- [ ] Prevent retrieved documents, market data, tool results, and prompts from granting additional permissions.
+- [ ] Keep credentials, broker tokens, personal account information, and other secrets outside prompts, logs, and model-visible tool outputs.
+- [ ] Require human approval for any action that changes persistent strategy, risk, configuration, or execution state.
 
 ## Prohibited behaviour
 - The agent must not directly connect to a broker or submit orders.
@@ -37,3 +41,7 @@ Introduce an AI agent that reasons over market/research information and calls ex
 - Deterministic calculations remain in Python.
 - Agent recommendations are auditable and cannot directly trigger live execution.
 - API usage and costs are bounded; no paid provider is enabled without explicit approval.
+- Agent permissions are enforced by deterministic application code, not by prompt instructions alone.
+- Untrusted retrieved content cannot grant permissions or override system controls.
+- Sensitive credentials and account information are excluded from model inputs and audit logs.
+- AI integration remains optional; the application continues deterministic research and paper reconciliation when the provider is unavailable.
