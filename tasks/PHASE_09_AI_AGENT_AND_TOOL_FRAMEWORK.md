@@ -12,20 +12,20 @@ Introduce an AI agent that reasons over market/research information and calls ex
 - Do not call an LLM for every price tick or candle. Use bounded, event-driven calls with timeouts, budgets, and audit logs.
 
 ## Tasks
-- [ ] Define the agent runtime, lifecycle, and bounded orchestration model.
-- [ ] Define a provider-independent LLM interface and configuration.
-- [ ] Implement a permissioned tool registry with typed input/output schemas.
-- [ ] Expose only approved read/research tools initially: market summaries, indicator calculations, strategy metadata, backtest results, and reports.
-- [ ] Add tool input validation, output validation, timeouts, retries where safe, and call budgets.
-- [ ] Record model/provider/version, prompts or prompt identifiers, tool calls, outputs, timestamps, and errors with appropriate secret/data redaction.
-- [ ] Require structured outputs for machine-consumed recommendations and validate them before use.
-- [ ] Add explicit uncertainty, evidence references, and rationale to recommendations.
-- [ ] Add tests for malformed model output, provider outage, timeout, prompt injection in retrieved data, and unauthorized tool calls.
-- [ ] Ensure AI-generated code cannot be executed without isolation, review, and explicit approval.
-- [ ] Enforce tool permissions in Python independently of model-generated instructions or requested tool names.
-- [ ] Prevent retrieved documents, market data, tool results, and prompts from granting additional permissions.
-- [ ] Keep credentials, broker tokens, personal account information, and other secrets outside prompts, logs, and model-visible tool outputs.
-- [ ] Require human approval for any action that changes persistent strategy, risk, configuration, or execution state.
+- [x] Define the agent runtime, lifecycle, and bounded orchestration model.
+- [x] Define a provider-independent LLM interface and configuration.
+- [x] Implement a permissioned tool registry with typed input/output schemas.
+- [x] Expose only approved read/research tools initially: market summaries, indicator calculations, strategy metadata, backtest results, and reports.
+- [x] Add tool input validation, output validation, timeouts, retries where safe, and call budgets.
+- [x] Record model/provider/version, prompts or prompt identifiers, tool calls, outputs, timestamps, and errors with appropriate secret/data redaction.
+- [x] Require structured outputs for machine-consumed recommendations and validate them before use.
+- [x] Add explicit uncertainty, evidence references, and rationale to recommendations.
+- [x] Add tests for malformed model output, provider outage, timeout, prompt injection in retrieved data, and unauthorized tool calls.
+- [ ] Ensure AI-generated code cannot be executed without isolation, review, and explicit approval. _(deferred — no code-execution tool exposed)_
+- [x] Enforce tool permissions in Python independently of model-generated instructions or requested tool names.
+- [x] Prevent retrieved documents, market data, tool results, and prompts from granting additional permissions.
+- [x] Keep credentials, broker tokens, personal account information, and other secrets outside prompts, logs, and model-visible tool outputs.
+- [x] Require human approval for any action that changes persistent strategy, risk, configuration, or execution state.
 
 ## Prohibited behaviour
 - The agent must not directly connect to a broker or submit orders.

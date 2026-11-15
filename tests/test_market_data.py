@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from aegis.database import get_connection, initialize_database
+from aegis.database import SCHEMA_VERSION, get_connection, initialize_database
 from aegis.instruments import InstrumentInput, register_instrument, update_instrument
 from aegis.market_data import (
     SUPPORTED_INTERVALS,
@@ -60,7 +60,7 @@ def test_fresh_schema_has_exact_decimal_candle_storage(database_path: Path) -> N
 
     candle_columns = {row["name"]: row["type"] for row in candle_info}
     market_columns = {row["name"]: row["type"] for row in market_info}
-    assert version == 7
+    assert version == SCHEMA_VERSION
     assert {
         "open_decimal": "TEXT",
         "high_decimal": "TEXT",

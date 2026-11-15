@@ -197,3 +197,90 @@ no configured coverage, so Phase 7 acceptance remains pending until permitted an
 quality-gated market data supports cost-aware, untouched out-of-sample evaluation.
 Nothing in Phase 7 changes `RESEARCH_ONLY`, bypasses risk controls, or authorizes
 paper/live execution.
+
+## Paper execution foundation (Phase 8)
+
+`src/aegis/paper_trading.py` is an isolated, local simulation API. It has no broker
+adapter, network data source, strategy signal subscription, or live-order operation.
+Callers must supply a registered NSE cash-equity identity, a permitted completed import,
+a source-permission declaration and a `DatasetQualityReport` with full confirmed
+calendar coverage, complete and fresh prior data. Quality evidence must end strictly
+before execution. The fill uses only an explicitly supplied quote at execution time;
+the order's signal, submission and execution times remain separately recorded. Prices apply
+the existing adverse spread/slippage and tick-rounding assumptions from Phase 4; fills
+are synchronous, all-or-none, and constrained by caller-supplied execution-time
+capacity. Eventual candle volume is not used.
+
+Schema version 8 adds paper accounts, orders, fills, cash ledger entries, long-only
+position projections, realized-P&L history, marks, lifecycle events, and daily starting
+equity. Order submission, fill, cash entry, position projection and events commit in one
+transaction. Deterministic idempotency keys prevent repeat fills. Reconciliation
+reconstructs cash and positions from immutable fill/ledger records and fails closed on
+disagreement. It verifies the order-to-fill-to-ledger relationships and their account,
+instrument, quantity, price and side before replay; it does not repair corrupted records.
+Projected exposure replaces the prior instrument mark once with the complete post-order
+position at the execution quote. Daily-loss gates block additional BUYs. A valid, fresh,
+long-only SELL can reduce exposure during risk/data halts, while a reconciliation halt
+blocks both sides; fresh matching SELL evidence is still required, but stale existing
+portfolio marks do not trap an otherwise validated exit. Selling never clears a halt.
+Risk settings are mandatory per account;
+no financial limits are silently defaulted. Pending orders, cancellation, partial fills,
+leverage, shorting and automated strategy routing are not implemented.
+
+The dashboard shows simulated reports and order/fill history read-only; it cannot create
+accounts or submit orders. The application mode remains `RESEARCH_ONLY`. The service
+does not supply market data; empty/unconfirmed calendar configuration and Phase 4's
+pending acceptance remain prerequisites to any real-data operation. Paper results are
+not real balances or evidence of profitability.
+
+## Synthetic Forward Runtime (Phase 10A-2)
+
+`src/aegis/forward_runtime.py` supplies a deterministic synthetic quote provider,
+provider-neutral quote contract, per-instrument feed validation and health state, and
+streaming 1m/5m/15m candle aggregation. Quotes require confirmed configured session
+coverage and are rejected when invalid, duplicated, delayed, out of order, or outside a
+session. Decision evidence is pinned to the runtime's exact permitted source import and
+completed candle. Candidate selection is capped, and scheduler event identities are
+stable per completed candle; restart recovery reconstructs missing scheduler events but
+does not create proposals or submit orders.
+
+Forward BUY/SELL proposals require timezone-aware expiry and are accepted only through
+`ForwardRuntimeService.route_event`, which reconstructs evidence from the exact pending
+runtime event, permitted synthetic import, and completed candle. The canonical proposal
+digest is persisted on the event and carried with the execution binding to Phase 8.
+Generic Phase 8 submission cannot consume a forward-runtime import or supply a runtime
+binding. The deterministic mock proposal intake therefore routes through the existing
+Phase 8 paper execution and risk boundary using an independently persisted latest-quote snapshot.
+Quote-triggered stop/target exits are long-only, idempotent and retryable after a rejected
+attempt or restart. Restart performs Phase 8 account reconciliation and halts on
+corruption; the runtime does not repair financial records. Accepted trade quotes update
+`paper_marks` transactionally as a **last-trade-price projection**, not as a bid,
+liquidation price, or executable quote. Cash, fills, and realized P&L remain derived from
+the Phase 8 ledger. Runtime dashboard summaries use read-only SQLite access and report
+feed health, mark freshness, recovery, valuation, and reconciliation status.
+
+This phase is a research-only simulation. It adds no live market feed, broker connection,
+real-order path, or AI trading brain; `RESEARCH_ONLY` remains mandatory.
+
+## AI Agent and Controlled Tool Framework (Phase 9)
+
+`src/aegis/ai_agent/` provides a provider-agnostic, bounded AI research assistant.
+The module exposes four sub-components:
+
+- **`models.py`**: Typed data classes for messages (`ChatMessage`, `Role`), tool calls (`ToolCall`, `ToolResult`), provider responses (`LLMResponse`, `ModelUsage`), and audit records (`AgentAuditRecord`, `AgentResearchResult`).
+- **`security.py`**: Deterministic permission enforcement (`enforce_tool_permission`), secret redaction (`redact_secrets`, `redact_nested_secrets`), prompt-injection defense (`tag_untrusted_data`), and query-bound validation (`validate_query_bounds`). Security is enforced by Python code, not by prompt instructions alone.
+- **`providers.py`**: `LLMProvider` abstract base class. Concrete implementations: `MockLLMProvider` (fully offline, deterministic, no API key required), `GeminiProvider` (REST via stdlib `urllib`), `OpenAIProvider` (REST), `AnthropicProvider` (REST). No provider SDK dependency is required; standard library only.
+- **`tools.py`**: `ToolRegistry` with strict recursive argument validation, permission gates, bounded output, and process-isolated handler timeouts. Custom handlers must be importable/pickleable for Windows `spawn` execution. The default registry exposes six read-only tools: `get_instrument_info`, `get_dataset_quality_summary`, `compute_technical_indicators`, `detect_price_action_patterns`, `get_backtest_summary`, and `get_strategy_experiment_results`. Paper-account reports and positions are deliberately excluded from provider-visible tools.
+- **`orchestrator.py`**: `AIAgent` executes bounded loops (defaults: `max_steps=5`, `max_total_tool_calls=10`, aggregate token ceiling 20,000). Constructor ceilings cap configurable resources. Provider outputs, token usage, tool-call shapes, and audit arguments are validated; malformed provider results fail closed. Citations contain bounded tool-output evidence, and confidence is never elevated solely because a tool completed.
+
+Architectural constraints:
+- All quantitative computations (indicators, patterns, quality analysis, backtest performance) remain in deterministic Python. The LLM receives only tool outputs, never raw floats.
+- Tool mutation keywords (`order`, `buy`, `sell`, `cancel`, `delete`, `eval`, `shell`, etc.) are blocked at registration time by `enforce_tool_permission`.
+- Retrieved data is redacted, HTML-escaped, and wrapped in `<data_block>` tags as defense-in-depth only. Prompt instructions and delimiters are not security boundaries; deterministic permissions, strict schemas, and the explicit tool registry remain authoritative.
+- Provider response bodies are limited to 1 MB, provider output is capped (1,024 tokens by default), tool output is bounded (25,000 characters by default), provider calls have validated timeouts, and orchestration enforces step, tool-call, and provider-reported aggregate-token ceilings.
+- Tool arguments are recursively redacted in audit records. Raw prompts/responses are not persisted; the audit records hashes, bounded tool output summaries, usage metadata, and errors.
+- No LLM API key is required for unit tests or offline use; `MockLLMProvider` provides fully deterministic coverage.
+- The AI component is optional: all deterministic research, paper-trading, and backtesting services operate normally when no provider is configured.
+- Provider outages, timeouts, and malformed responses fail closed: they produce an `AgentResearchResult` with `status="FAILED"` and do not affect any deterministic service.
+- AI agent cannot change execution modes, risk limits, strategy configurations, database schemas, or place orders.
+- The Streamlit dashboard exposes an optional AI Research Assistant panel with a prominent disclaimer and no order-submission capability.

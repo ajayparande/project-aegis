@@ -173,6 +173,7 @@ class DatasetQualityReport:
     completeness_percentage: Decimal | None
     overall_status: str
     reasons: tuple[str, ...]
+    source_import_id: int | None = None
 
 
 def _required_mapping(value: object, label: str) -> dict[str, object]:
@@ -571,12 +572,19 @@ def analyze_dataset(
     *,
     as_of: datetime,
     calendars: CalendarRegistry,
+    source_import_id: int | None = None,
 ) -> DatasetQualityReport:
     """Analyze a date slice without writing to SQLite or modifying stored candles."""
 
     if start_date > end_date:
         raise ValueError("start_date must not be after end_date.")
     _interval_duration(interval)
+    if source_import_id is not None and (
+        isinstance(source_import_id, bool)
+        or not isinstance(source_import_id, int)
+        or source_import_id < 1
+    ):
+        raise ValueError("source_import_id must be a positive integer when supplied.")
     as_of_utc = _aware_utc(as_of, "as_of")
     normalized_exchange = exchange.strip().upper()
     normalized_symbol = trading_symbol.strip().upper()
@@ -590,6 +598,8 @@ def analyze_dataset(
         timestamp_conditions.append("candle_timestamp < ?")
         timestamp_parameters.append(upper_bound)
     timestamp_filter = " AND " + " AND ".join(timestamp_conditions) if timestamp_conditions else ""
+    import_filter = " AND import_id = ?" if source_import_id is not None else ""
+    import_parameters = (source_import_id,) if source_import_id is not None else ()
     with closing(_readonly_connection(database_path)) as connection:
         instrument = connection.execute(
             "SELECT id, segment FROM instruments "
@@ -604,16 +614,16 @@ def analyze_dataset(
             f"""SELECT id, interval, candle_timestamp, open_decimal, high_decimal,
                       low_decimal, close_decimal, volume, import_id
                FROM historical_candles WHERE instrument_id = ? AND interval = ?
-                 {timestamp_filter}
+                 {import_filter} {timestamp_filter}
                ORDER BY candle_timestamp, id""",
-            (instrument["id"], interval, *timestamp_parameters),
+            (instrument["id"], interval, *import_parameters, *timestamp_parameters),
         ).fetchall()
         duplicate_groups = connection.execute(
             f"""SELECT candle_timestamp FROM historical_candles
                WHERE instrument_id = ? AND interval = ?
-                 {timestamp_filter}
+                 {import_filter} {timestamp_filter}
                GROUP BY instrument_id, interval, candle_timestamp HAVING COUNT(*) > 1""",
-            (instrument["id"], interval, *timestamp_parameters),
+            (instrument["id"], interval, *import_parameters, *timestamp_parameters),
         ).fetchall()
         # Keep detecting malformed timestamps anywhere in this instrument/interval.
         # They cannot be assigned to a requested date range, so this narrow covering
@@ -621,9 +631,9 @@ def analyze_dataset(
         # every historical candle and its OHLC values in memory.
         invalid_timestamp_count = 0
         for timestamp_row in connection.execute(
-            "SELECT candle_timestamp FROM historical_candles "
-            "WHERE instrument_id = ? AND interval = ?",
-            (instrument["id"], interval),
+            f"SELECT candle_timestamp FROM historical_candles "
+            f"WHERE instrument_id = ? AND interval = ? {import_filter}",
+            (instrument["id"], interval, *import_parameters),
         ):
             try:
                 _parse_stored_timestamp(timestamp_row["candle_timestamp"])
@@ -632,13 +642,27 @@ def analyze_dataset(
         issue_rows = connection.execute(
             """SELECT issue_type, affected_timestamp FROM data_quality_issues
                WHERE instrument_id = ? AND interval = ?
+                 AND (? IS NULL OR import_id = ?)
                  AND issue_type IN ('DUPLICATE_CANDLE', 'CSV_ROW_REJECTED')""",
-            (instrument["id"], interval),
+            (instrument["id"], interval, source_import_id, source_import_id),
         ).fetchall()
 
     calendar = calendars.resolve(normalized_exchange, instrument["segment"])
     timezone_name = calendar.timezone_name if calendar is not None else _DEFAULT_TIMEZONE
     timezone = ZoneInfo(timezone_name)
+    if source_import_id is not None:
+        if calendar is None:
+            rows = []
+        else:
+            _, completed_rows, _, _ = calculate_expected_candles(
+                calendar,
+                interval,
+                start_date,
+                end_date,
+                as_of=as_of_utc,
+            )
+            completed_timestamps = {item.timestamp for item in completed_rows}
+            rows = [row for row in rows if row["candle_timestamp"] in completed_timestamps]
     day_range_rows: list[sqlite3.Row] = []
     invalid_count = invalid_timestamp_count
     actual_days: set[date] = set()
@@ -863,4 +887,5 @@ def analyze_dataset(
         completeness_percentage=completeness,
         overall_status=overall,
         reasons=tuple(dict.fromkeys(reasons)),
+        source_import_id=source_import_id,
     )

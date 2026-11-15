@@ -29,17 +29,26 @@ Establish a provider-neutral, auditable market-data foundation. External data ma
 - [x] Add explicit-`as_of` staleness checks with configurable completed-candle thresholds.
 - [x] Add deterministic calendar, boundary, quality, staleness, read-only, and dashboard tests.
 
-### Remaining work
-- [ ] Verify and document the permitted use, licensing, entitlements, rate limits, and retention rules for any proposed external market-data source.
-- [ ] Verify and maintain an official calendar dataset before claiming official calendar coverage.
+### Cross-phase source-permission gate — implemented and verified
+- [x] Strategy Lab (`run_strategy_experiment`): captures and validates every contributing source import before signal generation; `UNVERIFIED`, `PROHIBITED`, missing/null/malformed/unknown statuses, and missing provenance all block via `DataQualityGateError`; blocked runs persist `BLOCKED`/`PARTIAL_BLOCKED` with zero signals; completed runs persist full source-import provenance.
+- [x] Backtesting: every contributing import is checked before simulation; missing provenance blocks explicitly; `UNVERIFIED`/`PROHIBITED` imports block; completed backtests persist `source_imports` provenance.
+- [x] Paper Trading (`submit_paper_order`): BUY requires an explicitly `VERIFIED_PERMITTED` completed import plus matching complete/fresh confirmed-calendar quality evidence; missing/invalid provenance fails closed and halts the account; SELL reductions retain their own evidence/capacity/held-quantity checks.
+- [x] New or updated regression tests cover permitted, unverified, prohibited, undeclared, missing, malformed, mixed multi-import, and persisted-provenance cases across Strategy Lab and Backtesting.
+
+### Remaining operational prerequisites (require authoritative external evidence)
+- [ ] Verify and document the permitted use, licensing, entitlements, rate limits, and retention rules for any proposed external market-data source. A source-use declaration is recorded provenance, not independent proof of legal licensing.
+- [ ] Verify and maintain an authoritative NSE/BSE exchange-calendar dataset (holidays, sessions, coverage range) before claiming `CONFIRMED` calendar coverage. The checked-in `config/exchange_calendars.json` has an empty `calendars` list and makes no official-coverage claim; calendar-dependent workflows remain fail-closed until verified coverage is supplied.
+- [ ] Obtain a real historical dataset from a source with verified permitted use; synthetic `VERIFIED_PERMITTED` declarations in tests are test fixtures only, not licensing evidence.
 - [ ] Add a provider adapter or read-only live feed only in a separately scoped milestone after source approval.
-- [ ] Integrate stale-data and calendar-confidence status with dependent strategy and execution workflows; fail closed when required data quality is insufficient.
+- [ ] Phase 4 backtesting acceptance remains pending; the source-permission gate is implemented but Phase 4 milestone acceptance is not yet satisfied.
 
 ## Acceptance criteria
 - Imported timestamps are timezone-aware, normalized to UTC, and checked against documented interval alignment.
 - Calendar-dependent results remain insufficient/provisional without complete verified calendar coverage; dependent workflows fail closed on that status.
-- Dataset provenance and source terms are documented.
+- Every contributing source import must be explicitly `VERIFIED_PERMITTED` before Strategy Lab, Backtesting, or Paper Trading execution; undeclared, `UNVERIFIED`, `PROHIBITED`, or missing provenance blocks fail-closed.
+- Dataset provenance and source terms are documented; declarations are recorded, not independently verified.
 - Tests use mocks/fixtures and cannot submit broker orders.
 - No external data source is treated as free or permitted without verification.
+- Phase 2 engineering is complete for the local CSV ingestion, calendar engine, quality engine, Instrument Master, and cross-phase source-permission gate. Phase 2 is not fully accepted until the outstanding operational prerequisites above (authoritative calendar coverage, permitted historical dataset, source entitlement evidence, and Phase 4 acceptance) are satisfied.
 
 Stages 3 and 4 provide local CSV ingestion and a configurable calendar-aware quality engine. They do not provide an approved live market-data feed or complete official calendar coverage.

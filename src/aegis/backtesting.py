@@ -1277,6 +1277,16 @@ def run_backtest(
             timezone_name=calendar.timezone_name,
             completed_timestamps=completed_timestamps,
         )
+        if not source_imports:
+            return _blocked(
+                database_path,
+                run_id,
+                "No source-import provenance was resolved for the backtest dataset; "
+                "every contributing import must be declared VERIFIED_PERMITTED before "
+                "execution. Missing provenance is treated as not permitted.",
+                actual_hash,
+                provenance={"source_imports": []},
+            )
         _validate_candles(candles)
         if len(candles) != len(completed_timestamps):
             return _blocked(

@@ -10,9 +10,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from aegis.database import get_connection, get_database_status, initialize_database
+from aegis.database import SCHEMA_VERSION, get_connection, get_database_status, initialize_database
 from aegis.instruments import InstrumentInput, register_instrument
-from aegis.market_data import import_ohlcv_csv
+from aegis.market_data import declare_import_source_use_status, import_ohlcv_csv
 from aegis.market_quality import CalendarRegistry, load_calendar_registry
 from aegis.strategy_lab import (
     StrategyCandle,
@@ -134,6 +134,13 @@ def _import(database_path: Path, tmp_path: Path, *, missing: int | None = None) 
         "1m",
     )
     assert result.accepted_rows == len(_CLOSES) - (missing is not None)
+    declare_import_source_use_status(
+        database_path,
+        result.import_id,
+        "VERIFIED_PERMITTED",
+        declared_by="synthetic strategy lab test fixture",
+        rationale="Test-generated synthetic candles; declaration is limited to this fixture and is not licensing evidence.",
+    )
 
 
 def test_simple_moving_average_uses_trailing_decimal_values() -> None:
@@ -264,7 +271,7 @@ def test_experiment_registry_uses_existing_schema_and_freezes_strategy_version(
     experiments = list_strategy_experiments(database_path)
     assert len(experiments) == 2
     assert all(item["strategy_spec_sha256"] for item in experiments)
-    assert get_database_status(database_path)["schema_version"] == 7
+    assert get_database_status(database_path)["schema_version"] == SCHEMA_VERSION
 
 
 def test_experiment_registry_scopes_versions_by_instrument_and_interval(
@@ -658,3 +665,243 @@ def test_register_experiment_rejects_inactive_and_mismatched_instruments(
         _register(inactive_path)
     with pytest.raises(StrategyLabError, match="does not match"):
         _register(database_path, _spec(instrument_type="INDEX"))
+
+
+def _import_undeclared(database_path: Path, tmp_path: Path) -> int:
+    result = import_ohlcv_csv(
+        database_path,
+        _write_csv(tmp_path),
+        "NSE",
+        "TCS",
+        "1m",
+    )
+    assert result.accepted_rows == len(_CLOSES)
+    return result.import_id
+
+
+def _write_csv_subset(path: Path, start_index: int, end_index: int) -> Path:
+    lines = ["timestamp,open,high,low,close,volume"]
+    for index in range(start_index, end_index):
+        close = _CLOSES[index]
+        minute = 15 + index
+        lines.append(
+            f"2026-01-05T09:{minute:02d}:00+05:30,{close},{close + 1},{close - 1},{close},100"
+        )
+    csv_path = path / "subset_candles.csv"
+    csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return csv_path
+
+
+def _persisted_run(database_path: Path, run_id: int) -> dict[str, object]:
+    with closing(get_connection(database_path)) as connection:
+        row = connection.execute(
+            "SELECT status, result_json FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+    assert row is not None
+    assert row["status"] == "BLOCKED"
+    return json.loads(row["result_json"])
+
+
+def _run_and_assert_blocked(
+    database_path: Path, experiment_id: int, tmp_path: Path, *, status_label: str
+) -> dict[str, object]:
+    result = run_strategy_experiment(
+        database_path, experiment_id, calendars=_registry(tmp_path), as_of=_AS_OF
+    )
+    assert result.status == "BLOCKED"
+    assert result.signals == ()
+    assert result.reason is not None
+    assert "VERIFIED_PERMITTED" in result.reason
+    assert status_label in (result.reason or "")
+    persisted = _persisted_run(database_path, result.run_id)
+    assert persisted["status"] == "BLOCKED"
+    assert persisted["provenance_status"] == "PARTIAL_BLOCKED"
+    assert not persisted.get("signals")
+    return persisted
+
+
+def test_run_blocks_unverified_import(database_path: Path, tmp_path: Path) -> None:
+    import_id = _import_undeclared(database_path, tmp_path)
+    experiment_id = _register(database_path)
+
+    with closing(get_connection(database_path)) as connection:
+        declared = connection.execute(
+            "SELECT source_use_status FROM data_imports WHERE id = ?", (import_id,)
+        ).fetchone()[0]
+    assert declared == "UNVERIFIED"
+
+    persisted = _run_and_assert_blocked(
+        database_path, experiment_id, tmp_path, status_label=str(import_id)
+    )
+    assert str(import_id) in (persisted.get("reason") or "")
+
+
+def test_run_blocks_prohibited_import(database_path: Path, tmp_path: Path) -> None:
+    import_id = _import_undeclared(database_path, tmp_path)
+    declare_import_source_use_status(
+        database_path,
+        import_id,
+        "PROHIBITED",
+        declared_by="synthetic strategy lab test fixture",
+        rationale="Test-generated synthetic candles; declaration is limited to this fixture and is not licensing evidence.",
+    )
+    experiment_id = _register(database_path)
+
+    persisted = _run_and_assert_blocked(
+        database_path, experiment_id, tmp_path, status_label=str(import_id)
+    )
+    assert str(import_id) in (persisted.get("reason") or "")
+
+
+def test_run_blocks_undeclared_import(database_path: Path, tmp_path: Path) -> None:
+    import_id = _import_undeclared(database_path, tmp_path)
+    experiment_id = _register(database_path)
+
+    with closing(get_connection(database_path)) as connection:
+        declared = connection.execute(
+            "SELECT source_use_status FROM data_imports WHERE id = ?", (import_id,)
+        ).fetchone()[0]
+    assert declared == "UNVERIFIED"
+
+    _run_and_assert_blocked(database_path, experiment_id, tmp_path, status_label=str(import_id))
+
+
+def test_run_blocks_missing_source_import_provenance(
+    database_path: Path, tmp_path: Path, monkeypatch
+) -> None:
+    _import(database_path, tmp_path)
+    experiment_id = _register(database_path)
+
+    candles = tuple(_candle(index, close) for index, close in enumerate(_CLOSES))
+
+    def fake_load_missing(*args, **kwargs):
+        return list(candles), "dataset-sha", (), ()
+
+    monkeypatch.setattr("aegis.strategy_lab._load_completed_candles", fake_load_missing)
+
+    result = run_strategy_experiment(
+        database_path, experiment_id, calendars=_registry(tmp_path), as_of=_AS_OF
+    )
+    assert result.status == "BLOCKED"
+    assert result.signals == ()
+    assert "No source-import provenance" in (result.reason or "")
+    persisted = _persisted_run(database_path, result.run_id)
+    assert persisted["status"] == "BLOCKED"
+    assert persisted["provenance_status"] == "PARTIAL_BLOCKED"
+
+
+def test_run_blocks_malformed_source_import_status(
+    database_path: Path, tmp_path: Path, monkeypatch
+) -> None:
+    _import(database_path, tmp_path)
+    experiment_id = _register(database_path)
+
+    candles = tuple(_candle(index, close) for index, close in enumerate(_CLOSES))
+
+    def fake_load_malformed(*args, **kwargs):
+        return (
+            list(candles),
+            "dataset-sha",
+            (),
+            (
+                {
+                    "import_id": 1,
+                    "file_sha256": "abc",
+                    "source_use_status": None,
+                    "declaration_id": None,
+                    "declared_by": None,
+                    "rationale": None,
+                    "declared_at": None,
+                },
+            ),
+        )
+
+    monkeypatch.setattr("aegis.strategy_lab._load_completed_candles", fake_load_malformed)
+
+    result = run_strategy_experiment(
+        database_path, experiment_id, calendars=_registry(tmp_path), as_of=_AS_OF
+    )
+    assert result.status == "BLOCKED"
+    assert result.signals == ()
+    assert "VERIFIED_PERMITTED" in (result.reason or "")
+    persisted = _persisted_run(database_path, result.run_id)
+    assert persisted["provenance_status"] == "PARTIAL_BLOCKED"
+
+
+@pytest.mark.parametrize("later_status", ["UNVERIFIED", "PROHIBITED"])
+def test_run_blocks_when_any_contributing_import_is_not_permitted(
+    database_path: Path, tmp_path: Path, later_status: str
+) -> None:
+    first_import = import_ohlcv_csv(
+        database_path, _write_csv_subset(tmp_path, 0, 4), "NSE", "TCS", "1m"
+    )
+    declare_import_source_use_status(
+        database_path,
+        first_import.import_id,
+        "VERIFIED_PERMITTED",
+        declared_by="synthetic strategy lab test fixture",
+        rationale="First synthetic fixture permitted; not licensing evidence.",
+    )
+    second_import = import_ohlcv_csv(
+        database_path, _write_csv_subset(tmp_path, 4, 7), "NSE", "TCS", "1m"
+    )
+    if later_status != "UNVERIFIED":
+        declare_import_source_use_status(
+            database_path,
+            second_import.import_id,
+            later_status,
+            declared_by="synthetic strategy lab test fixture",
+            rationale="Second synthetic fixture; not licensing evidence.",
+        )
+    assert second_import.import_id != first_import.import_id
+
+    with closing(get_connection(database_path)) as connection:
+        statuses = {
+            row["original_filename"]: row["source_use_status"]
+            for row in connection.execute(
+                "SELECT original_filename, source_use_status FROM data_imports ORDER BY id"
+            ).fetchall()
+        }
+    assert statuses["subset_candles.csv"] == later_status
+
+    experiment_id = _register(database_path)
+    persisted = _run_and_assert_blocked(
+        database_path, experiment_id, tmp_path, status_label=str(second_import.import_id)
+    )
+    assert str(second_import.import_id) in (persisted.get("reason") or "")
+    # One permitted import must not mask another non-permitted import.
+    assert "VERIFIED_PERMITTED" in (persisted.get("reason") or "")
+
+
+def test_completed_run_persists_source_import_provenance(
+    database_path: Path, tmp_path: Path
+) -> None:
+    _import(database_path, tmp_path)
+    experiment_id = _register(database_path)
+
+    result = run_strategy_experiment(
+        database_path, experiment_id, calendars=_registry(tmp_path), as_of=_AS_OF
+    )
+    assert result.status == "COMPLETED"
+    assert result.signals != ()
+
+    with closing(get_connection(database_path)) as connection:
+        import_row = connection.execute(
+            "SELECT id, source_use_status FROM data_imports ORDER BY id"
+        ).fetchone()
+        run = connection.execute(
+            "SELECT status, result_json FROM runs WHERE id = ?", (result.run_id,)
+        ).fetchone()
+    assert run["status"] == "COMPLETED"
+    persisted = json.loads(run["result_json"])
+    assert persisted["metadata"]["provenance_status"] == "COMPLETE"
+    assert persisted["metadata"]["dataset_sha256"] == result.dataset_sha256
+    source_imports = persisted["metadata"]["source_imports"]
+    assert source_imports
+    imported = source_imports[0]
+    assert imported["import_id"] == int(import_row["id"])
+    assert imported["source_use_status"] == "VERIFIED_PERMITTED"
+    assert imported["file_sha256"]
+    assert imported["declared_by"] == "synthetic strategy lab test fixture"
+    assert "rationale" in imported
+    assert "declared_at" in imported

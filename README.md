@@ -21,10 +21,13 @@ This folder contains milestone-specific implementation instructions and acceptan
 
 ## Execution and safety modes
 
-**`RESEARCH_ONLY` is the only currently available application mode.** The application
-does not connect to a broker and has no live order-placement path.
+**`RESEARCH_ONLY` is the only currently available application mode.** The local paper
+ledger is an explicit-input simulation API with a read-only dashboard report; it is not
+an enabled application mode or an automated strategy runner. The application does not
+connect to a broker and has no live order-placement path.
 
-- `PAPER_TRADING` is planned for a later phase and is not implemented or available.
+- `PAPER_TRADING` mode is not implemented or available. Phase 8's simulation foundation
+  does not change the configured application mode or authorize forward operation.
 - `LIVE_TRADING` is not implemented and remains unavailable. Phase 12 is an assessment,
   not authorization or activation; any implementation would require a separate, explicit
   approval.

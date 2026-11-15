@@ -93,6 +93,21 @@ Calendar results remain limited by administrator-supplied coverage and source ve
 - Do not persist or deploy models, connect them to execution, or change execution mode without separate approval.
 - Phase 7 acceptance remains pending until the implementation report maps every criterion to evidence and demonstrates cost-aware, untouched out-of-sample results.
 
+## Phase 8 paper execution foundation acceptance
+
+- Keep `RESEARCH_ONLY`; do not add a broker connection, live order path, live credentials, or automated strategy-to-order routing.
+- Accept only explicit execution snapshots tied to an active, registered, supported instrument, an explicitly `VERIFIED_PERMITTED` completed import, and a matching quality report with full confirmed calendar coverage, complete/fresh prior data, and a last completed candle strictly before execution.
+- Separate and persist signal, submission, simulated execution and fill timestamps. Use only a caller-supplied quote available at execution time; never use candle close or eventual candle volume for the fill decision.
+- Require explicit per-account capital, risk limits and cost assumptions. Reject invalid or missing settings; apply long-only exposure, order-value, position-size, daily-loss, market-age and available-cash controls deterministically.
+- Use Decimal accounting and the existing backtest spread, slippage, tick-rounding and fee conventions. Clearly label all values simulated; these are assumptions, not official charges or evidence of actual fills.
+- Persist idempotent order IDs, state events, fills, fee/cost detail, cash entries, positions, marks, realized P&L and daily state in one transaction. Rebuild and reconcile accounting from persisted fills/entries; discrepancy halts the account and is never auto-repaired.
+- Calculate projected exposure by replacing the existing instrument's marked exposure once with the complete post-order quantity at the execution quote. Projected daily equity includes post-fill cash and the full post-order position. A daily-loss breach blocks additional BUYs; a valid risk-reducing SELL may exit during risk/data halts while its own evidence, capacity, order-value and held-quantity checks remain active. Stale marks on other existing positions cannot trap an otherwise validated exit. Reconciliation halts block both sides, and SELLs never clear a halt.
+- Reconciliation verifies that each filled order has exactly one matching fill and directionally correct ledger entry, with matching order/fill account context, instrument, quantity and price. Rejected orders cannot carry financial records; cross-linked, missing, duplicate or contradictory financial records fail closed without repair.
+- Test migrations, transaction rollback, restart/idempotency, risk failures, invalid source/calendar/quality evidence, deterministic IDs, accounting and dashboard behavior only against isolated temporary databases/logs.
+- The implemented execution policy is synchronous all-or-none at an explicitly supplied execution-time quote. Pending orders, cancellation, partial fills, shorting, leverage, strategy automation and live-data forwarding are outside this foundation unless separately specified and approved.
+- A read-only dashboard may present simulated accounts, orders, fills, positions, assumptions and daily summaries. It must not provide account creation or order-submission controls while the application remains `RESEARCH_ONLY`.
+- Paper execution acceptance does not imply Phase 4 backtesting acceptance, verified live-data availability, forward-test readiness, profitability, or authorization to change application mode.
+
 ## Quantitative research quality
 Every candidate report must include:
 - Data source, licence/terms status, date range, interval and universe definition.

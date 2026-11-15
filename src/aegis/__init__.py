@@ -1,5 +1,11 @@
 __version__ = "0.1.0"
 
+from aegis.ai_agent import (
+    AIAgent,
+    MockLLMProvider,
+    ToolRegistry,
+    create_default_tool_registry,
+)
 from aegis.candlesticks import (
     Candle,
     CandlestickPatternError,
@@ -14,6 +20,27 @@ from aegis.candlesticks import (
     detect_single_candle_patterns,
     detect_two_candle_patterns,
     prepare_candles,
+)
+from aegis.forward_paper_trading import (
+    DecisionAction,
+    DecisionProposal,
+    ForwardPaperTradingEngine,
+    MarketCandidate,
+    MarketEvidence,
+    ProposalExecutionResult,
+    ProposalValidationError,
+    ProposalValidationResult,
+    build_mock_proposal,
+    create_test_fixture,
+)
+from aegis.forward_runtime import (
+    DeterministicSyntheticQuoteProvider,
+    FeedHealth,
+    ForwardRuntimeError,
+    ForwardRuntimeService,
+    Quote,
+    QuoteProvider,
+    QuoteResult,
 )
 from aegis.indicators import (
     IndicatorError,
@@ -37,17 +64,38 @@ from aegis.indicators import (
 )
 
 __all__ = [
+    "AIAgent",
     "Candle",
     "CandlestickPatternError",
+    "DecisionAction",
+    "DecisionProposal",
     "DetectionConfig",
+    "DeterministicSyntheticQuoteProvider",
+    "FeedHealth",
+    "ForwardPaperTradingEngine",
+    "ForwardRuntimeError",
+    "ForwardRuntimeService",
     "IndicatorError",
     "IndicatorResult",
+    "MarketCandidate",
+    "MarketEvidence",
+    "MockLLMProvider",
     "PatternResult",
+    "ProposalExecutionResult",
+    "ProposalValidationError",
+    "ProposalValidationResult",
+    "Quote",
+    "QuoteProvider",
+    "QuoteResult",
     "SessionContext",
+    "ToolRegistry",
     "__version__",
     "absolute_returns",
     "average_true_range",
     "bollinger_bands",
+    "build_mock_proposal",
+    "create_default_tool_registry",
+    "create_test_fixture",
     "detect_all_patterns",
     "detect_multi_candle_patterns",
     "detect_pattern",

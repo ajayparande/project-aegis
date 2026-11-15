@@ -769,6 +769,32 @@ def _gate_reason(report: DatasetQualityReport) -> str | None:
     return None
 
 
+def _validate_source_imports(
+    source_imports: tuple[dict[str, object], ...],
+) -> None:
+    """Require every contributing import to be declared VERIFIED_PERMITTED before signals."""
+
+    if not source_imports:
+        raise DataQualityGateError(
+            "No source-import provenance was resolved for the dataset. "
+            "Every import contributing candles must be declared VERIFIED_PERMITTED; "
+            "this is a recorded declaration, not independent legal verification."
+        )
+    blocked: list[str] = []
+    for source_import in source_imports:
+        import_id = source_import.get("import_id")
+        status = source_import.get("source_use_status")
+        if status != "VERIFIED_PERMITTED":
+            blocked.append(str(import_id) if import_id is not None else "unknown import")
+    if blocked:
+        raise DataQualityGateError(
+            "Source imports must be declared VERIFIED_PERMITTED before strategy evaluation: "
+            + ", ".join(blocked)
+            + ". Every import contributing candles requires an explicit VERIFIED_PERMITTED "
+            "declaration; this is a recorded declaration, not independent legal verification."
+        )
+
+
 def _decimal_text(value: Decimal) -> str:
     text = format(value, "f")
     return text.rstrip("0").rstrip(".") if "." in text else text
@@ -1016,16 +1042,20 @@ def run_strategy_experiment(
         if uncovered:
             raise DataQualityGateError("Calendar coverage is incomplete for the experiment range.")
         completed_timestamps = {item.timestamp for item in completed_candles}
-        candles, dataset_sha, source_hashes, _ = _load_completed_candles(
-            database_path,
-            exchange=spec.exchange,
-            trading_symbol=spec.trading_symbol,
-            interval=spec.interval,
-            start_date=start_date,
-            end_date=end_date,
-            timezone_name=calendar.timezone_name,
-            completed_timestamps=completed_timestamps,
-        )
+        try:
+            candles, dataset_sha, source_hashes, source_imports = _load_completed_candles(
+                database_path,
+                exchange=spec.exchange,
+                trading_symbol=spec.trading_symbol,
+                interval=spec.interval,
+                start_date=start_date,
+                end_date=end_date,
+                timezone_name=calendar.timezone_name,
+                completed_timestamps=completed_timestamps,
+            )
+        except StrategyLabError as exc:
+            raise DataQualityGateError(str(exc)) from exc
+        _validate_source_imports(source_imports)
         _validate_candles(candles)
         if len(candles) != report.expected_candles:
             raise DataQualityGateError(
@@ -1057,6 +1087,7 @@ def run_strategy_experiment(
             "source_revision_status": source_revision["status"],
             "dataset_sha256": dataset_sha,
             "source_file_sha256s": list(source_hashes),
+            "source_imports": list(source_imports),
             "exchange": spec.exchange,
             "trading_symbol": spec.trading_symbol,
             "interval": spec.interval,

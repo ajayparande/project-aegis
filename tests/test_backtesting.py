@@ -2186,6 +2186,118 @@ def test_duplicate_signal_rejections_and_closed_trade_round_trip() -> None:
     assert sim["summary"]["closed_trade_count"] == 1
 
 
+def test_entry_exit_round_trip_with_costs_hand_calculated() -> None:
+    """Hand-calculated entry→exit round trip with configured (non-zero) costs.
+
+    Scenario (all prices in INR, qty = 10, tick = 0.05):
+      Candle 0 (03:15): close 100
+      Candle 1 (03:16): close 110 -> ENTER_LONG signal at Candle 1 close
+      Candle 2 (03:17): open 100  -> BUY fills at Candle 2 open
+      Candle 3 (03:18): close 120 -> EXIT_LONG signal at Candle 3 close
+      Candle 4 (03:19): open 120  -> SELL fills at Candle 4 open
+
+    Costs (default_cost_assumptions): spread 2 bps, slippage 5 bps, adverse.
+
+    BUY at reference 100.00:
+      spread_per_unit = 100 * 0.0001 = 0.01
+      slippage_per_unit = 100 * 0.0005 = 0.05
+      raw_price = 100.06 -> ROUND_CEILING to 0.05 ticks -> fill 100.10
+      turnover = 1001.00
+      brokerage 0.30, exchange 0.03, regulatory 0.00, tax 1.00, stamp 0.15, gst 0.06
+      entry_fees = 1.54
+
+    SELL at reference 120.00:
+      spread_per_unit = 120 * 0.0001 = 0.012
+      slippage_per_unit = 120 * 0.0005 = 0.06
+      raw_price = 119.928 -> ROUND_FLOOR to 0.05 ticks -> fill 119.90
+      turnover = 1199.00
+      brokerage 0.36, exchange 0.04, regulatory 0.00, tax 1.20, stamp 0.00, gst 0.07
+      exit_fees = 1.67
+
+    gross_pnl = (119.90 - 100.10) * 10 = 198.00
+    net_pnl   = 198.00 - 1.54 - 1.67 = 194.79
+    ending_cash = 100000 - 1001.00 - 1.54 + 1199.00 - 1.67 = 100194.79
+    """
+    cal = _calendar_fixture()
+    expected_by_timestamp = {
+        f"2026-01-05T03:{15 + i:02d}:00Z": datetime(2026, 1, 5, 3, 16 + i) for i in range(5)
+    }
+    candles = [
+        StrategyCandle(
+            f"2026-01-05T03:{15 + i:02d}:00Z",
+            Decimal(100),
+            Decimal(105),
+            Decimal(95),
+            Decimal(100),
+            1000,
+        )
+        for i in range(5)
+    ]
+    # Override closes so Candle 1 = 110 (entry signal) and Candle 3 = 120 (exit signal).
+    candles[1] = StrategyCandle(
+        "2026-01-05T03:16:00Z", Decimal(110), Decimal(115), Decimal(105), Decimal(110), 1000
+    )
+    candles[3] = StrategyCandle(
+        "2026-01-05T03:18:00Z", Decimal(120), Decimal(125), Decimal(115), Decimal(120), 1000
+    )
+    candles[4] = StrategyCandle(
+        "2026-01-05T03:19:00Z", Decimal(120), Decimal(125), Decimal(115), Decimal(120), 1000
+    )
+    signals = (
+        StrategySignal(
+            "2026-01-05T03:16:00Z", "ENTER_LONG", Decimal(110), Decimal(110), Decimal(100)
+        ),
+        StrategySignal(
+            "2026-01-05T03:18:00Z", "EXIT_LONG", Decimal(120), Decimal(120), Decimal(100)
+        ),
+    )
+    config = BacktestConfig(
+        starting_cash=Decimal(100000),
+        order_quantity=10,
+        max_volume_participation=Decimal("0.5"),
+        costs=default_cost_assumptions(),
+    )
+    sim = _simulate(
+        candles,
+        signals,
+        config=config,
+        tick_size=Decimal("0.05"),
+        interval="1m",
+        calendar=cal,
+        expected_by_timestamp=expected_by_timestamp,
+    )
+    orders = sim["orders"]
+    assert isinstance(orders, list)
+    assert len(orders) == 2
+    assert orders[0]["status"] == "FILLED"
+    assert orders[0]["fill_price"] == "100.1"
+    assert orders[1]["status"] == "FILLED"
+    assert orders[1]["fill_price"] == "119.9"
+
+    trades = sim["trades"]
+    assert isinstance(trades, list)
+    assert len(trades) == 1
+    trade = trades[0]
+    assert trade["quantity"] == 10
+    assert trade["entry_price"] == "100.1"
+    assert trade["exit_price"] == "119.9"
+    assert trade["gross_pnl"] == "198"
+    assert trade["entry_fees"] == "1.54"
+    assert trade["exit_fees"] == "1.67"
+    assert trade["net_pnl"] == "194.79"
+
+    summary = sim["summary"]
+    assert summary["ending_cash"] == "100194.79"
+    assert summary["ending_equity"] == "100194.79"
+    assert summary["open_position_quantity"] == 0
+    assert summary["absolute_pnl"] == "194.79"
+    assert summary["realized_net_pnl"] == "194.79"
+    assert summary["total_fees"] == "3.21"
+    assert summary["filled_turnover"] == "2200"
+    # Costs must reduce gross to net; net P&L strictly below gross P&L.
+    assert Decimal(str(summary["realized_net_pnl"])) < Decimal(str(trade["gross_pnl"]))
+
+
 def test_backtest_blocks_when_strategy_history_is_below_required_minimum(
     database_path: Path, tmp_path: Path
 ) -> None:
@@ -2407,6 +2519,61 @@ def test_mixed_source_dataset_requires_every_contributing_import_to_be_permitted
         "VERIFIED_PERMITTED",
         "UNVERIFIED",
     }
+
+
+def test_backtest_blocks_missing_source_import_provenance(
+    database_path: Path, tmp_path: Path, monkeypatch
+) -> None:
+    rows = [
+        (
+            f"2026-01-05T09:{15 + index:02d}:00+05:30",
+            close,
+            close + 2,
+            close - 2,
+            close,
+            1000,
+        )
+        for index, close in enumerate((30, 20, 10, 20, 40, 50))
+    ]
+    csv_path = _write_csv(tmp_path, rows, filename="provenance.csv")
+    imported = import_ohlcv_csv(database_path, csv_path, "NSE", "TCS", "1m")
+    assert imported.accepted_rows == len(rows)
+    declare_import_source_use_status(
+        database_path,
+        imported.import_id,
+        "VERIFIED_PERMITTED",
+        declared_by="synthetic backtest fixture",
+        rationale="Synthetic test data; not licensing evidence.",
+    )
+    strategy_experiment_id = _create_strategy_experiment(database_path)
+    registration = register_backtest(
+        database_path,
+        strategy_experiment_id,
+        BacktestConfig(
+            Decimal(100000),
+            1,
+            Decimal("0.5"),
+            zero_cost_assumptions(),
+        ),
+    )
+    calendar_path = _create_calendar_file(tmp_path, len(rows), "missing_provenance")
+    as_of = datetime(2026, 1, 5, 9, 16 + len(rows), tzinfo=ZoneInfo("Asia/Kolkata"))
+
+    def empty_provenance(*args, **kwargs):
+        return [], "dataset-sha", (), ()
+
+    monkeypatch.setattr("aegis.backtesting._load_completed_candles", empty_provenance)
+
+    run_backtest(
+        database_path,
+        registration.experiment_id,
+        calendars=load_calendar_registry(calendar_path),
+        as_of=as_of,
+    )
+    result = list_backtest_runs(database_path, registration.experiment_id)[0]["result"]
+    assert result["status"] == "BLOCKED"
+    assert "No source-import provenance" in result["reason"]
+    assert result["source_imports"] == []
 
 
 def test_source_use_declaration_requires_explicit_auditable_user_action(

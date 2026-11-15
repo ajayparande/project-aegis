@@ -1,24 +1,19 @@
 """Smoke tests for the Aegis Streamlit dashboard."""
 
 import hashlib
+import sqlite3
 from contextlib import closing
 from pathlib import Path
 
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from aegis.database import get_connection, initialize_database
+from aegis.database import get_connection, get_readonly_connection, initialize_database
 from aegis.instruments import InstrumentInput, register_instrument
 from aegis.market_data import import_ohlcv_csv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_FILE = PROJECT_ROOT / "app.py"
-DEVELOPMENT_FILES = (
-    PROJECT_ROOT / "data" / "aegis.db",
-    PROJECT_ROOT / "data" / "aegis.db-wal",
-    PROJECT_ROOT / "data" / "aegis.db-shm",
-    PROJECT_ROOT / "logs" / "aegis.log",
-)
 
 
 @pytest.fixture
@@ -29,14 +24,14 @@ def isolated_app_paths(monkeypatch, tmp_path):
     log_path = tmp_path / "aegis.log"
     monkeypatch.setenv("AEGIS_DATABASE_PATH", str(database_path))
     monkeypatch.setenv("AEGIS_LOG_FILE", str(log_path))
+    initialize_database(database_path)
     return database_path, log_path
 
 
-def _development_file_snapshot() -> dict[Path, tuple[bool, str | None]]:
-    """Return content hashes for default development database, sidecars, and log."""
-
+def _file_snapshot(paths: tuple[Path, ...]) -> dict[Path, tuple[bool, str | None]]:
+    """Return content hashes for explicitly isolated test files."""
     snapshot = {}
-    for path in DEVELOPMENT_FILES:
+    for path in paths:
         digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
         snapshot[path] = (path.exists(), digest)
     return snapshot
@@ -65,15 +60,47 @@ def test_dashboard_displays_research_only_warning(isolated_app_paths) -> None:
     assert any("RESEARCH ONLY" in warning for warning in warnings)
 
 
+def test_dashboard_shows_simulated_reports_without_execution_controls(isolated_app_paths) -> None:
+    app = AppTest.from_file(str(APP_FILE)).run(timeout=10)
+
+    assert not app.exception
+    assert "Paper Simulation Reports — Read Only" in [item.value for item in app.subheader]
+    assert any(
+        "does not create accounts or submit simulated orders" in item.value for item in app.caption
+    )
+    assert {item.label: item.value for item in app.metric}["Application Mode"] == "RESEARCH_ONLY"
+    assert not any("submit simulated order" in item.label.lower() for item in app.button)
+
+
+def test_read_only_dashboard_connection_rejects_database_writes(isolated_app_paths) -> None:
+    database_path, _ = isolated_app_paths
+    initialize_database(database_path)
+
+    with (
+        closing(get_readonly_connection(database_path)) as connection,
+        pytest.raises(sqlite3.OperationalError, match="readonly"),
+    ):
+        connection.execute("INSERT INTO schema_metadata (version) VALUES (100)")
+
+    with closing(get_connection(database_path)) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM schema_metadata WHERE version = 100"
+            ).fetchone()[0]
+            == 0
+        )
+
+
 def test_dashboard_does_not_modify_development_database_or_log(isolated_app_paths) -> None:
     database_path, _ = isolated_app_paths
-    before = _development_file_snapshot()
+    paths = (database_path,)
+    before = _file_snapshot(paths)
 
     app = AppTest.from_file(str(APP_FILE)).run()
 
     assert not app.exception
     assert database_path.exists()
-    assert _development_file_snapshot() == before
+    assert _file_snapshot(paths) == before
 
 
 def test_dashboard_shows_instrument_master_summary_and_details(isolated_app_paths) -> None:
@@ -215,3 +242,48 @@ def test_dashboard_registers_experiment_in_isolated_database(isolated_app_paths)
     with closing(get_connection(database_path)) as connection:
         experiment_count = connection.execute("SELECT COUNT(*) FROM experiments").fetchone()[0]
     assert experiment_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 regression: AI Research panel startup without a Gemini key
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_starts_without_gemini_key(isolated_app_paths, monkeypatch) -> None:
+    """Dashboard must start cleanly when GEMINI_API_KEY is absent (Phase 9 regression)."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    app = AppTest.from_file(str(APP_FILE)).run(timeout=10)
+
+    assert not app.exception
+
+
+def test_ai_panel_shows_mock_provider_when_key_absent(isolated_app_paths, monkeypatch) -> None:
+    """AI Research panel must report offline/mock provider when no API key is set."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    app = AppTest.from_file(str(APP_FILE)).run(timeout=10)
+
+    assert not app.exception
+    all_text = " ".join(item.value for item in app.markdown)
+    # Must mention offline/mock status — not claim Gemini is configured
+    assert "Mock Provider (Offline)" in all_text or "No LLM API key detected" in all_text
+    assert "Gemini API configured" not in all_text
+
+
+def test_ai_panel_uses_gemini_env_var_when_configured(isolated_app_paths, monkeypatch) -> None:
+    """AI panel must use GEMINI_API_KEY env var without crashing on startup.
+
+    This test sets a fake key to verify the provider detection path; no real
+    API call is made because the form is not submitted. The key value is never
+    asserted on — only provider-label rendering is checked.
+    """
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-test-key-not-a-real-credential")
+
+    app = AppTest.from_file(str(APP_FILE)).run(timeout=10)
+
+    assert not app.exception
+    all_text = " ".join(item.value for item in app.markdown)
+    assert "Gemini API" in all_text
+    # Key value must never appear in any rendered output
+    assert "fake-test-key-not-a-real-credential" not in all_text

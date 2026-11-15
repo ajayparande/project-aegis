@@ -25,6 +25,23 @@ ALL_TABLES = {
     "data_quality_issues",
     "historical_candles",
     "import_source_use_history",
+    "paper_accounts",
+    "paper_orders",
+    "paper_fills",
+    "paper_ledger_entries",
+    "paper_positions",
+    "paper_realized_pnl",
+    "paper_marks",
+    "paper_order_events",
+    "paper_daily_state",
+    "forward_runtimes",
+    "forward_runtime_imports",
+    "forward_quotes",
+    "forward_runtime_candles",
+    "forward_scheduler_events",
+    "forward_execution_authorizations",
+    "forward_trade_controls",
+    "paper_execution_snapshot_uses",
 }
 
 
@@ -169,6 +186,57 @@ def _create_version_6_database(database_path) -> None:
         connection.close()
 
 
+def _create_version_8_database(database_path) -> None:
+    """Create the populated schema immediately before forward-runtime tables."""
+
+    _create_version_6_database(database_path)
+    connection = sqlite3.connect(database_path)
+    try:
+        for statement in database.MIGRATIONS[6]:
+            database._execute_statements(connection, statement)
+        connection.execute("INSERT INTO schema_metadata (version) VALUES (7)")
+        for statement in database.MIGRATIONS[7]:
+            database._execute_statements(connection, statement)
+        connection.execute("INSERT INTO schema_metadata (version) VALUES (8)")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _insert_phase_8_records(connection, account_id: int) -> None:
+    instrument_id = connection.execute(
+        """INSERT INTO instruments
+           (exchange, trading_symbol, instrument_name, instrument_type, lot_size, is_active)
+           VALUES ('NSE', 'MIGRATION', 'Migration Fixture', 'EQUITY', 1, 1)"""
+    ).lastrowid
+    order_id = "phase8-preserved-order"
+    fill_id = "phase8-preserved-fill"
+    connection.execute(
+        """INSERT INTO paper_orders
+           (order_id, account_id, idempotency_key, request_sha256, instrument_id,
+            requested_instrument_id, side, quantity, status, signal_timestamp,
+            submitted_timestamp, execution_timestamp, reference_price, fill_price, created_at)
+           VALUES (?, ?, 'preserved-key', ?, ?, ?, 'BUY', 1, 'FILLED',
+                   '2026-01-05T09:15:00Z', '2026-01-05T09:15:00Z',
+                   '2026-01-05T09:15:00Z', '100.00', '100.00', '2026-01-05T09:15:00Z')""",
+        (order_id, account_id, "a" * 64, instrument_id, instrument_id),
+    )
+    connection.execute(
+        """INSERT INTO paper_fills
+           (fill_id, order_id, instrument_id, quantity, fill_price, fees_json,
+            execution_costs_json, execution_timestamp)
+           VALUES (?, ?, ?, 1, '100.00', '{}', '{}', '2026-01-05T09:15:00Z')""",
+        (fill_id, order_id, instrument_id),
+    )
+    connection.execute(
+        """INSERT INTO paper_ledger_entries
+           (entry_id, account_id, order_id, fill_id, entry_type, amount, created_at)
+           VALUES ('phase8-preserved-ledger', ?, ?, ?, 'BUY_CASH_DEBIT', '-100.00',
+                   '2026-01-05T09:15:00Z')""",
+        (account_id, order_id, fill_id),
+    )
+
+
 def _add_metadata_insert_failure(database_path, version: int) -> None:
     connection = sqlite3.connect(database_path)
     try:
@@ -185,6 +253,66 @@ def _add_metadata_insert_failure(database_path, version: int) -> None:
         connection.commit()
     finally:
         connection.close()
+
+
+def _create_populated_version_10_database(database_path) -> int:
+    _create_version_8_database(database_path)
+    with closing(get_connection(database_path)) as connection:
+        cursor = connection.execute(
+            """INSERT INTO paper_accounts
+               (name, initial_cash, risk_limits_json, cost_assumptions_json, created_at)
+               VALUES ('v10 populated account', '12345.67', '{}', '{}', '2026-01-05T00:00:00Z')"""
+        )
+        account_id = int(cursor.lastrowid)
+        _insert_phase_8_records(connection, account_id)
+        for version in (8, 9):
+            for statement in database.MIGRATIONS[version]:
+                database._execute_statements(connection, statement)
+            connection.execute("INSERT INTO schema_metadata (version) VALUES (?)", (version + 1,))
+        instrument_id = int(
+            connection.execute(
+                "SELECT id FROM instruments WHERE trading_symbol = 'MIGRATION'"
+            ).fetchone()["id"]
+        )
+        connection.execute(
+            """INSERT INTO forward_runtimes
+               (runtime_id, account_id, config_json, config_sha256, state_json,
+                state_sha256, status, created_at, updated_at)
+               VALUES ('migration-runtime', ?, '{}', ?, '{}', ?, 'RUNNING',
+                       '2026-01-05T00:00:00Z', '2026-01-05T00:00:00Z')""",
+            (account_id, "a" * 64, "b" * 64),
+        )
+        connection.execute(
+            """INSERT INTO forward_scheduler_events
+               (event_id, runtime_id, instrument_id, interval, candle_timestamp,
+                decision_timestamp, status, proposal_id, result_json, created_at)
+               VALUES ('migration-event', 'migration-runtime', ?, '1m',
+                       '2026-01-05T00:00:00Z', '2026-01-05T00:01:00Z',
+                       'PENDING', 'migration-proposal', NULL, '2026-01-05T00:01:00Z')""",
+            (instrument_id,),
+        )
+        connection.commit()
+    return account_id
+
+
+def _create_populated_version_11_database(database_path) -> int:
+    account_id = _create_populated_version_10_database(database_path)
+    with closing(get_connection(database_path)) as connection:
+        for statement in database.MIGRATIONS[10]:
+            database._execute_statements(connection, statement)
+        connection.execute("INSERT INTO schema_metadata (version) VALUES (11)")
+        connection.commit()
+    return account_id
+
+
+def _create_populated_version_12_database(database_path) -> int:
+    account_id = _create_populated_version_11_database(database_path)
+    with closing(get_connection(database_path)) as connection:
+        for statement in database.MIGRATIONS[11]:
+            database._execute_statements(connection, statement)
+        connection.execute("INSERT INTO schema_metadata (version) VALUES (12)")
+        connection.commit()
+    return account_id
 
 
 def test_fresh_database_initialization(tmp_path) -> None:
@@ -558,7 +686,7 @@ def test_existing_version_6_imports_migrate_to_unverified_permission_status(tmp_
     initialize_database(database_path)
     initialize_database(database_path)
 
-    assert get_database_status(database_path)["schema_version"] == 7
+    assert get_database_status(database_path)["schema_version"] == database.SCHEMA_VERSION
     with closing(get_connection(database_path)) as connection:
         versions = connection.execute(
             "SELECT version FROM schema_metadata ORDER BY version"
@@ -577,7 +705,7 @@ def test_existing_version_6_imports_migrate_to_unverified_permission_status(tmp_
                 "runs",
             )
         }
-    assert [row["version"] for row in versions] == list(range(1, 8))
+    assert [row["version"] for row in versions] == list(range(1, database.SCHEMA_VERSION + 1))
     assert import_row["source_use_status"] == "UNVERIFIED"
     assert history_count == 0
     assert preserved_counts == {
@@ -884,3 +1012,644 @@ def test_experiment_relationships(tmp_path) -> None:
         result = connection.execute("SELECT name FROM experiments").fetchone()
 
         assert result["name"] == "Test Experiment"
+
+
+def test_version_7_migration_adds_paper_tables_and_preserves_records(tmp_path) -> None:
+    database_path = tmp_path / "version_7_paper.db"
+    _create_version_6_database(database_path)
+    connection = sqlite3.connect(database_path)
+    try:
+        for statement in database.MIGRATIONS[6]:
+            database._execute_statements(connection, statement)
+        connection.execute("INSERT INTO schema_metadata (version) VALUES (7)")
+        connection.commit()
+    finally:
+        connection.close()
+
+    initialize_database(database_path)
+
+    status = get_database_status(database_path)
+    assert status["schema_version"] == database.SCHEMA_VERSION
+    assert set(status["tables"]) == ALL_TABLES
+    with closing(get_connection(database_path)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM experiments").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+        assert [
+            row[0]
+            for row in connection.execute("SELECT version FROM schema_metadata ORDER BY version")
+        ] == list(range(1, database.SCHEMA_VERSION + 1))
+
+
+def test_version_8_migration_failure_rolls_back_all_paper_tables(tmp_path) -> None:
+    database_path = tmp_path / "version_7_rollback.db"
+    _create_version_6_database(database_path)
+    connection = sqlite3.connect(database_path)
+    try:
+        for statement in database.MIGRATIONS[6]:
+            database._execute_statements(connection, statement)
+        connection.execute("INSERT INTO schema_metadata (version) VALUES (7)")
+        connection.execute(
+            """CREATE TRIGGER reject_schema_version_8 BEFORE INSERT ON schema_metadata
+               WHEN NEW.version = 8 BEGIN SELECT RAISE(ABORT, 'injected v8 failure'); END"""
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected v8 failure"):
+        initialize_database(database_path)
+
+    connection = sqlite3.connect(database_path)
+    try:
+        version = connection.execute("SELECT MAX(version) FROM schema_metadata").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert version == 7
+        assert not any(name.startswith("paper_") for name in tables)
+        assert connection.execute("SELECT COUNT(*) FROM experiments").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_upgrade_preserves_phase_8_records_and_is_idempotent(tmp_path) -> None:
+    database_path = tmp_path / "version_8_forward_runtime.db"
+    _create_version_8_database(database_path)
+    with closing(get_connection(database_path)) as connection:
+        cursor = connection.execute(
+            """INSERT INTO paper_accounts
+               (name, initial_cash, risk_limits_json, cost_assumptions_json, created_at)
+               VALUES ('preserved account', '12345.67', '{}', '{}', '2026-01-05T00:00:00Z')"""
+        )
+        account_id = cursor.lastrowid
+        _insert_phase_8_records(connection, account_id)
+        connection.execute(
+            """INSERT INTO paper_daily_state (account_id, local_date, starting_equity)
+               VALUES (?, '2026-01-05', '12345.67')""",
+            (account_id,),
+        )
+        connection.commit()
+
+    initialize_database(database_path)
+    first_status = get_database_status(database_path)
+    with closing(get_connection(database_path)) as connection:
+        assert connection.execute(
+            "SELECT name, initial_cash FROM paper_accounts WHERE id = ?", (account_id,)
+        ).fetchone()[:] == ("preserved account", "12345.67")
+        for table in ("paper_orders", "paper_fills", "paper_ledger_entries"):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT starting_equity FROM paper_daily_state WHERE account_id = ?", (account_id,)
+            ).fetchone()[0]
+            == "12345.67"
+        )
+        assert [
+            row[0]
+            for row in connection.execute("SELECT version FROM schema_metadata ORDER BY version")
+        ] == list(range(1, database.SCHEMA_VERSION + 1))
+
+    initialize_database(database_path)
+    second_status = get_database_status(database_path)
+    assert first_status == second_status
+    with closing(get_connection(database_path)) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM paper_accounts WHERE id = ?", (account_id,)
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM schema_metadata WHERE version = ?",
+                (database.SCHEMA_VERSION,),
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_version_9_migration_failure_rolls_back_runtime_tables_and_preserves_phase_8(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "version_8_forward_runtime_rollback.db"
+    _create_version_8_database(database_path)
+    with closing(get_connection(database_path)) as connection:
+        cursor = connection.execute(
+            """INSERT INTO paper_accounts
+               (name, initial_cash, risk_limits_json, cost_assumptions_json, created_at)
+               VALUES ('rollback account', '100', '{}', '{}', '2026-01-05T00:00:00Z')"""
+        )
+        account_id = cursor.lastrowid
+        connection.commit()
+    _add_metadata_insert_failure(database_path, 9)
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected metadata insertion failure"):
+        initialize_database(database_path)
+
+    with closing(get_connection(database_path)) as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_metadata").fetchone()[0] == 8
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM paper_accounts WHERE id = ?", (account_id,)
+            ).fetchone()[0]
+            == 1
+        )
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert not any(name.startswith("forward_") for name in tables)
+
+
+def test_version_10_migration_failure_rolls_back_only_new_schema_and_preserves_phase_8(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "version_9_v10_rollback.db"
+    _create_version_8_database(database_path)
+    with closing(get_connection(database_path)) as connection:
+        cursor = connection.execute(
+            """INSERT INTO paper_accounts
+               (name, initial_cash, risk_limits_json, cost_assumptions_json, created_at)
+               VALUES ('v10 rollback account', '12345.67', '{}', '{}', '2026-01-05T00:00:00Z')"""
+        )
+        account_id = int(cursor.lastrowid)
+        _insert_phase_8_records(connection, account_id)
+        for statement in database.MIGRATIONS[8]:
+            database._execute_statements(connection, statement)
+        connection.execute("INSERT INTO schema_metadata (version) VALUES (9)")
+        connection.commit()
+    _add_metadata_insert_failure(database_path, 10)
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected metadata insertion failure"):
+        initialize_database(database_path)
+
+    with closing(get_connection(database_path)) as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_metadata").fetchone()[0] == 9
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(paper_accounts)")}
+        tables = {
+            row["name"]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "halt_class" not in columns
+        assert "paper_execution_snapshot_uses" not in tables
+        for table in ("paper_accounts", "paper_orders", "paper_fills", "paper_ledger_entries"):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
+
+
+def test_version_11_migration_preserves_populated_v10_and_is_idempotent(tmp_path) -> None:
+    database_path = tmp_path / "version_10_to_11.db"
+    account_id = _create_populated_version_10_database(database_path)
+
+    initialize_database(database_path)
+    first_status = get_database_status(database_path)
+    with closing(get_connection(database_path)) as connection:
+        versions = [
+            row[0]
+            for row in connection.execute("SELECT version FROM schema_metadata ORDER BY version")
+        ]
+        event = connection.execute(
+            """SELECT event_id, proposal_id, status, proposal_sha256
+               FROM forward_scheduler_events WHERE event_id = 'migration-event'"""
+        ).fetchone()
+        for table in ("paper_orders", "paper_fills", "paper_ledger_entries"):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT initial_cash FROM paper_accounts WHERE id = ?", (account_id,)
+            ).fetchone()[0]
+            == "12345.67"
+        )
+    assert first_status["schema_version"] == database.SCHEMA_VERSION
+    assert versions == list(range(1, database.SCHEMA_VERSION + 1))
+    assert tuple(event) == ("migration-event", "migration-proposal", "PENDING", None)
+
+    initialize_database(database_path)
+
+    assert get_database_status(database_path) == first_status
+    with closing(get_connection(database_path)) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM schema_metadata WHERE version = ?",
+                (database.SCHEMA_VERSION,),
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_version_12_migration_preserves_populated_v11_and_is_idempotent(tmp_path) -> None:
+    database_path = tmp_path / "version_11_to_12.db"
+    account_id = _create_populated_version_11_database(database_path)
+
+    initialize_database(database_path)
+    first_status = get_database_status(database_path)
+    with closing(get_connection(database_path)) as connection:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(forward_scheduler_events)")
+        }
+        event = connection.execute(
+            """SELECT event_id, proposal_id, status, proposal_sha256, proposal_json,
+                      proposal_binding_state
+               FROM forward_scheduler_events WHERE event_id = 'migration-event'"""
+        ).fetchone()
+        assert (
+            connection.execute("SELECT COUNT(*) FROM forward_execution_authorizations").fetchone()[
+                0
+            ]
+            == 0
+        )
+        assert {
+            "proposal_sha256",
+            "proposal_json",
+            "proposal_binding_state",
+        }.issubset(columns)
+        for table in ("paper_orders", "paper_fills", "paper_ledger_entries"):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT initial_cash FROM paper_accounts WHERE id = ?", (account_id,)
+            ).fetchone()[0]
+            == "12345.67"
+        )
+    assert first_status["schema_version"] == database.SCHEMA_VERSION
+    assert tuple(event) == (
+        "migration-event",
+        "migration-proposal",
+        "PENDING",
+        None,
+        None,
+        "LEGACY_UNVERIFIABLE",
+    )
+
+    initialize_database(database_path)
+
+    assert get_database_status(database_path) == first_status
+    with closing(get_connection(database_path)) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM schema_metadata WHERE version = ?",
+                (database.SCHEMA_VERSION,),
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_version_13_migration_classifies_pending_event_bindings_and_is_idempotent(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "version_12_to_13.db"
+    account_id = _create_populated_version_12_database(database_path)
+    with closing(get_connection(database_path)) as connection:
+        legacy_event = connection.execute(
+            "SELECT * FROM forward_scheduler_events WHERE event_id = 'migration-event'"
+        ).fetchone()
+        connection.execute(
+            """INSERT INTO forward_scheduler_events
+               (event_id, runtime_id, instrument_id, interval, candle_timestamp,
+                decision_timestamp, status, proposal_id, proposal_sha256, proposal_json,
+                result_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, NULL, ?)""",
+            (
+                "migration-bound-event",
+                legacy_event["runtime_id"],
+                legacy_event["instrument_id"],
+                legacy_event["interval"],
+                legacy_event["candle_timestamp"],
+                legacy_event["decision_timestamp"],
+                "bound-migration-proposal",
+                "a" * 64,
+                "{}",
+                legacy_event["created_at"],
+            ),
+        )
+        connection.execute(
+            """INSERT INTO forward_scheduler_events
+               (event_id, runtime_id, instrument_id, interval, candle_timestamp,
+                decision_timestamp, status, proposal_id, proposal_sha256, proposal_json,
+                result_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, NULL, NULL, ?)""",
+            (
+                "migration-partial-event",
+                legacy_event["runtime_id"],
+                legacy_event["instrument_id"],
+                legacy_event["interval"],
+                legacy_event["candle_timestamp"],
+                legacy_event["decision_timestamp"],
+                "partial-migration-proposal",
+                "b" * 64,
+                legacy_event["created_at"],
+            ),
+        )
+        connection.commit()
+
+    monkeypatch.setattr(database, "SCHEMA_VERSION", 13)
+    initialize_database(database_path)
+    first_status = get_database_status(database_path)
+    with closing(get_connection(database_path)) as connection:
+        states = {
+            row["event_id"]: row["proposal_binding_state"]
+            for row in connection.execute(
+                """SELECT event_id, proposal_binding_state FROM forward_scheduler_events
+                   WHERE event_id IN (
+                       'migration-event', 'migration-partial-event', 'migration-bound-event'
+                   )"""
+            )
+        }
+        for table in ("paper_orders", "paper_fills", "paper_ledger_entries"):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT initial_cash FROM paper_accounts WHERE id = ?", (account_id,)
+            ).fetchone()[0]
+            == "12345.67"
+        )
+    assert first_status["schema_version"] == 13
+    assert states == {
+        "migration-event": "LEGACY_UNVERIFIABLE",
+        "migration-partial-event": "LEGACY_UNVERIFIABLE",
+        "migration-bound-event": "BOUND",
+    }
+
+    initialize_database(database_path)
+
+    assert get_database_status(database_path) == first_status
+    with closing(get_connection(database_path)) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM schema_metadata WHERE version = 13"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def _create_populated_version_13_database(database_path) -> int:
+    account_id = _create_populated_version_12_database(database_path)
+    with closing(get_connection(database_path)) as connection:
+        for statement in database.MIGRATIONS[12]:
+            database._execute_statements(connection, statement)
+        connection.execute("INSERT INTO schema_metadata (version) VALUES (13)")
+        connection.commit()
+    return account_id
+
+
+def test_version_14_migration_installs_binding_guards_idempotently(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "version_13_to_14.db"
+    _create_populated_version_13_database(database_path)
+
+    monkeypatch.setattr(database, "SCHEMA_VERSION", 14)
+    initialize_database(database_path)
+    first_status = get_database_status(database_path)
+    with closing(get_connection(database_path)) as connection:
+        triggers = connection.execute(
+            """SELECT name FROM sqlite_master WHERE type = 'trigger'
+               AND name = 'protect_forward_event_proposal_binding'"""
+        ).fetchall()
+        event = connection.execute(
+            """SELECT status, proposal_sha256, proposal_json, proposal_binding_state
+               FROM forward_scheduler_events WHERE event_id = 'migration-event'"""
+        ).fetchone()
+    assert first_status["schema_version"] == 14
+    assert len(triggers) == 1
+    assert tuple(event) == ("PENDING", None, None, "LEGACY_UNVERIFIABLE")
+
+    initialize_database(database_path)
+
+    assert get_database_status(database_path) == first_status
+    with closing(get_connection(database_path)) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM schema_metadata WHERE version = 14"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute(
+                """SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'
+                   AND name = 'protect_forward_event_proposal_binding'"""
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_version_14_migration_failure_rolls_back_guards_and_marker(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "version_13_to_14_rollback.db"
+    account_id = _create_populated_version_13_database(database_path)
+    monkeypatch.setattr(database, "SCHEMA_VERSION", 14)
+    _add_metadata_insert_failure(database_path, 14)
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected metadata insertion failure"):
+        initialize_database(database_path)
+
+    with closing(get_connection(database_path)) as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_metadata").fetchone()[0] == 13
+        assert (
+            connection.execute(
+                """SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'
+                   AND name = 'protect_forward_event_proposal_binding'"""
+            ).fetchone()[0]
+            == 0
+        )
+        event = connection.execute(
+            """SELECT status, proposal_sha256, proposal_json, proposal_binding_state
+               FROM forward_scheduler_events WHERE event_id = 'migration-event'"""
+        ).fetchone()
+        assert tuple(event) == ("PENDING", None, None, "LEGACY_UNVERIFIABLE")
+        assert (
+            connection.execute(
+                "SELECT initial_cash FROM paper_accounts WHERE id = ?", (account_id,)
+            ).fetchone()[0]
+            == "12345.67"
+        )
+
+    with closing(get_connection(database_path)) as connection:
+        connection.execute("DROP TRIGGER reject_schema_version_14")
+        connection.commit()
+    initialize_database(database_path)
+    assert get_database_status(database_path)["schema_version"] == 14
+
+
+def _create_populated_version_14_database(database_path) -> int:
+    account_id = _create_populated_version_13_database(database_path)
+    with closing(get_connection(database_path)) as connection:
+        for statement in database.MIGRATIONS[13]:
+            database._execute_statements(connection, statement)
+        connection.execute("INSERT INTO schema_metadata (version) VALUES (14)")
+        connection.commit()
+    return account_id
+
+
+def test_version_15_migration_installs_event_insert_guards_idempotently(tmp_path) -> None:
+    database_path = tmp_path / "version_14_to_15.db"
+    _create_populated_version_14_database(database_path)
+
+    initialize_database(database_path)
+    first_status = get_database_status(database_path)
+    with closing(get_connection(database_path)) as connection:
+        triggers = {
+            row["name"]
+            for row in connection.execute(
+                """SELECT name FROM sqlite_master WHERE type = 'trigger'
+                   AND name IN (
+                       'authorize_forward_scheduler_event_insert',
+                       'consume_forward_scheduler_event_insert',
+                       'consume_forward_event_proposal_binding',
+                       'protect_forward_event_proposal_binding'
+                   )"""
+            )
+        }
+    assert first_status["schema_version"] == 15
+    assert triggers == {
+        "authorize_forward_scheduler_event_insert",
+        "consume_forward_scheduler_event_insert",
+        "consume_forward_event_proposal_binding",
+        "protect_forward_event_proposal_binding",
+    }
+
+    initialize_database(database_path)
+
+    assert get_database_status(database_path) == first_status
+    with closing(get_connection(database_path)) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM schema_metadata WHERE version = 15"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_version_15_migration_failure_rolls_back_insert_guards_and_marker(tmp_path) -> None:
+    database_path = tmp_path / "version_14_to_15_rollback.db"
+    account_id = _create_populated_version_14_database(database_path)
+    _add_metadata_insert_failure(database_path, 15)
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected metadata insertion failure"):
+        initialize_database(database_path)
+
+    with closing(get_connection(database_path)) as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_metadata").fetchone()[0] == 14
+        trigger_names = {
+            row["name"]
+            for row in connection.execute(
+                """SELECT name FROM sqlite_master WHERE type = 'trigger'
+                   AND name IN (
+                       'authorize_forward_scheduler_event_insert',
+                       'consume_forward_scheduler_event_insert',
+                       'consume_forward_event_proposal_binding',
+                       'protect_forward_event_proposal_binding'
+                   )"""
+            )
+        }
+        assert trigger_names == {"protect_forward_event_proposal_binding"}
+        event = connection.execute(
+            """SELECT status, proposal_sha256, proposal_json, proposal_binding_state
+               FROM forward_scheduler_events WHERE event_id = 'migration-event'"""
+        ).fetchone()
+        assert tuple(event) == ("PENDING", None, None, "LEGACY_UNVERIFIABLE")
+        assert (
+            connection.execute(
+                "SELECT initial_cash FROM paper_accounts WHERE id = ?", (account_id,)
+            ).fetchone()[0]
+            == "12345.67"
+        )
+
+    with closing(get_connection(database_path)) as connection:
+        connection.execute("DROP TRIGGER reject_schema_version_15")
+        connection.commit()
+    initialize_database(database_path)
+    assert get_database_status(database_path)["schema_version"] == 15
+
+
+def test_version_13_migration_failure_rolls_back_marker_and_preserves_v12_data(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "version_12_to_13_rollback.db"
+    account_id = _create_populated_version_12_database(database_path)
+    _add_metadata_insert_failure(database_path, 13)
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected metadata insertion failure"):
+        initialize_database(database_path)
+
+    with closing(get_connection(database_path)) as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_metadata").fetchone()[0] == 12
+        event_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(forward_scheduler_events)")
+        }
+        assert "proposal_binding_state" not in event_columns
+        event = connection.execute(
+            """SELECT status, proposal_sha256, proposal_json FROM forward_scheduler_events
+               WHERE event_id = 'migration-event'"""
+        ).fetchone()
+        assert tuple(event) == ("PENDING", None, None)
+        assert (
+            connection.execute(
+                "SELECT initial_cash FROM paper_accounts WHERE id = ?", (account_id,)
+            ).fetchone()[0]
+            == "12345.67"
+        )
+        for table in ("paper_orders", "paper_fills", "paper_ledger_entries"):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
+
+
+def test_version_12_migration_failure_rolls_back_new_schema_and_preserves_v11_data(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "version_11_to_12_rollback.db"
+    account_id = _create_populated_version_11_database(database_path)
+    _add_metadata_insert_failure(database_path, 12)
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected metadata insertion failure"):
+        initialize_database(database_path)
+
+    with closing(get_connection(database_path)) as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_metadata").fetchone()[0] == 11
+        event_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(forward_scheduler_events)")
+        }
+        tables = {
+            row["name"]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "proposal_json" not in event_columns
+        assert "forward_execution_authorizations" not in tables
+        assert (
+            connection.execute(
+                "SELECT initial_cash FROM paper_accounts WHERE id = ?", (account_id,)
+            ).fetchone()[0]
+            == "12345.67"
+        )
+        for table in ("paper_orders", "paper_fills", "paper_ledger_entries"):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
+
+
+def test_version_11_migration_failure_rolls_back_column_and_preserves_v10_data(tmp_path) -> None:
+    database_path = tmp_path / "version_10_to_11_rollback.db"
+    account_id = _create_populated_version_10_database(database_path)
+    _add_metadata_insert_failure(database_path, 11)
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected metadata insertion failure"):
+        initialize_database(database_path)
+
+    with closing(get_connection(database_path)) as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_metadata").fetchone()[0] == 10
+        event_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(forward_scheduler_events)")
+        }
+        assert "proposal_sha256" not in event_columns
+        event = connection.execute(
+            """SELECT event_id, proposal_id, status FROM forward_scheduler_events
+               WHERE event_id = 'migration-event'"""
+        ).fetchone()
+        assert tuple(event) == ("migration-event", "migration-proposal", "PENDING")
+        assert (
+            connection.execute(
+                "SELECT initial_cash FROM paper_accounts WHERE id = ?", (account_id,)
+            ).fetchone()[0]
+            == "12345.67"
+        )
+        for table in ("paper_orders", "paper_fills", "paper_ledger_entries"):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1

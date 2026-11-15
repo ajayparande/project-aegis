@@ -1,5 +1,6 @@
 """Project Aegis - local research dashboard."""
 
+import os
 import sqlite3
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -7,8 +8,16 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 
+from aegis.ai_agent import (
+    AIAgent,
+    GeminiProvider,
+    MockLLMProvider,
+    ProviderError,
+    create_default_tool_registry,
+)
 from aegis.config import get_settings
-from aegis.database import get_database_status, initialize_database
+from aegis.database import SCHEMA_VERSION, get_database_status
+from aegis.forward_runtime import list_forward_runtime_summaries
 from aegis.instruments import list_instruments, search_instruments
 from aegis.logging_config import setup_logging
 from aegis.market_data import (
@@ -21,6 +30,7 @@ from aegis.market_data import (
     list_recent_imports,
 )
 from aegis.market_quality import analyze_dataset, load_calendar_registry
+from aegis.paper_trading import get_paper_account_report, list_paper_accounts
 from aegis.strategy_lab import (
     StrategyLabError,
     create_sma_crossover_spec,
@@ -48,9 +58,10 @@ st.caption("AI-assisted Quantitative Research Platform")
 st.warning("RESEARCH ONLY — No broker connection, live orders, or automated trading is enabled.")
 
 try:
-    initialize_database(settings.database_path)
     database_status = get_database_status(settings.database_path)
-    database_healthy = database_status["exists"]
+    database_healthy = (
+        database_status["exists"] and database_status["schema_version"] == SCHEMA_VERSION
+    )
     logger.info("Dashboard database check completed")
 except Exception:
     database_healthy = False
@@ -111,7 +122,13 @@ if database_healthy:
     for table in tables:
         st.write(f"• {table}")
 else:
-    st.error("Database is unavailable. Check the application logs.")
+    if database_status["exists"]:
+        st.error(
+            f"Database schema is not current (expected version {SCHEMA_VERSION}). "
+            "The dashboard will not migrate it; use the application maintenance workflow."
+        )
+    else:
+        st.error("Database is unavailable. Check the application logs.")
 
 st.divider()
 
@@ -673,6 +690,185 @@ st.caption(
     "Runs require complete CONFIRMED calendar coverage and FRESH, 100% complete data. "
     "The checked-in calendar is unconfigured, so current experiments will be blocked until verified coverage is supplied."
 )
+
+st.divider()
+
+st.subheader("Paper Simulation Reports — Read Only")
+st.caption(
+    "SIMULATED VALUES ONLY. This dashboard does not create accounts or submit simulated orders. "
+    "Application mode remains RESEARCH_ONLY."
+)
+if database_healthy:
+    try:
+        paper_accounts = list_paper_accounts(settings.database_path)
+        if paper_accounts:
+            account_by_id = {int(item["account_id"]): item for item in paper_accounts}
+            selected_paper_id = st.selectbox(
+                "Simulated account",
+                list(account_by_id),
+                format_func=lambda account_id: str(account_by_id[account_id]["name"]),
+                key="paper_report_account",
+            )
+            paper_report = get_paper_account_report(settings.database_path, int(selected_paper_id))
+            st.warning(str(paper_report["label"]))
+            if paper_report["status"] == "HALTED":
+                st.error(f"Account halted: {paper_report['halt_reason']}")
+            summary = st.columns(4)
+            summary[0].metric("Virtual capital", f"₹{paper_report['initial_cash']}")
+            summary[1].metric("Simulated available cash", f"₹{paper_report['available_cash']}")
+            summary[2].metric("Simulated exposure", f"₹{paper_report['gross_exposure']}")
+            summary[3].metric("Reconciliation", str(paper_report["reconciliation"]["status"]))
+            st.write("**Daily simulation report:**", paper_report["daily_report"])
+            st.write("**Simulated order and fill history:**")
+            if paper_report["orders"]:
+                st.dataframe(paper_report["orders"], hide_index=True, width="stretch")
+            else:
+                st.info("No simulated orders or fills are recorded for this account.")
+            st.write("**Simulated positions:**")
+            if paper_report["positions"]:
+                st.dataframe(paper_report["positions"], hide_index=True, width="stretch")
+            else:
+                st.info("No simulated positions are recorded for this account.")
+            with st.expander("Recorded cost assumptions and risk limits"):
+                st.json(
+                    {
+                        "cost_assumptions": paper_report["cost_assumptions"],
+                        "risk_limits": paper_report["risk_limits"],
+                    }
+                )
+        else:
+            st.info("No simulated paper accounts are recorded.")
+    except Exception:
+        logger.exception("Paper simulation report failed")
+        st.error("Paper simulation report is unavailable; inspect reconciliation and logs.")
+else:
+    st.info("Paper simulation reports are unavailable while the database is unavailable.")
+
+st.divider()
+
+st.subheader("Synthetic Forward Runtime — Read Only")
+st.caption(
+    "RESEARCH_ONLY synthetic quote simulation. No live feed, broker connection, "
+    "order submission controls, or real transactions are available here."
+)
+if database_healthy:
+    try:
+        runtime_summaries = list_forward_runtime_summaries(settings.database_path)
+        if runtime_summaries:
+            st.dataframe(runtime_summaries, hide_index=True, width="stretch")
+        else:
+            st.info("No synthetic forward runtime is recorded.")
+    except Exception:
+        logger.exception("Synthetic forward runtime dashboard view failed")
+        st.error("Synthetic forward runtime status is unavailable; inspect the logs.")
+else:
+    st.info("Synthetic forward runtime status is unavailable while the database is unavailable.")
+
+st.divider()
+
+st.subheader("🤖 AI Research Assistant (Optional)")
+st.caption(
+    "Provider-agnostic, bounded AI research tool. "
+    "Uses deterministic Python tools for all quantitative computations. "
+    "No real or paper orders are submitted from this interface."
+)
+
+st.info(
+    "⚠️ **Disclaimer:** AI research assistance only. All recommendations are purely informational. "
+    "No real or simulated orders are submitted. The AI cannot modify risk controls, execution modes, "
+    "strategies, or database contents. All quantitative calculations remain in deterministic Python."
+)
+
+if database_healthy:
+    # Detect which provider is available
+    _gemini_key = os.environ.get("GEMINI_API_KEY", "") or ""
+    _has_gemini = bool(_gemini_key)
+    _provider_label = "Gemini API" if _has_gemini else "Mock Provider (Offline)"
+    _provider_note = (
+        "Gemini API configured via environment variable."
+        if _has_gemini
+        else "No LLM API key detected — using deterministic mock provider for offline demonstration."
+    )
+
+    st.write(f"**Provider status:** {_provider_label} — {_provider_note}")
+
+    with st.form("ai_research_form"):
+        ai_query = st.text_area(
+            "Research Question",
+            placeholder=(
+                "Example: Analyze RELIANCE technical indicators over the last 100 days "
+                "and assess data quality."
+            ),
+            height=120,
+            key="ai_research_query",
+        )
+        ai_submitted = st.form_submit_button("Run Research Query")
+
+    if ai_submitted and ai_query.strip():
+        try:
+            # Build provider
+            if _has_gemini:
+                _ai_provider = GeminiProvider(api_key=_gemini_key)
+            else:
+                _ai_provider = MockLLMProvider()
+
+            _ai_registry = create_default_tool_registry(settings.database_path)
+            _agent = AIAgent(
+                provider=_ai_provider,
+                tool_registry=_ai_registry,
+                database_path=settings.database_path,
+                max_steps=5,
+            )
+
+            with st.spinner("Running bounded research workflow…"):
+                _result = _agent.run_research(ai_query)
+
+            if _result.status == "REJECTED":
+                st.error(f"Request rejected by safety policy: {_result.error}")
+            elif _result.status == "FAILED":
+                st.error(f"Research workflow encountered an error: {_result.error}")
+            else:
+                st.success(f"Research complete — Status: {_result.status}")
+                st.write("### Research Findings")
+                st.write(_result.answer)
+
+                if _result.tools_invoked:
+                    with st.expander(f"Tools invoked ({len(_result.tools_invoked)})"):
+                        for t in _result.tools_invoked:
+                            status_icon = "✅" if not t.is_error else "⚠️"
+                            st.write(
+                                f"{status_icon} **{t.tool_name}** "
+                                f"(args: `{t.arguments}`, {t.duration_ms:.1f}ms)"
+                            )
+
+                with st.expander("Audit provenance"):
+                    st.json(
+                        {
+                            "audit_id": _result.audit_record.audit_id,
+                            "provider": _result.audit_record.provider_name,
+                            "model": _result.audit_record.model_id,
+                            "prompt_sha256": _result.audit_record.prompt_sha256[:16] + "…",
+                            "total_duration_ms": round(_result.audit_record.total_duration_ms, 2),
+                            "token_usage": {
+                                "prompt": _result.audit_record.token_usage.prompt_tokens,
+                                "completion": _result.audit_record.token_usage.completion_tokens,
+                                "total": _result.audit_record.token_usage.total_tokens,
+                            },
+                            "confidence": _result.confidence_assessment,
+                        }
+                    )
+
+        except ProviderError as exc:
+            st.error(f"Provider error (AI features unavailable): {exc}")
+        except Exception:
+            logger.exception("AI Research Assistant error in dashboard")
+            st.error(
+                "AI Research Assistant encountered an unexpected error. Check application logs."
+            )
+    elif ai_submitted:
+        st.warning("Please enter a research question before submitting.")
+else:
+    st.info("AI Research Assistant is unavailable while the database is unavailable.")
 
 st.divider()
 

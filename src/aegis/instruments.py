@@ -12,7 +12,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TypeAlias, TypedDict
 
-from aegis.database import get_connection
+from aegis.database import get_connection, get_readonly_connection
 
 DecimalInput: TypeAlias = Decimal | int | str
 DateInput: TypeAlias = date | str
@@ -418,7 +418,7 @@ def list_instruments(
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY exchange COLLATE NOCASE, trading_symbol COLLATE NOCASE, id"
-    with closing(get_connection(database_path)) as connection:
+    with closing(get_readonly_connection(database_path)) as connection:
         rows = connection.execute(query, params).fetchall()
     return [_row_to_instrument(row) for row in rows]
 
@@ -460,7 +460,7 @@ def search_instruments(
     query_sql = "SELECT " + _SELECT_COLUMNS + " FROM instruments WHERE "
     query_sql += " AND ".join(clauses)
     query_sql += " ORDER BY exchange COLLATE NOCASE, trading_symbol COLLATE NOCASE, id"
-    with closing(get_connection(database_path)) as connection:
+    with closing(get_readonly_connection(database_path)) as connection:
         rows = connection.execute(query_sql, params).fetchall()
     return [_row_to_instrument(row) for row in rows]
 

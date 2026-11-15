@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from aegis.database import get_connection
+from aegis.database import get_connection, get_readonly_connection
 
 SUPPORTED_INTERVALS = ("1m", "5m", "15m", "1h", "1d")
 REQUIRED_CSV_COLUMNS = frozenset({"timestamp", "open", "high", "low", "close", "volume"})
@@ -757,7 +757,7 @@ def declare_import_source_use_status(
 def list_historical_overview(database_path: Path) -> list[dict[str, object]]:
     """Return exact candle counts and UTC date coverage per instrument and interval."""
 
-    with closing(get_connection(database_path)) as connection:
+    with closing(get_readonly_connection(database_path)) as connection:
         rows = connection.execute(
             """
             SELECT i.exchange, i.trading_symbol, i.instrument_name, c.interval,
@@ -775,7 +775,7 @@ def list_historical_overview(database_path: Path) -> list[dict[str, object]]:
 def get_legacy_market_data_count(database_path: Path) -> int:
     """Count pre-Stage-3 REAL-based rows preserved outside the exact-decimal view."""
 
-    with closing(get_connection(database_path)) as connection:
+    with closing(get_readonly_connection(database_path)) as connection:
         return int(connection.execute("SELECT COUNT(*) FROM market_data").fetchone()[0])
 
 
@@ -784,7 +784,7 @@ def list_recent_imports(database_path: Path, limit: int = 20) -> list[dict[str, 
 
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError("limit must be a positive integer.")
-    with closing(get_connection(database_path)) as connection:
+    with closing(get_readonly_connection(database_path)) as connection:
         rows = connection.execute(
             """
             SELECT id, instrument_id, original_filename, file_sha256, requested_exchange,
@@ -805,7 +805,7 @@ def list_quality_issues(database_path: Path, limit: int = 100) -> list[dict[str,
 
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError("limit must be a positive integer.")
-    with closing(get_connection(database_path)) as connection:
+    with closing(get_readonly_connection(database_path)) as connection:
         rows = connection.execute(
             """
             SELECT q.id, q.import_id, d.original_filename, q.instrument_id,
@@ -856,6 +856,6 @@ def list_historical_candles(
         query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY c.candle_timestamp DESC, i.exchange, i.trading_symbol LIMIT ?"
     parameters.append(limit)
-    with closing(get_connection(database_path)) as connection:
+    with closing(get_readonly_connection(database_path)) as connection:
         rows = connection.execute(query, parameters).fetchall()
     return [dict(row) for row in rows]
