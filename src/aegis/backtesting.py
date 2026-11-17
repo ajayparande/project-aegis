@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
@@ -17,18 +17,25 @@ from decimal import (
     localcontext,
 )
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal
 from zoneinfo import ZoneInfo
 
 from aegis.database import get_connection
 from aegis.market_quality import (
+    CalendarConfigError,
     CalendarRegistry,
+    DatasetQualityReport,
     ExchangeCalendar,
+    SpecialSessionClosure,
     analyze_dataset,
     calculate_expected_candles,
+    load_approved_calendar_registry,
 )
 from aegis.strategy_lab import (
+    DataQualityGateError,
     StrategyCandle,
+    StrategyLabError,
     StrategySignal,
     StrategySpec,
     _canonical_hash,
@@ -42,6 +49,8 @@ from aegis.strategy_lab import (
     _validate_candles,
     _validate_experiment_configuration,
     _validate_legacy_strategy_reference,
+    _validate_source_imports,
+    create_sma_crossover_spec,
     generate_sma_crossover_signals,
 )
 
@@ -52,6 +61,15 @@ _BASIS_POINT_DENOMINATOR = Decimal(10000)
 
 class BacktestError(ValueError):
     """Raised when a backtest configuration or execution input is invalid."""
+
+
+class _QualificationBlocked(Exception):
+    """Expected data-eligibility failure that must be persisted as BLOCKED."""
+
+    def __init__(self, reason: str, provenance: dict[str, object] | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.provenance = provenance
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +201,162 @@ class BacktestRunResult:
     reason: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _ExecutionInstrument:
+    """Instrument-master fields required by the one-instrument execution contract."""
+
+    exchange: str
+    trading_symbol: str
+    segment: str
+    instrument_type: str
+    is_active: bool
+    lot_size: int
+    tick_size_decimal: Decimal
+    tick_size_is_authoritative: bool
+    instrument_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionEligibility:
+    """Data-quality report and source-use records required before historical execution."""
+
+    quality_report: DatasetQualityReport
+    source_imports: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SignalProvenance:
+    """Identity and parameters for signals generated from the qualified candle sequence."""
+
+    strategy_key: str
+    name: str
+    version: str
+    parameters: tuple[tuple[str, int], ...]
+    strategy_spec_sha256: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "status": "CAUSAL_GENERATION_FROM_QUALIFIED_CANDLES",
+            "strategy_key": self.strategy_key,
+            "name": self.name,
+            "version": self.version,
+            "parameters": dict(self.parameters),
+            "strategy_spec_sha256": self.strategy_spec_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionRequest:
+    """Explicit, single-instrument inputs for deterministic historical execution."""
+
+    candles: tuple[StrategyCandle, ...]
+    signals: tuple[StrategySignal, ...]
+    signal_provenance: _SignalProvenance
+    instrument: _ExecutionInstrument
+    interval: str
+    config: BacktestConfig
+    calendar: ExchangeCalendar
+    expected_by_timestamp: Mapping[str, datetime]
+    eligibility: _ExecutionEligibility
+    dataset_sha256: str
+    candle_source_bindings_sha256: str
+    source_file_sha256s: tuple[str, ...]
+    calendar_configuration_sha256: str | None
+    effective_calendar_configuration_sha256: str
+    expected_schedule_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _QualifiedInstrumentData:
+    """Trusted M1B qualification output before causal signals or execution are created."""
+
+    strategy_spec: StrategySpec
+    instrument: _ExecutionInstrument
+    interval: str
+    config: BacktestConfig
+    calendar: ExchangeCalendar
+    expected_by_timestamp: Mapping[str, datetime]
+    eligibility: _ExecutionEligibility
+    candles: tuple[StrategyCandle, ...]
+    dataset_sha256: str
+    candle_source_bindings_sha256: str
+    source_file_sha256s: tuple[str, ...]
+    calendar_configuration_sha256: str
+    effective_calendar_configuration_sha256: str
+    expected_schedule_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionResult:
+    """Deeply immutable execution snapshot with defensive legacy serialization."""
+
+    orders: tuple[Mapping[str, object], ...]
+    fills: tuple[Mapping[str, object], ...]
+    rejected_or_unfilled_orders: tuple[Mapping[str, object], ...]
+    trades: tuple[Mapping[str, object], ...]
+    equity_curve: tuple[Mapping[str, object], ...]
+    open_position: Mapping[str, object] | None
+    summary: Mapping[str, object]
+    diagnostics: Mapping[str, object]
+    buy_and_hold_benchmark: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "orders",
+            "fills",
+            "rejected_or_unfilled_orders",
+            "trades",
+            "equity_curve",
+            "open_position",
+            "summary",
+            "diagnostics",
+            "buy_and_hold_benchmark",
+        ):
+            object.__setattr__(self, field_name, _freeze_result_value(getattr(self, field_name)))
+
+    def to_simulation_output(self) -> dict[str, object]:
+        """Return a detached, mutable copy of the legacy Phase 4 simulation shape."""
+
+        return {
+            "orders": _thaw_result_value(self.orders),
+            "trades": _thaw_result_value(self.trades),
+            "equity_curve": _thaw_result_value(self.equity_curve),
+            "open_position": _thaw_result_value(self.open_position),
+            "summary": _thaw_result_value(self.summary),
+        }
+
+    def to_benchmark_output(self) -> dict[str, object]:
+        """Return a detached benchmark dictionary suitable for legacy persistence."""
+
+        value = _thaw_result_value(self.buy_and_hold_benchmark)
+        if not isinstance(value, dict):
+            raise TypeError("Execution benchmark snapshot must be a mapping.")
+        return value
+
+
+_QUALIFICATION_TOKEN = object()
+
+
+def _freeze_result_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("Execution result mapping keys must be strings.")
+        return MappingProxyType({key: _freeze_result_value(item) for key, item in value.items()})
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_result_value(item) for item in value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"Unsupported execution result value: {type(value).__name__}.")
+
+
+def _thaw_result_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _thaw_result_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_thaw_result_value(item) for item in value]
+    return value
+
+
 def _decimal_text(value: Decimal) -> str:
     text = format(value, "f")
     return text.rstrip("0").rstrip(".") if "." in text else text
@@ -248,6 +422,28 @@ def _readonly_connection(database_path: Path) -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA query_only = ON")
     return connection
+
+
+def _load_admin_calendar_registry(config_path: Path) -> CalendarRegistry:
+    """Load the application-approved calendar file, never a request-selected alternative."""
+
+    try:
+        return load_approved_calendar_registry(config_path)
+    except CalendarConfigError as exc:
+        raise BacktestError(f"Calendar configuration is invalid: {exc}") from exc
+
+
+def _reload_calendar_registry(calendars: CalendarRegistry) -> CalendarRegistry:
+    """Reload the approved registry and detect changes since its caller loaded it."""
+
+    if not isinstance(calendars, CalendarRegistry) or calendars.configuration_path is None:
+        raise BacktestError(
+            "Calendar registry must originate from the approved application configuration."
+        )
+    try:
+        return load_approved_calendar_registry(expected_registry=calendars)
+    except CalendarConfigError as exc:
+        raise BacktestError(str(exc)) from exc
 
 
 def _load_strategy_experiment(
@@ -658,6 +854,8 @@ def _execution_time(candle: StrategyCandle, interval: str, calendar: ExchangeCal
     timezone = ZoneInfo(calendar.timezone_name)
     local_day = parsed.astimezone(timezone).date()
     special = calendar.special_sessions.get(local_day)
+    if isinstance(special, SpecialSessionClosure):
+        raise BacktestError("Daily bar has no configured market session for its execution time.")
     sessions = special.sessions if special is not None else calendar.sessions
     if not sessions:
         raise BacktestError("Daily bar has no configured market session for its execution time.")
@@ -1066,6 +1264,691 @@ def _buy_and_hold_benchmark(
         }
 
 
+def _evidence_json_value(value: object) -> object:
+    if isinstance(value, datetime):
+        return value.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return _decimal_text(value)
+    if isinstance(value, dict):
+        return {key: _evidence_json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_evidence_json_value(item) for item in value]
+    return value
+
+
+class _QualificationFailure(BacktestError):
+    """Expected M1B input-eligibility failure with a stable portfolio category."""
+
+    def __init__(self, category: str, reason: str) -> None:
+        super().__init__(reason)
+        self.category = category
+        self.reason = reason
+
+
+def _resolve_execution_instrument(
+    connection: sqlite3.Connection,
+    *,
+    exchange: str,
+    trading_symbol: str,
+    order_quantity: int,
+) -> _ExecutionInstrument:
+    """Resolve and validate one instrument using the caller-owned read snapshot."""
+
+    row = connection.execute(
+        """SELECT id, exchange, trading_symbol, segment, tick_size,
+                  tick_size_decimal, lot_size, is_active, instrument_type
+           FROM instruments
+           WHERE exchange = ? COLLATE NOCASE AND trading_symbol = ? COLLATE NOCASE""",
+        (exchange.strip().upper(), trading_symbol.strip().upper()),
+    ).fetchone()
+    if row is None:
+        raise _QualificationFailure("INSTRUMENT", "Execution instrument is not registered.")
+    if not row["is_active"]:
+        raise _QualificationFailure("INSTRUMENT", "Execution instrument is not active.")
+    if (
+        str(row["exchange"]).strip().upper() != "NSE"
+        or str(row["instrument_type"]).strip().upper() != "EQUITY"
+    ):
+        raise _QualificationFailure(
+            "INSTRUMENT", "Execution is restricted to active NSE cash equities (EQUITY)."
+        )
+    lot_size = row["lot_size"]
+    if (
+        isinstance(lot_size, bool)
+        or not isinstance(lot_size, int)
+        or lot_size < 1
+        or order_quantity % lot_size
+    ):
+        raise _QualificationFailure(
+            "INSTRUMENT", "Order quantity must match the instrument lot size."
+        )
+    if row["tick_size"] is not None or row["tick_size_decimal"] is None:
+        raise _QualificationFailure("INSTRUMENT", "An authoritative decimal tick size is required.")
+    try:
+        tick_size = _decimal_from_json(row["tick_size_decimal"], "tick_size_decimal")
+    except BacktestError as exc:
+        raise _QualificationFailure("INSTRUMENT", str(exc)) from exc
+    if tick_size <= 0:
+        raise _QualificationFailure(
+            "INSTRUMENT", "An authoritative positive decimal tick size is required."
+        )
+    return _ExecutionInstrument(
+        exchange=str(row["exchange"]),
+        trading_symbol=str(row["trading_symbol"]),
+        segment=str(row["segment"]),
+        instrument_type=str(row["instrument_type"]),
+        is_active=bool(row["is_active"]),
+        lot_size=lot_size,
+        tick_size_decimal=tick_size,
+        tick_size_is_authoritative=True,
+        instrument_id=int(row["id"]),
+    )
+
+
+def _qualify_one_instrument(
+    database_path: Path,
+    *,
+    exchange: str,
+    trading_symbol: str,
+    interval: str,
+    start_date: date,
+    end_date: date,
+    config: BacktestConfig,
+    as_of: datetime,
+    calendars: CalendarRegistry,
+    connection: sqlite3.Connection,
+    qualification_token: object,
+    strategy_spec: StrategySpec | None = None,
+    instrument: _ExecutionInstrument | None = None,
+    fast_window: int | None = None,
+    slow_window: int | None = None,
+) -> _QualifiedInstrumentData:
+    """Build trusted M1B qualification evidence without generating signals or executing."""
+
+    if qualification_token is not _QUALIFICATION_TOKEN:
+        raise BacktestError("Qualification is available only through trusted internal loaders.")
+    if not isinstance(database_path, Path):
+        raise BacktestError("database_path must be a pathlib Path.")
+    if not isinstance(config, BacktestConfig):
+        raise BacktestError("config must be a validated BacktestConfig.")
+    if not isinstance(connection, sqlite3.Connection) or not connection.in_transaction:
+        raise BacktestError("Qualification requires an active caller-owned read transaction.")
+    if not connection.execute("PRAGMA query_only").fetchone()[0]:
+        raise BacktestError("Qualification requires a read-only SQLite connection.")
+    if not isinstance(calendars, CalendarRegistry) or (
+        calendars.configuration_path is None or calendars.configuration_sha256 is None
+    ):
+        raise BacktestError("Calendar registry must originate from approved application settings.")
+    if not isinstance(as_of, datetime) or as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise BacktestError("as_of must be timezone-aware.")
+    if (
+        not isinstance(start_date, date)
+        or isinstance(start_date, datetime)
+        or not isinstance(end_date, date)
+        or isinstance(end_date, datetime)
+        or start_date > end_date
+    ):
+        raise BacktestError("start_date and end_date must be ordered dates.")
+    if any(
+        not isinstance(value, str) or not value.strip()
+        for value in (exchange, trading_symbol, interval)
+    ):
+        raise BacktestError("exchange, trading_symbol, and interval must be non-empty text.")
+    normalized_exchange = exchange.strip().upper()
+    normalized_symbol = trading_symbol.strip().upper()
+    if normalized_exchange != "NSE":
+        raise _QualificationFailure(
+            "INSTRUMENT", "Execution is restricted to NSE cash equities (EQUITY)."
+        )
+    if instrument is None:
+        instrument = _resolve_execution_instrument(
+            connection,
+            exchange=normalized_exchange,
+            trading_symbol=normalized_symbol,
+            order_quantity=config.order_quantity,
+        )
+    elif (
+        type(instrument) is not _ExecutionInstrument
+        or instrument.exchange.strip().upper() != normalized_exchange
+        or instrument.trading_symbol.strip().upper() != normalized_symbol
+        or config.order_quantity % instrument.lot_size
+    ):
+        raise BacktestError("Trusted instrument snapshot does not match qualification inputs.")
+    if strategy_spec is None:
+        if (
+            isinstance(fast_window, bool)
+            or not isinstance(fast_window, int)
+            or isinstance(slow_window, bool)
+            or not isinstance(slow_window, int)
+            or fast_window < 2
+            or slow_window <= fast_window
+        ):
+            raise BacktestError("Require 2 <= fast_window < slow_window.")
+        strategy_spec = create_sma_crossover_spec(
+            exchange=normalized_exchange,
+            trading_symbol=normalized_symbol,
+            instrument_type=instrument.instrument_type,
+            interval=interval,
+            fast_window=fast_window,
+            slow_window=slow_window,
+            hypothesis="Deterministic direct-execution baseline for qualified candles.",
+        )
+    elif (
+        type(strategy_spec) is not StrategySpec
+        or strategy_spec.exchange != normalized_exchange
+        or strategy_spec.trading_symbol != normalized_symbol
+        or strategy_spec.instrument_type != instrument.instrument_type.strip().upper()
+        or strategy_spec.interval != interval
+    ):
+        raise BacktestError("Strategy specification does not match the resolved instrument.")
+    if (
+        isinstance(instrument.lot_size, bool)
+        or not isinstance(instrument.lot_size, int)
+        or instrument.lot_size < 1
+        or config.order_quantity % instrument.lot_size
+    ):
+        raise _QualificationFailure(
+            "INSTRUMENT", "Order quantity must match the instrument lot size."
+        )
+
+    report = analyze_dataset(
+        database_path,
+        normalized_exchange,
+        normalized_symbol,
+        interval,
+        start_date,
+        end_date,
+        as_of=as_of,
+        calendars=calendars,
+        connection=connection,
+    )
+    gate_reason = _gate_reason(report)
+    if gate_reason is not None:
+        category = (
+            "CALENDAR"
+            if report.calendar_status != "FULL" or report.calendar_confidence != "CONFIRMED"
+            else "DATA_QUALITY"
+        )
+        raise _QualificationFailure(category, gate_reason)
+    calendar = calendars.resolve(normalized_exchange, instrument.segment)
+    if calendar is None:
+        raise _QualificationFailure("CALENDAR", "No exchange/segment calendar is configured.")
+    scheduled, completed, _, uncovered = calculate_expected_candles(
+        calendar, interval, start_date, end_date, as_of=as_of
+    )
+    if uncovered or len(scheduled) != len(completed):
+        raise _QualificationFailure(
+            "SCHEDULE", "The requested range includes uncovered or incomplete expected candles."
+        )
+    expected_by_timestamp = {item.timestamp: item.completes_at for item in completed}
+    (
+        candles,
+        dataset_sha256,
+        source_hashes,
+        source_imports,
+        candle_source_bindings_sha256,
+    ) = _load_completed_candles(
+        database_path,
+        exchange=normalized_exchange,
+        trading_symbol=normalized_symbol,
+        interval=interval,
+        start_date=start_date,
+        end_date=end_date,
+        timezone_name=calendar.timezone_name,
+        completed_timestamps=set(expected_by_timestamp),
+        connection=connection,
+    )
+    try:
+        _validate_source_imports(source_imports)
+    except DataQualityGateError as exc:
+        raise _QualificationFailure("SOURCE_USE", str(exc)) from exc
+    if len(candles) < strategy_spec.minimum_history_candles:
+        raise _QualificationFailure(
+            "STRATEGY_HISTORY",
+            f"Insufficient strategy history for {strategy_spec.name} version "
+            f"{strategy_spec.version}: requires {strategy_spec.minimum_history_candles} "
+            f"candles but only {len(candles)} eligible completed candles are available.",
+        )
+    candle_timestamps = tuple(candle.timestamp for candle in candles)
+    if (
+        report.expected_candles != len(candles)
+        or report.actual_candles != len(candles)
+        or report.first_candle_timestamp != candle_timestamps[0]
+        or report.last_candle_timestamp != candle_timestamps[-1]
+        or set(expected_by_timestamp) != set(candle_timestamps)
+    ):
+        raise StrategyLabError(
+            "Qualified candles do not match the quality report and complete expected schedule."
+        )
+
+    schedule_snapshot = {
+        timestamp: completion.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+        for timestamp, completion in expected_by_timestamp.items()
+    }
+    return _QualifiedInstrumentData(
+        strategy_spec=strategy_spec,
+        instrument=instrument,
+        interval=interval,
+        config=config,
+        calendar=calendar,
+        expected_by_timestamp=MappingProxyType(expected_by_timestamp),
+        eligibility=_ExecutionEligibility(report, source_imports),
+        candles=tuple(candles),
+        dataset_sha256=dataset_sha256,
+        candle_source_bindings_sha256=candle_source_bindings_sha256,
+        source_file_sha256s=source_hashes,
+        calendar_configuration_sha256=calendars.configuration_sha256,
+        effective_calendar_configuration_sha256=_effective_calendar_hash(calendar, calendars),
+        expected_schedule_sha256=_canonical_hash(schedule_snapshot),
+    )
+
+
+def execute_one_instrument(
+    database_path: Path,
+    *,
+    exchange: str,
+    trading_symbol: str,
+    interval: str,
+    start_date: date,
+    end_date: date,
+    fast_window: int,
+    slow_window: int,
+    config: BacktestConfig,
+    calendar_config_path: Path,
+    as_of: datetime,
+) -> ExecutionResult:
+    """Qualify local data, generate causal SMA signals, then execute without DB writes.
+
+    The path argument must identify the calendar file selected by application
+    configuration; it cannot select an alternate source. Signals are generated from
+    the exact qualified candles, so caller-supplied signal histories are not accepted
+    as causal evidence. The function uses one read-only SQLite snapshot and performs
+    no writes.
+    """
+
+    if not isinstance(database_path, Path):
+        raise BacktestError("database_path must be a pathlib Path.")
+    if not isinstance(config, BacktestConfig):
+        raise BacktestError("config must be a validated BacktestConfig.")
+    if (
+        isinstance(fast_window, bool)
+        or not isinstance(fast_window, int)
+        or isinstance(slow_window, bool)
+        or not isinstance(slow_window, int)
+        or fast_window < 2
+        or slow_window <= fast_window
+    ):
+        raise BacktestError("Require 2 <= fast_window < slow_window.")
+    if not isinstance(as_of, datetime) or as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise BacktestError("as_of must be timezone-aware.")
+    if (
+        not isinstance(start_date, date)
+        or isinstance(start_date, datetime)
+        or not isinstance(end_date, date)
+        or isinstance(end_date, datetime)
+        or start_date > end_date
+    ):
+        raise BacktestError("start_date and end_date must be ordered dates.")
+    if any(
+        not isinstance(value, str) or not value.strip()
+        for value in (exchange, trading_symbol, interval)
+    ):
+        raise BacktestError("exchange, trading_symbol, and interval must be non-empty text.")
+    calendars = _load_admin_calendar_registry(calendar_config_path)
+    try:
+        with closing(_readonly_connection(database_path)) as connection:
+            connection.execute("BEGIN")
+            qualified = _qualify_one_instrument(
+                database_path,
+                exchange=exchange,
+                trading_symbol=trading_symbol,
+                interval=interval,
+                start_date=start_date,
+                end_date=end_date,
+                fast_window=fast_window,
+                slow_window=slow_window,
+                config=config,
+                as_of=as_of,
+                calendars=calendars,
+                connection=connection,
+                qualification_token=_QUALIFICATION_TOKEN,
+            )
+    except (DataQualityGateError, StrategyLabError) as exc:
+        raise BacktestError(str(exc)) from exc
+
+    strategy_spec = qualified.strategy_spec
+    signals = generate_sma_crossover_signals(
+        qualified.candles,
+        fast_window=strategy_spec.fast_window,
+        slow_window=strategy_spec.slow_window,
+    )
+    request = _ExecutionRequest(
+        candles=qualified.candles,
+        signals=signals,
+        signal_provenance=_SignalProvenance(
+            strategy_key=strategy_spec.strategy_key,
+            name=strategy_spec.name,
+            version=strategy_spec.version,
+            parameters=(
+                ("fast_window", strategy_spec.fast_window),
+                ("slow_window", strategy_spec.slow_window),
+            ),
+            strategy_spec_sha256=_canonical_hash(strategy_spec.to_dict()),
+        ),
+        instrument=qualified.instrument,
+        interval=qualified.interval,
+        config=qualified.config,
+        calendar=qualified.calendar,
+        expected_by_timestamp=qualified.expected_by_timestamp,
+        eligibility=qualified.eligibility,
+        dataset_sha256=qualified.dataset_sha256,
+        candle_source_bindings_sha256=qualified.candle_source_bindings_sha256,
+        source_file_sha256s=qualified.source_file_sha256s,
+        calendar_configuration_sha256=qualified.calendar_configuration_sha256,
+        effective_calendar_configuration_sha256=qualified.effective_calendar_configuration_sha256,
+        expected_schedule_sha256=qualified.expected_schedule_sha256,
+    )
+    return _execute_qualified_request(request, qualification_token=_QUALIFICATION_TOKEN)
+
+
+def _execute_qualified_request(
+    request: _ExecutionRequest, *, qualification_token: object
+) -> ExecutionResult:
+    """Execute only data qualified by the public loader or registered backtest gates."""
+
+    if qualification_token is not _QUALIFICATION_TOKEN:
+        raise BacktestError("Qualified execution is available only through the trusted loader.")
+    if not request.candles:
+        raise BacktestError("At least one eligible completed candle is required.")
+    if not isinstance(request.config, BacktestConfig):
+        raise BacktestError("config must be a validated BacktestConfig.")
+    if not isinstance(request.signal_provenance, _SignalProvenance):
+        raise BacktestError("Signal provenance must come from qualified internal generation.")
+    if not isinstance(request.calendar, ExchangeCalendar):
+        raise BacktestError("calendar must be a validated ExchangeCalendar.")
+    if not isinstance(request.interval, str) or not request.interval:
+        raise BacktestError("interval must be non-empty text.")
+    instrument = request.instrument
+    if not isinstance(instrument, _ExecutionInstrument):
+        raise BacktestError("instrument must be an ExecutionInstrument.")
+    if any(
+        not isinstance(value, str) or not value.strip()
+        for value in (
+            instrument.exchange,
+            instrument.trading_symbol,
+            instrument.segment,
+            instrument.instrument_type,
+        )
+    ):
+        raise BacktestError("Instrument identity fields must be non-empty text.")
+    if (
+        instrument.exchange.strip().upper() != "NSE"
+        or instrument.instrument_type.strip().upper() != "EQUITY"
+        or instrument.is_active is not True
+    ):
+        raise BacktestError("Execution is restricted to active NSE cash equities.")
+    if (
+        isinstance(instrument.lot_size, bool)
+        or not isinstance(instrument.lot_size, int)
+        or instrument.lot_size < 1
+        or request.config.order_quantity % instrument.lot_size
+    ):
+        raise BacktestError("Order quantity must match the instrument lot size.")
+    if (
+        instrument.tick_size_is_authoritative is not True
+        or not isinstance(instrument.tick_size_decimal, Decimal)
+        or not instrument.tick_size_decimal.is_finite()
+        or instrument.tick_size_decimal <= 0
+    ):
+        raise BacktestError("An authoritative positive decimal tick size is required.")
+
+    if not isinstance(request.eligibility, _ExecutionEligibility):
+        raise BacktestError("eligibility must be an ExecutionEligibility.")
+    report = request.eligibility.quality_report
+    if not isinstance(report, DatasetQualityReport):
+        raise BacktestError("A Phase 2 DatasetQualityReport is required.")
+    gate_reason = _gate_reason(report)
+    if gate_reason is not None:
+        raise BacktestError(gate_reason)
+    if (
+        report.exchange.strip().upper() != instrument.exchange.strip().upper()
+        or report.trading_symbol.strip().upper() != instrument.trading_symbol.strip().upper()
+        or report.segment != instrument.segment.strip().upper()
+        or report.interval != request.interval
+    ):
+        raise BacktestError("Quality report identity does not match the execution request.")
+    if (
+        report.expected_candles is None
+        or report.expected_candles != len(request.candles)
+        or report.actual_candles != len(request.candles)
+        or report.first_candle_timestamp != request.candles[0].timestamp
+        or report.last_candle_timestamp != request.candles[-1].timestamp
+    ):
+        raise BacktestError(
+            "Expected, reported, and supplied completed candles must match exactly."
+        )
+    try:
+        _validate_source_imports(request.eligibility.source_imports)
+    except DataQualityGateError as exc:
+        raise BacktestError(str(exc)) from exc
+
+    _validate_candles(request.candles)
+    if not isinstance(request.expected_by_timestamp, Mapping):
+        raise BacktestError("expected_by_timestamp must be a timestamp mapping.")
+    candle_timestamps = {candle.timestamp for candle in request.candles}
+    if (
+        any(not isinstance(timestamp, str) for timestamp in request.expected_by_timestamp)
+        or set(request.expected_by_timestamp) != candle_timestamps
+    ):
+        raise BacktestError(
+            "Expected-candle completion metadata must match every supplied candle exactly."
+        )
+    for completes_at in request.expected_by_timestamp.values():
+        if (
+            not isinstance(completes_at, datetime)
+            or completes_at.tzinfo is None
+            or completes_at.utcoffset() is None
+            or completes_at > report.as_of
+        ):
+            raise BacktestError("Every supplied candle must have a completed expected timestamp.")
+    if (
+        request.calendar.exchange != instrument.exchange.strip().upper()
+        or request.calendar.segment not in (instrument.segment.strip().upper(), "*")
+        or request.calendar.confidence != "CONFIRMED"
+        or request.calendar.confidence != report.calendar_confidence
+        or request.calendar.source != report.calendar_source
+        or request.calendar.coverage_start != report.calendar_coverage_start
+        or request.calendar.coverage_end != report.calendar_coverage_end
+    ):
+        raise BacktestError("Exchange calendar does not match the confirmed quality report.")
+    scheduled, completed, _, uncovered = calculate_expected_candles(
+        request.calendar,
+        request.interval,
+        report.requested_start,
+        report.requested_end,
+        as_of=report.as_of,
+    )
+    scheduled_completion_map = {item.timestamp: item.completes_at for item in completed}
+    if (
+        uncovered
+        or len(scheduled) != len(completed)
+        or dict(request.expected_by_timestamp) != scheduled_completion_map
+    ):
+        raise BacktestError(
+            "Expected-candle metadata does not match the complete exchange schedule."
+        )
+
+    candles_by_timestamp = {candle.timestamp: candle for candle in request.candles}
+    previous_signal_timestamp: str | None = None
+    for signal in request.signals:
+        if not isinstance(signal, StrategySignal):
+            raise BacktestError("signals must contain StrategySignal values.")
+        if signal.action not in ("ENTER_LONG", "EXIT_LONG"):
+            raise BacktestError("Signal action is unsupported.")
+        if signal.timestamp not in candle_timestamps:
+            raise BacktestError("Every strategy signal must refer to a supplied completed candle.")
+        if previous_signal_timestamp is not None and signal.timestamp <= previous_signal_timestamp:
+            raise BacktestError("Signals must have unique timestamps in increasing order.")
+        if signal.close != candles_by_timestamp[signal.timestamp].close:
+            raise BacktestError("Signal close must match its completed candle close.")
+        if any(
+            not isinstance(value, Decimal) or not value.is_finite()
+            for value in (signal.close, signal.fast_sma, signal.slow_sma)
+        ):
+            raise BacktestError("Signal prices and SMA values must be finite Decimals.")
+        previous_signal_timestamp = signal.timestamp
+
+    with localcontext() as context:
+        context.prec = 50
+        context.rounding = ROUND_HALF_UP
+        simulation = _simulate(
+            list(request.candles),
+            request.signals,
+            config=request.config,
+            tick_size=instrument.tick_size_decimal,
+            interval=request.interval,
+            calendar=request.calendar,
+            expected_by_timestamp=dict(request.expected_by_timestamp),
+        )
+        benchmark = _buy_and_hold_benchmark(
+            list(request.candles),
+            config=request.config,
+            tick_size=instrument.tick_size_decimal,
+        )
+
+    orders_value = simulation.get("orders")
+    trades_value = simulation.get("trades")
+    equity_curve_value = simulation.get("equity_curve")
+    summary_value = simulation.get("summary")
+    benchmark_value = benchmark
+    if (
+        not isinstance(orders_value, list)
+        or any(not isinstance(item, dict) for item in orders_value)
+        or not isinstance(trades_value, list)
+        or any(not isinstance(item, dict) for item in trades_value)
+        or not isinstance(equity_curve_value, list)
+        or any(not isinstance(item, dict) for item in equity_curve_value)
+        or not isinstance(summary_value, dict)
+        or not isinstance(benchmark_value, dict)
+    ):
+        raise BacktestError("Shared execution engine returned malformed results.")
+    equity_by_timestamp = {
+        point.get("timestamp"): point
+        for point in equity_curve_value
+        if isinstance(point.get("timestamp"), str)
+    }
+    candle_index_by_timestamp = {
+        candle.timestamp: index for index, candle in enumerate(request.candles)
+    }
+    fills_list: list[dict[str, object]] = []
+    for order in orders_value:
+        if order.get("status") != "FILLED":
+            continue
+        execution_bar_timestamp = order.get("execution_bar_timestamp")
+        equity_mark = equity_by_timestamp.get(execution_bar_timestamp)
+        candle_index = candle_index_by_timestamp.get(execution_bar_timestamp)
+        if equity_mark is None or candle_index is None or candle_index < 1:
+            raise BacktestError("A filled order is missing its corresponding equity marks.")
+        prior_equity_mark = equity_by_timestamp.get(request.candles[candle_index - 1].timestamp)
+        if prior_equity_mark is None:
+            raise BacktestError("A filled order is missing its prior equity mark.")
+        fills_list.append(
+            {
+                "order_id": order["order_id"],
+                "execution_bar_timestamp": execution_bar_timestamp,
+                "execution_time": order["execution_time"],
+                "side": order["side"],
+                "quantity": order["quantity"],
+                "fill_price": order["fill_price"],
+                "fees": order["fees"],
+                "total_fees": order["total_fees"],
+                "cash_before": prior_equity_mark["cash"],
+                "cash_after": equity_mark["cash"],
+                "position_quantity_before": prior_equity_mark["position_quantity"],
+                "position_quantity_after": equity_mark["position_quantity"],
+            }
+        )
+    fills = tuple(fills_list)
+    rejections = tuple(
+        {
+            "order_id": order.get("order_id"),
+            "status": order.get("status"),
+            "reason": order.get("reason"),
+        }
+        for order in orders_value
+        if order.get("status") != "FILLED"
+    )
+    open_position = simulation.get("open_position")
+    if open_position is not None and not isinstance(open_position, dict):
+        raise BacktestError("Shared execution engine returned an invalid open position.")
+    return ExecutionResult(
+        orders=tuple(orders_value),
+        fills=fills,
+        rejected_or_unfilled_orders=rejections,
+        trades=tuple(trades_value),
+        equity_curve=tuple(equity_curve_value),
+        open_position=open_position,
+        summary=dict(summary_value),
+        diagnostics={
+            "instrument": {
+                "instrument_id": instrument.instrument_id,
+                "exchange": instrument.exchange.strip().upper(),
+                "trading_symbol": instrument.trading_symbol.strip().upper(),
+                "segment": instrument.segment.strip().upper(),
+                "instrument_type": instrument.instrument_type.strip().upper(),
+                "lot_size": instrument.lot_size,
+                "tick_size_decimal": _decimal_text(instrument.tick_size_decimal),
+            },
+            "interval": request.interval,
+            "execution_configuration": request.config.to_dict(),
+            "signal_provenance": request.signal_provenance.to_dict(),
+            "strategy_implementation_sha256": _sha256_file(
+                Path(__file__).with_name("strategy_lab.py")
+            ),
+            "signals_sha256": _canonical_hash(
+                [
+                    {
+                        "timestamp": signal.timestamp,
+                        "action": signal.action,
+                        "close": _decimal_text(signal.close),
+                        "fast_sma": _decimal_text(signal.fast_sma),
+                        "slow_sma": _decimal_text(signal.slow_sma),
+                    }
+                    for signal in request.signals
+                ]
+            ),
+            "dataset_sha256": request.dataset_sha256,
+            "candle_source_bindings_sha256": (request.candle_source_bindings_sha256),
+            "source_file_sha256s": list(request.source_file_sha256s),
+            "source_imports_sha256": _canonical_hash(list(request.eligibility.source_imports)),
+            "calendar_configuration_sha256": request.calendar_configuration_sha256,
+            "effective_calendar_configuration_sha256": (
+                request.effective_calendar_configuration_sha256
+            ),
+            "expected_schedule_sha256": request.expected_schedule_sha256,
+            "quality_report_sha256": _canonical_hash(_evidence_json_value(asdict(report))),
+            "data_quality": {
+                "status": report.overall_status,
+                "calendar_status": report.calendar_status,
+                "calendar_confidence": report.calendar_confidence,
+                "staleness_status": report.staleness_status,
+                "completeness_percentage": (
+                    _decimal_text(report.completeness_percentage)
+                    if report.completeness_percentage is not None
+                    else None
+                ),
+                "expected_candles": report.expected_candles,
+                "actual_candles": report.actual_candles,
+                "as_of": report.as_of.astimezone(UTC).isoformat(timespec="seconds"),
+            },
+            "source_imports": [dict(item) for item in request.eligibility.source_imports],
+        },
+        buy_and_hold_benchmark=benchmark_value,
+    )
+
+
 def _finish_run(
     database_path: Path, run_id: int, *, status: str, result: dict[str, object], error: str | None
 ) -> None:
@@ -1186,139 +2069,148 @@ def run_backtest(
                 f"Unsupported instrument: {spec.exchange}:{spec.trading_symbol} ({spec.instrument_type}).",
                 actual_hash,
             )
-        with closing(_readonly_connection(database_path)) as connection:
-            instrument = connection.execute(
-                """SELECT id, exchange, trading_symbol, segment, tick_size,
-                          tick_size_decimal, lot_size, is_active, instrument_type
-                   FROM instruments
-                   WHERE exchange = ? COLLATE NOCASE AND trading_symbol = ? COLLATE NOCASE""",
-                (spec.exchange, spec.trading_symbol),
-            ).fetchone()
-        if instrument is None:
-            return _blocked(
-                database_path, run_id, "Strategy instrument is not registered.", actual_hash
-            )
-        if not instrument["is_active"]:
-            return _blocked(
-                database_path, run_id, "Strategy instrument is no longer active.", actual_hash
-            )
-        if instrument["instrument_type"].upper() != spec.instrument_type:
+        source_imports: tuple[dict[str, object], ...] = ()
+        try:
+            with closing(_readonly_connection(database_path)) as connection:
+                connection.execute("BEGIN")
+                instrument = connection.execute(
+                    """SELECT id, exchange, trading_symbol, segment, tick_size,
+                              tick_size_decimal, lot_size, is_active, instrument_type
+                       FROM instruments
+                       WHERE exchange = ? COLLATE NOCASE AND trading_symbol = ? COLLATE NOCASE""",
+                    (spec.exchange, spec.trading_symbol),
+                ).fetchone()
+                if instrument is None:
+                    raise _QualificationBlocked("Strategy instrument is not registered.")
+                if not instrument["is_active"]:
+                    raise _QualificationBlocked("Strategy instrument is no longer active.")
+                if instrument["instrument_type"].upper() != spec.instrument_type:
+                    raise _QualificationBlocked(
+                        "Strategy instrument type no longer matches the Instrument Master."
+                    )
+                if int(instrument["lot_size"]) < 1 or config.order_quantity % int(
+                    instrument["lot_size"]
+                ):
+                    raise _QualificationBlocked(
+                        "Backtest order quantity no longer matches the registered instrument lot size."
+                    )
+                if instrument["tick_size"] is not None or instrument["tick_size_decimal"] is None:
+                    raise _QualificationBlocked(
+                        "An authoritative decimal tick size is required for backtest fill rounding."
+                    )
+                tick_size = _decimal_from_json(instrument["tick_size_decimal"], "tick_size_decimal")
+                try:
+                    calendars = _reload_calendar_registry(calendars)
+                except BacktestError as exc:
+                    raise _QualificationBlocked(str(exc)) from exc
+                instrument_snapshot: dict[str, object] = {
+                    "instrument_id": int(instrument["id"]),
+                    "exchange": str(instrument["exchange"]),
+                    "trading_symbol": str(instrument["trading_symbol"]),
+                    "segment": instrument["segment"],
+                    "instrument_type": str(instrument["instrument_type"]),
+                    "lot_size": int(instrument["lot_size"]),
+                    "tick_size_decimal": _decimal_text(tick_size),
+                }
+                instrument_snapshot_sha256 = _canonical_hash(instrument_snapshot)
+                report = analyze_dataset(
+                    database_path,
+                    spec.exchange,
+                    spec.trading_symbol,
+                    spec.interval,
+                    start_date,
+                    end_date,
+                    as_of=as_of,
+                    calendars=calendars,
+                    connection=connection,
+                )
+                reason = _gate_reason(report)
+                if reason is not None:
+                    raise _QualificationBlocked(reason)
+                calendar = calendars.resolve(spec.exchange, report.segment)
+                if calendar is None:
+                    raise _QualificationBlocked("No exchange/segment calendar is configured.")
+                scheduled, completed, _, uncovered = calculate_expected_candles(
+                    calendar, spec.interval, start_date, end_date, as_of=as_of
+                )
+                if uncovered or len(scheduled) != len(completed):
+                    raise _QualificationBlocked(
+                        "The requested backtest range includes uncovered or incomplete candles."
+                    )
+                expected_by_timestamp = {item.timestamp: item.completes_at for item in completed}
+                completed_timestamps = set(expected_by_timestamp)
+                (
+                    candles,
+                    dataset_hash,
+                    source_hashes,
+                    source_imports,
+                    candle_source_bindings_sha256,
+                ) = _load_completed_candles(
+                    database_path,
+                    exchange=spec.exchange,
+                    trading_symbol=spec.trading_symbol,
+                    interval=spec.interval,
+                    start_date=start_date,
+                    end_date=end_date,
+                    timezone_name=calendar.timezone_name,
+                    completed_timestamps=completed_timestamps,
+                    connection=connection,
+                )
+                if not source_imports:
+                    raise _QualificationBlocked(
+                        "No source-import provenance was resolved for the backtest dataset; "
+                        "every contributing import must have a complete VERIFIED_PERMITTED "
+                        "declaration. Missing provenance is treated as not permitted.",
+                        {"source_imports": []},
+                    )
+                _validate_candles(candles)
+                if len(candles) != len(completed_timestamps):
+                    raise _QualificationBlocked(
+                        "Dataset changed or lacks a completed expected candle."
+                    )
+                prohibited_imports = [
+                    item for item in source_imports if item["source_use_status"] == "PROHIBITED"
+                ]
+                if prohibited_imports:
+                    raise _QualificationBlocked(
+                        "Backtest data includes source imports marked PROHIBITED: "
+                        + ", ".join(str(item["import_id"]) for item in prohibited_imports),
+                        {"source_imports": list(source_imports)},
+                    )
+                unverified_imports = [
+                    item
+                    for item in source_imports
+                    if item["source_use_status"] != "VERIFIED_PERMITTED"
+                ]
+                if unverified_imports:
+                    raise _QualificationBlocked(
+                        "Backtest data includes source imports not declared VERIFIED_PERMITTED: "
+                        + ", ".join(str(item["import_id"]) for item in unverified_imports),
+                        {"source_imports": list(source_imports)},
+                    )
+                try:
+                    _validate_source_imports(source_imports)
+                except DataQualityGateError as exc:
+                    raise _QualificationBlocked(
+                        str(exc), {"source_imports": list(source_imports)}
+                    ) from exc
+        except _QualificationBlocked as exc:
             return _blocked(
                 database_path,
                 run_id,
-                "Strategy instrument type no longer matches the Instrument Master.",
+                exc.reason,
                 actual_hash,
+                provenance=exc.provenance,
             )
-        if int(instrument["lot_size"]) < 1 or config.order_quantity % int(instrument["lot_size"]):
+        except (BacktestError, StrategyLabError) as exc:
             return _blocked(
                 database_path,
                 run_id,
-                "Backtest order quantity no longer matches the registered instrument lot size.",
+                str(exc),
                 actual_hash,
+                provenance={"source_imports": list(source_imports)} if source_imports else None,
             )
-        if instrument["tick_size"] is not None or instrument["tick_size_decimal"] is None:
-            return _blocked(
-                database_path,
-                run_id,
-                "An authoritative decimal tick size is required for backtest fill rounding.",
-                actual_hash,
-            )
-        tick_size = _decimal_from_json(instrument["tick_size_decimal"], "tick_size_decimal")
-        instrument_snapshot: dict[str, object] = {
-            "instrument_id": int(instrument["id"]),
-            "exchange": str(instrument["exchange"]),
-            "trading_symbol": str(instrument["trading_symbol"]),
-            "segment": instrument["segment"],
-            "instrument_type": str(instrument["instrument_type"]),
-            "lot_size": int(instrument["lot_size"]),
-            "tick_size_decimal": _decimal_text(tick_size),
-        }
-        instrument_snapshot_sha256 = _canonical_hash(instrument_snapshot)
-        report = analyze_dataset(
-            database_path,
-            spec.exchange,
-            spec.trading_symbol,
-            spec.interval,
-            start_date,
-            end_date,
-            as_of=as_of,
-            calendars=calendars,
-        )
-        reason = _gate_reason(report)
-        if reason is not None:
-            return _blocked(database_path, run_id, reason, actual_hash)
-        calendar = calendars.resolve(spec.exchange, report.segment)
-        if calendar is None:
-            return _blocked(
-                database_path,
-                run_id,
-                "No exchange/segment calendar is configured.",
-                actual_hash,
-            )
-        scheduled, completed, _, uncovered = calculate_expected_candles(
-            calendar, spec.interval, start_date, end_date, as_of=as_of
-        )
-        if uncovered or len(scheduled) != len(completed):
-            return _blocked(
-                database_path,
-                run_id,
-                "The requested backtest range includes uncovered or incomplete candles.",
-                actual_hash,
-            )
-        expected_by_timestamp = {item.timestamp: item.completes_at for item in completed}
-        completed_timestamps = set(expected_by_timestamp)
-        candles, dataset_hash, source_hashes, source_imports = _load_completed_candles(
-            database_path,
-            exchange=spec.exchange,
-            trading_symbol=spec.trading_symbol,
-            interval=spec.interval,
-            start_date=start_date,
-            end_date=end_date,
-            timezone_name=calendar.timezone_name,
-            completed_timestamps=completed_timestamps,
-        )
-        if not source_imports:
-            return _blocked(
-                database_path,
-                run_id,
-                "No source-import provenance was resolved for the backtest dataset; "
-                "every contributing import must be declared VERIFIED_PERMITTED before "
-                "execution. Missing provenance is treated as not permitted.",
-                actual_hash,
-                provenance={"source_imports": []},
-            )
-        _validate_candles(candles)
-        if len(candles) != len(completed_timestamps):
-            return _blocked(
-                database_path,
-                run_id,
-                "Dataset changed or lacks a completed expected candle.",
-                actual_hash,
-            )
-        prohibited_imports = [
-            item for item in source_imports if item["source_use_status"] == "PROHIBITED"
-        ]
-        if prohibited_imports:
-            return _blocked(
-                database_path,
-                run_id,
-                "Backtest data includes source imports marked PROHIBITED: "
-                + ", ".join(str(item["import_id"]) for item in prohibited_imports),
-                actual_hash,
-                provenance={"source_imports": list(source_imports)},
-            )
-        unverified_imports = [
-            item for item in source_imports if item["source_use_status"] != "VERIFIED_PERMITTED"
-        ]
-        if unverified_imports:
-            return _blocked(
-                database_path,
-                run_id,
-                "Backtest data includes source imports not declared VERIFIED_PERMITTED: "
-                + ", ".join(str(item["import_id"]) for item in unverified_imports),
-                actual_hash,
-                provenance={"source_imports": list(source_imports)},
-            )
+
         required_history = spec.minimum_history_candles
         if len(candles) < required_history:
             return _blocked(
@@ -1333,19 +2225,63 @@ def run_backtest(
         signals = generate_sma_crossover_signals(
             candles, fast_window=spec.fast_window, slow_window=spec.slow_window
         )
-        with localcontext() as context:
-            context.prec = 50
-            context.rounding = ROUND_HALF_UP
-            output = _simulate(
-                candles,
-                signals,
-                config=config,
-                tick_size=tick_size,
+        signal_provenance = _SignalProvenance(
+            strategy_key=spec.strategy_key,
+            name=spec.name,
+            version=spec.version,
+            parameters=(
+                ("fast_window", spec.fast_window),
+                ("slow_window", spec.slow_window),
+            ),
+            strategy_spec_sha256=expected_spec_hash,
+        )
+        execution = _execute_qualified_request(
+            _ExecutionRequest(
+                candles=tuple(candles),
+                signals=signals,
+                signal_provenance=signal_provenance,
+                instrument=_ExecutionInstrument(
+                    exchange=str(instrument["exchange"]),
+                    trading_symbol=str(instrument["trading_symbol"]),
+                    segment=str(instrument["segment"]),
+                    instrument_type=str(instrument["instrument_type"]),
+                    is_active=bool(instrument["is_active"]),
+                    lot_size=int(instrument["lot_size"]),
+                    tick_size_decimal=tick_size,
+                    tick_size_is_authoritative=(
+                        instrument["tick_size"] is None
+                        and instrument["tick_size_decimal"] is not None
+                    ),
+                    instrument_id=int(instrument["id"]),
+                ),
                 interval=spec.interval,
+                config=config,
                 calendar=calendar,
                 expected_by_timestamp=expected_by_timestamp,
-            )
-            benchmark = _buy_and_hold_benchmark(candles, config=config, tick_size=tick_size)
+                eligibility=_ExecutionEligibility(
+                    quality_report=report,
+                    source_imports=source_imports,
+                ),
+                dataset_sha256=dataset_hash,
+                candle_source_bindings_sha256=candle_source_bindings_sha256,
+                source_file_sha256s=source_hashes,
+                calendar_configuration_sha256=calendars.configuration_sha256,
+                effective_calendar_configuration_sha256=_effective_calendar_hash(
+                    calendar, calendars
+                ),
+                expected_schedule_sha256=_canonical_hash(
+                    {
+                        timestamp: completion.astimezone(UTC)
+                        .isoformat(timespec="seconds")
+                        .replace("+00:00", "Z")
+                        for timestamp, completion in expected_by_timestamp.items()
+                    }
+                ),
+            ),
+            qualification_token=_QUALIFICATION_TOKEN,
+        )
+        output = execution.to_simulation_output()
+        benchmark = execution.to_benchmark_output()
         summary = output["summary"]
         if not isinstance(summary, dict):
             raise TypeError("Backtest simulation returned an invalid summary.")
@@ -1377,9 +2313,11 @@ def run_backtest(
             "strategy_experiment_id": strategy_experiment_id,
             "strategy_configuration_sha256": strategy_snapshot["strategy_configuration_sha256"],
             "strategy_spec_sha256": expected_spec_hash,
-            "strategy_implementation_sha256": _sha256_file(
-                Path(__file__).with_name("strategy_lab.py")
-            ),
+            "signal_provenance": _thaw_result_value(execution.diagnostics["signal_provenance"]),
+            "signals_sha256": execution.diagnostics["signals_sha256"],
+            "strategy_implementation_sha256": execution.diagnostics[
+                "strategy_implementation_sha256"
+            ],
             "backtesting_implementation_sha256": _sha256_file(Path(__file__)),
             "market_quality_implementation_sha256": _sha256_file(
                 Path(__file__).with_name("market_quality.py")

@@ -1,9 +1,16 @@
 # Exchange Calendar Configuration
 
-Project Aegis does not bundle an official NSE or BSE holiday dataset. The checked-in
-`config/exchange_calendars.json` intentionally has an empty `calendars` list. Until an
-administrator adds a locally verified calendar, session-based completeness and freshness
-are reported as unavailable; the application does not invent holidays, sessions, or missing bars.
+The checked-in `config/exchange_calendars.json` contains a `CONFIGURED` NSE cash-market
+calendar candidate covering 2025-01-01 through 2026-12-31. It is not independently reviewed or
+operationally accepted; 2027 and other exchanges/segments remain uncovered. Source URLs, circular
+references, retrieval dates, verified hashes, and limitations are recorded in
+[`EXCHANGE_CALENDAR_NSE_CASH_2025_2026_EVIDENCE.md`](EXCHANGE_CALENDAR_NSE_CASH_2025_2026_EVIDENCE.md).
+Until a calendar is verified for its full requested range, session-based completeness is
+provisional or unavailable and cannot authorize forward-paper entries.
+
+The candidate uses official NSE Capital Market (Equities) evidence and 09:15-15:30 IST normal
+market hours. Its 2026 Muhurat window does not model the instrument-specific Closing Auction
+Session (CAS) schedule. It does not configure F&O, BSE, or inferred 2027 dates.
 
 ## Maintaining local calendars
 
@@ -53,6 +60,22 @@ candles, not elapsed wall-clock time. Defaults are 1 and 3 respectively: fewer t
 threshold is `FRESH`; from the potential threshold up to (but not including) the stale threshold
 is `POTENTIALLY_STALE`; at or above the stale threshold is `STALE`. Holidays and closed hours add
 no expected slots.
+
+Qualified direct and registered backtest execution, Strategy Lab runs, and forward-paper
+qualification only load the path selected by application configuration
+(`AEGIS_CALENDAR_CONFIG_PATH`, defaulting to `config/exchange_calendars.json`). Callers may pass
+registry objects for API compatibility, but those objects are never authoritative: qualified
+workflows reload the configured file and reject a registry from another path or with different
+content. Execution callers cannot designate another JSON file as authoritative. The configured
+location is an administrative selection boundary; the application rejects alternate request
+paths, traversal, missing files, and paths that resolve through symlinks. SHA-256 identifies the
+selected file's contents and detects changes; it does not establish approval. `CONFIRMED` remains
+an administrative assertion, and neither it nor the hash proves official exchange-calendar
+authority. The application trusts administrators controlling its configuration and filesystem.
+The deployment must protect `AEGIS_CALENDAR_CONFIG_PATH` from untrusted process launchers; it is
+read from the process environment and is not an authorization boundary against code that can
+change that environment. Python cannot defend against malicious code already running with
+equivalent process privileges.
 
 ## Timestamp and candle conventions
 

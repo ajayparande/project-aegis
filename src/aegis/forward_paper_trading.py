@@ -16,10 +16,11 @@ from zoneinfo import ZoneInfo
 
 from aegis.database import get_connection, get_readonly_connection
 from aegis.market_quality import (
+    CalendarConfigError,
     CalendarRegistry,
     DatasetQualityReport,
     analyze_dataset,
-    load_calendar_registry,
+    load_approved_calendar_registry,
 )
 from aegis.paper_trading import (
     ExecutionSnapshot,
@@ -470,16 +471,12 @@ def _assert_verified_permitted_import(
 
 
 def _resolve_calendar_registry(
-    database_path: Path,
     calendars: CalendarRegistry | None = None,
 ) -> CalendarRegistry:
-    if calendars is not None:
-        return calendars
-    config_root = Path(__file__).resolve().parents[2]
-    config_path = config_root / "config" / "exchange_calendars.json"
-    if config_path.exists():
-        return load_calendar_registry(config_path)
-    return CalendarRegistry(())
+    try:
+        return load_approved_calendar_registry(expected_registry=calendars)
+    except CalendarConfigError as exc:
+        raise ForwardTradingError(f"Calendar configuration is invalid: {exc}") from exc
 
 
 def build_mock_proposal(
@@ -655,7 +652,7 @@ class ForwardPaperTradingEngine:
             as_of_dt.date(),
             as_of_dt.date(),
             as_of=as_of_dt,
-            calendars=_resolve_calendar_registry(self.database_path, calendars or self.calendars),
+            calendars=_resolve_calendar_registry(calendars or self.calendars),
             source_import_id=evidence_import_id,
         )
         if not report.actual_candles and not report.expected_candles:
@@ -1156,7 +1153,7 @@ class ForwardPaperTradingEngine:
                 snapshot_as_of.astimezone(_INDIA).date(),
                 snapshot_as_of.astimezone(_INDIA).date(),
                 as_of=snapshot_as_of,
-                calendars=_resolve_calendar_registry(self.database_path, self.calendars),
+                calendars=_resolve_calendar_registry(self.calendars),
                 source_import_id=execution_snapshot.import_id,
             )
             if independently_checked_quality != execution_snapshot.quality:

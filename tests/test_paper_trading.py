@@ -690,7 +690,13 @@ def test_execution_snapshot_cannot_precede_order_submission(setup) -> None:
     assert get_paper_account_report(database_path, account_id)["available_cash"] == "1000"
 
 
-def test_quality_failure_halts_and_does_not_store_an_untrusted_mark(setup) -> None:
+@pytest.mark.parametrize(
+    ("calendar_status", "calendar_confidence"),
+    [("PARTIAL", "CONFIRMED"), ("FULL", "CONFIGURED")],
+)
+def test_incomplete_or_unconfirmed_calendar_cannot_authorize_paper_order(
+    setup, calendar_status: str, calendar_confidence: str
+) -> None:
     database_path, _, instrument_id, imports, calendars, account_id = setup
     snapshot = _snapshot(
         database_path,
@@ -701,7 +707,11 @@ def test_quality_failure_halts_and_does_not_store_an_untrusted_mark(setup) -> No
         calendars,
         "100",
     )
-    bad_report = replace(snapshot.quality, calendar_status="PARTIAL")
+    bad_report = replace(
+        snapshot.quality,
+        calendar_status=calendar_status,
+        calendar_confidence=calendar_confidence,
+    )
     invalid = ExecutionSnapshot(
         snapshot.instrument_id,
         snapshot.interval,

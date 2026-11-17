@@ -22,9 +22,13 @@ implemented-but-not-accepted foundations, planned work, and blocked prerequisite
 ## Phase boundaries and dependencies
 
 Phase 2 includes the implemented Instrument Master, local historical CSV ingestion, and
-Stage 4 exchange-session/data-quality engine. The checked-in calendar configuration is
-intentionally empty. No verified official holiday dataset, approved external feed, or
-provider adapter is included. Source-use verification, maintained official calendar
+Stage 4 exchange-session/data-quality engine. The checked-in configuration contains a
+CONFIGURED NSE cash calendar candidate for 2025-2026, not operationally CONFIRMED.
+Coverage and evidence limitations remain, including uncovered 2027/other segments and
+the instrument-specific 2026 CAS schedule; see
+[calendar evidence](./EXCHANGE_CALENDAR_NSE_CASH_2025_2026_EVIDENCE.md).
+RESEARCH_ONLY remains mandatory. No approved external feed or provider adapter is
+included. Source-use verification, maintained official calendar
 coverage, and fail-closed quality/staleness integration remain prerequisites for dependent
 workflows.
 

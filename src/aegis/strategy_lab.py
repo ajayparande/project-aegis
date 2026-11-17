@@ -20,12 +20,15 @@ from zoneinfo import ZoneInfo
 from aegis.database import get_connection
 from aegis.market_data import SUPPORTED_INTERVALS, import_ohlcv_csv
 from aegis.market_quality import (
+    CalendarConfigError,
     CalendarRegistry,
     DatasetQualityReport,
     ExchangeCalendar,
     SessionWindow,
+    SpecialSessionClosure,
     analyze_dataset,
     calculate_expected_candles,
+    load_approved_calendar_registry,
 )
 
 SPEC_SCHEMA_VERSION = 1
@@ -35,6 +38,7 @@ _SUPPORTED_EXCHANGES = frozenset({"NSE", "BSE"})
 _SUPPORTED_UNIVERSE_TYPES = frozenset({"EQUITY", "INDEX"})
 _VERSION_TEXT = re.compile(r"\d+\.\d+\.\d+\Z")
 _UTC_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+_SOURCE_DECLARATION_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\Z")
 
 
 class StrategyLabError(ValueError):
@@ -286,7 +290,11 @@ def _calendar_document(calendar: ExchangeCalendar) -> dict[str, object]:
             {
                 "date": day.isoformat(),
                 "reason": special.reason,
-                "sessions": [_session_document(item) for item in special.sessions],
+                **(
+                    {"closed": True}
+                    if isinstance(special, SpecialSessionClosure)
+                    else {"sessions": [_session_document(item) for item in special.sessions]}
+                ),
             }
             for day, special in sorted(calendar.special_sessions.items())
         ],
@@ -772,7 +780,7 @@ def _gate_reason(report: DatasetQualityReport) -> str | None:
 def _validate_source_imports(
     source_imports: tuple[dict[str, object], ...],
 ) -> None:
-    """Require every contributing import to be declared VERIFIED_PERMITTED before signals."""
+    """Require complete, internally consistent declaration history for each import."""
 
     if not source_imports:
         raise DataQualityGateError(
@@ -784,15 +792,77 @@ def _validate_source_imports(
     for source_import in source_imports:
         import_id = source_import.get("import_id")
         status = source_import.get("source_use_status")
-        if status != "VERIFIED_PERMITTED":
+        declaration_id = source_import.get("declaration_id")
+        declaration_import_id = source_import.get("declaration_import_id")
+        declaration_status = source_import.get("declaration_new_status")
+        declared_by = source_import.get("declared_by")
+        rationale = source_import.get("rationale")
+        declared_at = source_import.get("declared_at")
+        previous_status = source_import.get("declaration_previous_status")
+        valid_statuses = {"VERIFIED_PERMITTED", "UNVERIFIED", "PROHIBITED"}
+        file_sha256 = source_import.get("file_sha256")
+        import_status = source_import.get("import_status")
+        instrument_id = source_import.get("instrument_id")
+        exchange = source_import.get("exchange")
+        trading_symbol = source_import.get("trading_symbol")
+        interval = source_import.get("interval")
+        declaration_is_complete = (
+            isinstance(import_id, int)
+            and not isinstance(import_id, bool)
+            and import_id > 0
+            and isinstance(declaration_id, int)
+            and not isinstance(declaration_id, bool)
+            and declaration_id > 0
+            and declaration_import_id == import_id
+            and isinstance(declaration_status, str)
+            and declaration_status in valid_statuses
+            and declaration_status == status
+            and isinstance(declared_by, str)
+            and bool(declared_by.strip())
+            and isinstance(rationale, str)
+            and bool(rationale.strip())
+            and isinstance(declared_at, str)
+            and bool(declared_at.strip())
+            and isinstance(previous_status, str)
+            and previous_status in valid_statuses
+            and isinstance(file_sha256, str)
+            and re.fullmatch(r"[a-fA-F0-9]{64}", file_sha256) is not None
+            and isinstance(import_status, str)
+            and import_status in {"COMPLETED", "COMPLETED_WITH_ERRORS"}
+            and isinstance(instrument_id, int)
+            and not isinstance(instrument_id, bool)
+            and instrument_id > 0
+            and isinstance(exchange, str)
+            and bool(exchange.strip())
+            and isinstance(trading_symbol, str)
+            and bool(trading_symbol.strip())
+            and isinstance(interval, str)
+            and interval in SUPPORTED_INTERVALS
+        )
+        if declaration_is_complete:
+            declaration_is_complete = _is_source_declaration_timestamp(declared_at)
+        if status != "VERIFIED_PERMITTED" or not declaration_is_complete:
             blocked.append(str(import_id) if import_id is not None else "unknown import")
     if blocked:
         raise DataQualityGateError(
-            "Source imports must be declared VERIFIED_PERMITTED before strategy evaluation: "
+            "Source imports require a complete, matching declaration history and "
+            "VERIFIED_PERMITTED status before strategy evaluation: "
             + ", ".join(blocked)
             + ". Every import contributing candles requires an explicit VERIFIED_PERMITTED "
             "declaration; this is a recorded declaration, not independent legal verification."
         )
+
+
+def _is_source_declaration_timestamp(value: object) -> bool:
+    """Validate SQLite CURRENT_TIMESTAMP text, stored as UTC without a timezone suffix."""
+
+    if not isinstance(value, str) or _SOURCE_DECLARATION_TIMESTAMP.fullmatch(value) is None:
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False
+    return parsed.strftime("%Y-%m-%d %H:%M:%S") == value
 
 
 def _decimal_text(value: Decimal) -> str:
@@ -810,8 +880,15 @@ def _load_completed_candles(
     end_date: date,
     timezone_name: str,
     completed_timestamps: set[str],
-) -> tuple[list[StrategyCandle], str, tuple[str, ...], tuple[dict[str, object], ...]]:
-    """Read exact rows from the selected local-date range and fingerprint their sources."""
+    connection: sqlite3.Connection | None = None,
+) -> tuple[
+    list[StrategyCandle],
+    str,
+    tuple[str, ...],
+    tuple[dict[str, object], ...],
+    str,
+]:
+    """Read exact rows and fingerprint both candle contents and per-candle source bindings."""
 
     try:
         lower = datetime.combine(start_date, time.min, UTC) - timedelta(days=1)
@@ -839,10 +916,18 @@ def _load_completed_candles(
         clauses.append("c.candle_timestamp < ?")
         parameters.append(upper_text)
     query = f"""SELECT c.candle_timestamp, c.open_decimal, c.high_decimal,
-                       c.low_decimal, c.close_decimal, c.volume, d.id AS source_import_id,
-                       d.file_sha256, d.source_use_status,
-                       h.id AS source_use_declaration_id, h.declared_by,
-                       h.rationale AS source_use_rationale, h.declared_at
+                       c.low_decimal, c.close_decimal, c.volume,
+                       c.instrument_id AS candle_instrument_id,
+                       d.id AS source_import_id, d.file_sha256, d.source_use_status,
+                       d.instrument_id AS source_instrument_id,
+                       d.requested_exchange AS source_exchange,
+                       d.requested_trading_symbol AS source_trading_symbol,
+                       d.interval AS source_interval, d.status AS source_import_status,
+                       h.id AS source_use_declaration_id,
+                       h.import_id AS source_use_declaration_import_id,
+                       h.previous_status AS source_use_declaration_previous_status,
+                       h.new_status AS source_use_declaration_new_status,
+                       h.declared_by, h.rationale AS source_use_rationale, h.declared_at
                 FROM historical_candles AS c
                 JOIN instruments AS i ON i.id = c.instrument_id
                 LEFT JOIN data_imports AS d ON d.id = c.import_id
@@ -857,9 +942,13 @@ def _load_completed_candles(
     timezone = ZoneInfo(timezone_name)
     candles: list[StrategyCandle] = []
     records: list[dict[str, object]] = []
+    candle_source_bindings: list[dict[str, object]] = []
     import_hashes: set[str] = set()
     source_imports: dict[int, dict[str, object]] = {}
-    with closing(_readonly_connection(database_path)) as connection:
+    if connection is None:
+        with closing(_readonly_connection(database_path)) as active_connection:
+            rows = active_connection.execute(query, parameters).fetchall()
+    else:
         rows = connection.execute(query, parameters).fetchall()
     for row in rows:
         timestamp = row["candle_timestamp"]
@@ -903,22 +992,122 @@ def _load_completed_candles(
         import_id = row["source_import_id"]
         if import_id is None:
             raise StrategyLabError("A historical candle has no resolvable source import.")
+        if (
+            row["source_instrument_id"] != row["candle_instrument_id"]
+            or not isinstance(row["source_exchange"], str)
+            or row["source_exchange"].strip().upper() != exchange.strip().upper()
+            or not isinstance(row["source_trading_symbol"], str)
+            or row["source_trading_symbol"].strip().upper() != trading_symbol.strip().upper()
+            or row["source_interval"] != interval
+        ):
+            raise StrategyLabError(
+                f"Source import {import_id} does not match its contributing candle identity."
+            )
         source_imports[int(import_id)] = {
             "import_id": int(import_id),
             "file_sha256": file_hash,
+            "instrument_id": row["source_instrument_id"],
+            "exchange": row["source_exchange"],
+            "trading_symbol": row["source_trading_symbol"],
+            "interval": row["source_interval"],
+            "import_status": row["source_import_status"],
             "source_use_status": row["source_use_status"] or "UNVERIFIED",
             "declaration_id": row["source_use_declaration_id"],
+            "declaration_import_id": row["source_use_declaration_import_id"],
+            "declaration_previous_status": row["source_use_declaration_previous_status"],
+            "declaration_new_status": row["source_use_declaration_new_status"],
             "declared_by": row["declared_by"],
             "rationale": row["source_use_rationale"],
             "declared_at": row["declared_at"],
         }
+        candle_source_bindings.append(
+            {
+                "timestamp": candle.timestamp,
+                "import_id": int(import_id),
+                "file_sha256": file_hash,
+                "instrument_id": row["source_instrument_id"],
+                "exchange": row["source_exchange"],
+                "trading_symbol": row["source_trading_symbol"],
+                "interval": row["source_interval"],
+                "source_use_status": row["source_use_status"] or "UNVERIFIED",
+                "declaration_id": row["source_use_declaration_id"],
+                "declaration_import_id": row["source_use_declaration_import_id"],
+                "declaration_new_status": row["source_use_declaration_new_status"],
+            }
+        )
     dataset_sha = _sha256(_canonical_json(records))
     return (
         candles,
         dataset_sha,
         tuple(sorted(import_hashes)),
         tuple(source_imports[key] for key in sorted(source_imports)),
+        _sha256(_canonical_json(candle_source_bindings)),
     )
+
+
+def _load_qualified_strategy_data(
+    database_path: Path,
+    spec: StrategySpec,
+    start_date: date,
+    end_date: date,
+    *,
+    as_of: datetime,
+    calendars: CalendarRegistry,
+) -> tuple[
+    DatasetQualityReport,
+    ExchangeCalendar | None,
+    list[StrategyCandle],
+    str | None,
+    tuple[str, ...],
+    tuple[dict[str, object], ...],
+]:
+    """Qualify and load strategy inputs from one read-only SQLite snapshot."""
+    with closing(_readonly_connection(database_path)) as connection:
+        connection.execute("BEGIN")
+        report = analyze_dataset(
+            database_path,
+            spec.exchange,
+            spec.trading_symbol,
+            spec.interval,
+            start_date,
+            end_date,
+            as_of=as_of,
+            calendars=calendars,
+            connection=connection,
+        )
+        if _gate_reason(report) is not None:
+            return report, None, [], None, (), ()
+
+        calendar = calendars.resolve(spec.exchange, report.segment)
+        if calendar is None:
+            raise DataQualityGateError("No exchange/segment calendar is configured.")
+        _, completed_candles, _, uncovered = calculate_expected_candles(
+            calendar, spec.interval, start_date, end_date, as_of=as_of
+        )
+        if uncovered:
+            raise DataQualityGateError("Calendar coverage is incomplete for the experiment range.")
+        completed_timestamps = {item.timestamp for item in completed_candles}
+        try:
+            candles, dataset_sha, source_hashes, source_imports, _ = _load_completed_candles(
+                database_path,
+                exchange=spec.exchange,
+                trading_symbol=spec.trading_symbol,
+                interval=spec.interval,
+                start_date=start_date,
+                end_date=end_date,
+                timezone_name=calendar.timezone_name,
+                completed_timestamps=completed_timestamps,
+                connection=connection,
+            )
+        except StrategyLabError as exc:
+            raise DataQualityGateError(str(exc)) from exc
+        _validate_source_imports(source_imports)
+        _validate_candles(candles)
+        if len(candles) != report.expected_candles:
+            raise DataQualityGateError(
+                "Stored completed candles changed during analysis; rerun after verifying the dataset."
+            )
+        return report, calendar, candles, dataset_sha, source_hashes, source_imports
 
 
 def run_strategy_experiment(
@@ -994,17 +1183,33 @@ def run_strategy_experiment(
         run_id = int(run_cursor.lastrowid)
 
     try:
-        report = analyze_dataset(
+        try:
+            calendars = load_approved_calendar_registry(expected_registry=calendars)
+        except CalendarConfigError as exc:
+            raise DataQualityGateError(str(exc)) from exc
+        (
+            report,
+            calendar,
+            candles,
+            dataset_sha,
+            source_hashes,
+            source_imports,
+        ) = _load_qualified_strategy_data(
             database_path,
-            spec.exchange,
-            spec.trading_symbol,
-            spec.interval,
+            spec,
             start_date,
             end_date,
             as_of=as_of,
             calendars=calendars,
         )
         gate_reason = _gate_reason(report)
+        if gate_reason is None and len(candles) < spec.minimum_history_candles:
+            required_history = spec.minimum_history_candles
+            gate_reason = (
+                f"Insufficient strategy history for {spec.name} version {spec.version}: "
+                f"requires {required_history} candles but only {len(candles)} eligible "
+                "completed candles are available."
+            )
         if gate_reason is not None:
             result = {
                 "result_schema_version": 1,
@@ -1033,34 +1238,8 @@ def run_strategy_experiment(
             )
             return StrategyRunResult(run_id, "BLOCKED", (), None, gate_reason)
 
-        calendar = calendars.resolve(spec.exchange, report.segment)
-        if calendar is None:
-            raise DataQualityGateError("No exchange/segment calendar is configured.")
-        _, completed_candles, _, uncovered = calculate_expected_candles(
-            calendar, spec.interval, start_date, end_date, as_of=as_of
-        )
-        if uncovered:
-            raise DataQualityGateError("Calendar coverage is incomplete for the experiment range.")
-        completed_timestamps = {item.timestamp for item in completed_candles}
-        try:
-            candles, dataset_sha, source_hashes, source_imports = _load_completed_candles(
-                database_path,
-                exchange=spec.exchange,
-                trading_symbol=spec.trading_symbol,
-                interval=spec.interval,
-                start_date=start_date,
-                end_date=end_date,
-                timezone_name=calendar.timezone_name,
-                completed_timestamps=completed_timestamps,
-            )
-        except StrategyLabError as exc:
-            raise DataQualityGateError(str(exc)) from exc
-        _validate_source_imports(source_imports)
-        _validate_candles(candles)
-        if len(candles) != report.expected_candles:
-            raise DataQualityGateError(
-                "Stored completed candles changed during analysis; rerun after verifying the dataset."
-            )
+        if calendar is None or dataset_sha is None:
+            raise DataQualityGateError("Qualified strategy inputs were not loaded.")
         signals = generate_sma_crossover_signals(
             candles, fast_window=spec.fast_window, slow_window=spec.slow_window
         )

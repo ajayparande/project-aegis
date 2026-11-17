@@ -159,7 +159,9 @@ def test_full_synthetic_workflow_stays_isolated_and_reconciles(tmp_path: Path, m
     assert source_status == "VERIFIED_PERMITTED"
 
     # C: Synthetic calendar is an isolated execution fixture, not operational evidence.
-    calendars = _calendar(database.parent / "synthetic_calendar.json")
+    calendar_path = database.parent / "synthetic_calendar.json"
+    calendars = _calendar(calendar_path)
+    monkeypatch.setenv("AEGIS_CALENDAR_CONFIG_PATH", str(calendar_path))
     quality = analyze_dataset(
         database,
         "NSE",

@@ -174,7 +174,7 @@ def test_dashboard_shows_historical_csv_import_and_candle_overview(
     assert len(app.dataframe) >= 3
 
 
-def test_dashboard_shows_unconfigured_calendar_without_claiming_completeness(
+def test_dashboard_warns_for_unconfirmed_calendar_without_claiming_completeness(
     isolated_app_paths,
 ) -> None:
     database_path, _ = isolated_app_paths
@@ -193,7 +193,10 @@ def test_dashboard_shows_unconfigured_calendar_without_claiming_completeness(
 
     assert not app.exception
     assert "Market Data Quality and Exchange Sessions" in [item.value for item in app.subheader]
-    assert any("Exchange calendars are unavailable" in item.value for item in app.warning)
+    assert any(
+        "CONFIGURED, not CONFIRMED" in item.value and "forward-paper" in item.value
+        for item in app.warning
+    )
     analyze_button = next(
         item for item in app.button if item.label == "Analyze market-data quality"
     )
@@ -212,7 +215,7 @@ def test_dashboard_displays_research_only_strategy_lab(isolated_app_paths) -> No
     assert not app.exception
     assert "Strategy Lab" in [item.value for item in app.subheader]
     assert any("research signals only" in item.value for item in app.caption)
-    assert any("checked-in calendar is unconfigured" in item.value for item in app.caption)
+    assert any("only CONFIGURED" in item.value for item in app.caption)
 
 
 def test_dashboard_registers_experiment_in_isolated_database(isolated_app_paths) -> None:

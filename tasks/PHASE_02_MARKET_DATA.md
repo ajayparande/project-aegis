@@ -37,7 +37,7 @@ Establish a provider-neutral, auditable market-data foundation. External data ma
 
 ### Remaining operational prerequisites (require authoritative external evidence)
 - [ ] Verify and document the permitted use, licensing, entitlements, rate limits, and retention rules for any proposed external market-data source. A source-use declaration is recorded provenance, not independent proof of legal licensing.
-- [ ] Verify and maintain an authoritative NSE/BSE exchange-calendar dataset (holidays, sessions, coverage range) before claiming `CONFIRMED` calendar coverage. The checked-in `config/exchange_calendars.json` has an empty `calendars` list and makes no official-coverage claim; calendar-dependent workflows remain fail-closed until verified coverage is supplied.
+- [ ] Independently review and maintain authoritative NSE/BSE exchange-calendar coverage before claiming `CONFIRMED`. The checked-in configuration contains a `CONFIGURED` NSE cash candidate for 2025-2026 only; 2027 and other segments remain uncovered. See [calendar evidence](../docs/EXCHANGE_CALENDAR_NSE_CASH_2025_2026_EVIDENCE.md). Calendar-dependent workflows remain fail-closed until confirmed coverage is supplied.
 - [ ] Obtain a real historical dataset from a source with verified permitted use; synthetic `VERIFIED_PERMITTED` declarations in tests are test fixtures only, not licensing evidence.
 - [ ] Add a provider adapter or read-only live feed only in a separately scoped milestone after source approval.
 - [ ] Phase 4 backtesting acceptance remains pending; the source-permission gate is implemented but Phase 4 milestone acceptance is not yet satisfied.

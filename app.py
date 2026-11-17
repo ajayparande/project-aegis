@@ -356,12 +356,16 @@ st.caption(
 
 if database_healthy:
     try:
-        calendar_path = Path(__file__).resolve().parent / "config" / "exchange_calendars.json"
-        calendar_registry = load_calendar_registry(calendar_path)
+        calendar_registry = load_calendar_registry(settings.calendar_config_path)
         if not calendar_registry.calendars:
             st.warning(
                 "Exchange calendars are unavailable. No holidays or session coverage are "
                 "assumed; missing-candle counts and completeness scores cannot be confirmed."
+            )
+        elif any(calendar.confidence != "CONFIRMED" for calendar in calendar_registry.calendars):
+            st.warning(
+                "One or more exchange calendars are CONFIGURED, not CONFIRMED. Findings remain "
+                "provisional and cannot authorize forward-paper entries."
             )
         else:
             st.caption(f"Loaded {len(calendar_registry.calendars)} exchange/segment calendar(s).")
@@ -617,10 +621,7 @@ if database_healthy:
                     ),
                     None,
                 )
-                calendar_path = (
-                    Path(__file__).resolve().parent / "config" / "exchange_calendars.json"
-                )
-                calendar_registry = load_calendar_registry(calendar_path)
+                calendar_registry = load_calendar_registry(settings.calendar_config_path)
                 calendar = (
                     calendar_registry.resolve(
                         str(selected_experiment["exchange"]),
@@ -688,7 +689,8 @@ else:
 
 st.caption(
     "Runs require complete CONFIRMED calendar coverage and FRESH, 100% complete data. "
-    "The checked-in calendar is unconfigured, so current experiments will be blocked until verified coverage is supplied."
+    "The checked-in NSE cash calendar covers 2025-2026 but is only CONFIGURED, so experiments "
+    "remain blocked until full coverage is independently verified."
 )
 
 st.divider()

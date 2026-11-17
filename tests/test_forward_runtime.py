@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -17,6 +18,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 import aegis.database as database_module
+import aegis.forward_paper_trading as forward_paper_trading_module
 import aegis.forward_runtime as forward_runtime_module
 import aegis.paper_trading as paper_trading_module
 from aegis.backtesting import zero_cost_assumptions
@@ -60,6 +62,11 @@ _LIMITS = RiskLimits(
 )
 
 
+@pytest.fixture(autouse=True)
+def isolate_calendar_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AEGIS_CALENDAR_CONFIG_PATH", raising=False)
+
+
 def _calendar(
     path: Path,
     *,
@@ -95,6 +102,7 @@ def _calendar(
         ),
         encoding="utf-8",
     )
+    os.environ["AEGIS_CALENDAR_CONFIG_PATH"] = str(path)
     return load_calendar_registry(path)
 
 
@@ -1698,10 +1706,10 @@ def test_direct_runtime_paths_cannot_authorize_forged_or_disconnected_quotes(
     def interrupt_evidence(*args, **kwargs):
         raise RuntimeError("leave a bound pending event")
 
-    monkeypatch.setattr(runtime, "prepare_evidence", interrupt_evidence)
-    with pytest.raises(RuntimeError, match="bound pending event"):
-        runtime.route_event(event_id, proposal, snapshot)
-    monkeypatch.undo()
+    with monkeypatch.context() as interruption:
+        interruption.setattr(runtime, "prepare_evidence", interrupt_evidence)
+        with pytest.raises(RuntimeError, match="bound pending event"):
+            runtime.route_event(event_id, proposal, snapshot)
     _set_feed_record(database, runtime, instrument_id, status="DISCONNECTED")
 
     forged_snapshot = replace(
@@ -1783,10 +1791,10 @@ def test_forward_order_and_authorization_rollback_together(
     def fail_order_event(*args, **kwargs):
         raise RuntimeError("injected Phase 8 transaction failure")
 
-    monkeypatch.setattr(paper_trading_module, "_insert_order_event", fail_order_event)
-    with pytest.raises(RuntimeError, match="Phase 8 transaction failure"):
-        runtime.route_event(event_id, proposal, snapshot)
-    monkeypatch.undo()
+    with monkeypatch.context() as transaction_failure:
+        transaction_failure.setattr(paper_trading_module, "_insert_order_event", fail_order_event)
+        with pytest.raises(RuntimeError, match="Phase 8 transaction failure"):
+            runtime.route_event(event_id, proposal, snapshot)
 
     with closing(get_connection(database)) as connection:
         authorization = connection.execute(
@@ -1902,6 +1910,47 @@ def test_forward_order_and_authorization_rollback_together(
         assert authorization["status"] == "CONSUMED"
         assert authorization["consumed_order_id"] == result.order_id
         assert connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0] == 1
+
+
+def test_forward_order_rechecks_calendar_inside_order_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, calendars, (instrument_id,), runtime = _setup(tmp_path)
+    quotes = list(_provider((instrument_id,), count=2))
+    runtime.process_quote(quotes[0])
+    event_id = runtime.process_quote(quotes[1]).scheduled_event_ids[0]
+    proposal = runtime.build_mock_proposal(event_id, "BUY", 1)
+    snapshot = runtime.execution_snapshot(instrument_id, quotes[1])
+    calendar_path = calendars.configuration_path
+    assert calendar_path is not None
+    original_submit = forward_paper_trading_module.submit_paper_order
+
+    def replace_calendar_then_submit(*args, **kwargs):
+        configuration = json.loads(calendar_path.read_text(encoding="utf-8"))
+        configuration["calendars"][0]["confidence"] = "CONFIGURED"
+        calendar_path.write_text(json.dumps(configuration), encoding="utf-8")
+        return original_submit(*args, **kwargs)
+
+    monkeypatch.setattr(
+        forward_paper_trading_module,
+        "submit_paper_order",
+        replace_calendar_then_submit,
+    )
+
+    result = runtime.route_event(event_id, proposal, snapshot)
+
+    assert result.status == "REJECTED"
+    assert "current approved-calendar" in (result.reason or "").lower()
+    with closing(get_connection(database)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM paper_ledger_entries").fetchone()[0] == 0
+        order = connection.execute(
+            "SELECT status, reason FROM paper_orders WHERE account_id = ?",
+            (runtime.account_id,),
+        ).fetchone()
+    assert order is not None
+    assert order["status"] == "REJECTED"
+    assert "approved-calendar" in order["reason"].lower()
 
 
 def test_concurrent_forward_event_submission_creates_one_order(tmp_path: Path) -> None:

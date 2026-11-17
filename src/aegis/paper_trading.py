@@ -24,7 +24,12 @@ from aegis.backtesting import (
     _fill_price,
 )
 from aegis.database import get_connection
-from aegis.market_quality import DatasetQualityReport
+from aegis.market_quality import (
+    CalendarConfigError,
+    DatasetQualityReport,
+    analyze_dataset,
+    load_approved_calendar_registry,
+)
 
 _CURRENCY = "INR"
 _INDIA = ZoneInfo("Asia/Kolkata")
@@ -734,6 +739,34 @@ def submit_paper_order(
             reason = account["halt_reason"]
             if not reason:
                 reason = "Account halt is unclassified; order rejected."
+
+        if reason is None and forward_event_id is not None:
+            snapshot_as_of = _timestamp(snapshot.as_of, "snapshot as_of")
+            trading_date = snapshot_as_of.astimezone(_INDIA).date()
+            try:
+                calendars = load_approved_calendar_registry()
+                current_quality = analyze_dataset(
+                    database_path,
+                    instrument["exchange"],
+                    instrument["trading_symbol"],
+                    snapshot.interval,
+                    trading_date,
+                    trading_date,
+                    as_of=snapshot_as_of,
+                    calendars=calendars,
+                    source_import_id=snapshot.import_id,
+                    connection=connection,
+                )
+            except (CalendarConfigError, OSError, ValueError) as exc:
+                reason = f"Current approved-calendar qualification failed: {exc}"
+                halt_reason = PaperRiskHaltReason.MARKET_QUALITY_FAILURE.value
+            else:
+                if current_quality != snapshot.quality:
+                    reason = (
+                        "Execution snapshot quality no longer matches the current "
+                        "approved-calendar dataset."
+                    )
+                    halt_reason = PaperRiskHaltReason.MARKET_QUALITY_FAILURE.value
 
         if reason is None:
             prior_snapshot_use = connection.execute(

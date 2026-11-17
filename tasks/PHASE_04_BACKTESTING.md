@@ -41,6 +41,58 @@ fixed integer order quantity. Completed-candle signals submit market orders for 
 eligible candle open. Orders use an all-or-none capacity check based on the prior completed
 candle's volume, never the execution candle's eventual volume.
 
+### Shared one-instrument execution contract (M1B)
+
+`aegis.backtesting.execute_one_instrument` accepts a local database path, instrument identity,
+date range, SMA windows, explicit execution configuration, a calendar-configuration file
+path, and `as_of`. It loads and validates the calendar file inside the boundary, then obtains
+the instrument master fields, historical candles, Phase 2 quality report, expected completed-
+candle schedule, source-import provenance, and source-use declaration history itself. The
+calendar file path must be selected by trusted host/administrator code; an arbitrary strategy
+or untrusted plugin must not choose it. The implementation validates the file format and
+mapping and records its content hash, but has no cryptographic signature or independent
+calendar authority. Calendar correctness and confirmation remain an administrative
+responsibility; missing, unknown, uncovered, or unconfirmed calendar data blocks execution.
+
+The direct path generates SMA crossover signals from the qualified candle sequence using
+explicit fast/slow windows. It does not accept caller-supplied signals as qualified input.
+Diagnostics identify the deterministic strategy key/version/parameters and fingerprint the
+generated signal sequence. Registered backtests likewise generate signals after qualification
+from their frozen strategy specification. The SMA generator evaluates each completed candle
+using only that candle and earlier candles. Arbitrary externally supplied signals remain
+unverified and must not be used as evidence of causal or confirmatory research.
+
+For each import contributing a candle, qualification checks the current source-use status
+against the latest history row, including import identity, declared status, and non-empty
+declaration metadata. It fails closed for missing or contradictory history. The
+`VERIFIED_PERMITTED` value remains a recorded user assertion, not independent legal
+verification.
+
+The registered `run_backtest` signature and persisted Phase 4 result shape are unchanged. It
+reloads the file-backed calendar registry and rejects a file changed since the caller loaded
+it. Instrument, quality, candle, and provenance reads use one read-only SQLite transaction;
+the run record is persisted only after that snapshot closes. The direct path also performs
+its qualification reads in one read-only transaction and does not persist runs.
+
+Deterministic execution correctness and causal research validity are distinct claims. The
+shared simulator preserves completed-bar decisions, next-eligible-candle fills, prior-bar
+volume participation, and the existing accounting. Causal signal generation is established
+only for the built-in deterministic generator or registered strategy path; the simulator
+alone cannot prove that arbitrary precomputed signals did not use future information. These
+interfaces remain single-instrument and do not implement a broader confirmatory evaluation
+harness.
+
+`ExecutionResult` stores recursively immutable snapshots. `to_simulation_output()` and
+`to_benchmark_output()` return detached mutable dictionaries for legacy Phase 4 persistence.
+The registered `run_backtest` entry point retains its existing database-backed registration,
+eligibility checks, provenance snapshots, status handling, and persistence; its already
+qualified inputs and the public research entry point both use the same `_simulate`,
+fill/fee calculations, and buy-and-hold benchmark implementation. Direct qualification
+failures raise `BacktestError` without persistence. Registered data-eligibility failures
+remain `BLOCKED`; unexpected execution or persistence errors retain the existing `FAILED`
+behavior. This contract is single-instrument and adds no portfolio allocation or Phase 8
+execution behavior.
+
 All charge rates are configurable user assumptions, not an official or broker-verified
 schedule. Brokerage is per-order turnover times `brokerage_rate`; a positive
 `brokerage_cap_per_order` limits that amount, while a zero cap means uncapped. A zero

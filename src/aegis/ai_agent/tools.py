@@ -43,7 +43,12 @@ from aegis.indicators import (
 )
 from aegis.instruments import get_instrument, search_instruments
 from aegis.market_data import list_historical_candles
-from aegis.market_quality import CalendarRegistry, analyze_dataset
+from aegis.market_quality import (
+    CalendarConfigError,
+    CalendarRegistry,
+    analyze_dataset,
+    load_approved_calendar_registry,
+)
 
 
 def _tool_worker(
@@ -418,9 +423,16 @@ def _tool_get_dataset_quality_summary(
     *,
     context: dict[str, Any],
 ) -> dict[str, Any]:
-    """Analyze historical dataset quality and calendar completeness."""
+    """Summarize quality using approved, fully confirmed calendar coverage.
+
+    Missing or invalid approved configuration and unavailable confirmed coverage
+    raise ValueError; the registry returns a controlled unsuccessful tool result.
+    """
     database_path: Path = context["database_path"]
-    calendars: CalendarRegistry = context.get("calendars") or CalendarRegistry(())
+    try:
+        calendars = load_approved_calendar_registry(expected_registry=context.get("calendars"))
+    except (CalendarConfigError, OSError) as exc:
+        raise ValueError("Approved calendar evidence is unavailable or invalid.") from exc
 
     try:
         start_d = date.fromisoformat(start_date)
@@ -439,6 +451,8 @@ def _tool_get_dataset_quality_summary(
         calendars=calendars,
     )
 
+    if report.calendar_status != "FULL" or report.calendar_confidence != "CONFIRMED":
+        raise ValueError("Quality summaries require full CONFIRMED approved calendar coverage.")
     passes_gate = report.overall_status == "COMPLETE" and report.calendar_status == "FULL"
 
     return {

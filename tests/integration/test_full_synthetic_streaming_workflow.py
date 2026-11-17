@@ -75,7 +75,9 @@ def test_fresh_synthetic_stream_reaches_paper_ledger_and_dashboard(
     initialize_database(database)
     assert get_database_status(database)["schema_version"] == SCHEMA_VERSION
 
-    calendar = _calendar(database.parent / "calendar.json")
+    calendar_path = database.parent / "calendar.json"
+    calendar = _calendar(calendar_path)
+    monkeypatch.setenv("AEGIS_CALENDAR_CONFIG_PATH", str(calendar_path))
     instrument = register_instrument(
         database,
         InstrumentInput(

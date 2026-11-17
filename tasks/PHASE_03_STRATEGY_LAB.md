@@ -53,7 +53,8 @@ The Strategy Lab emits deterministic long-only entry/exit research signals from 
 historical candles. It does not calculate returns, simulate fills, size positions, set risk
 limits, or submit orders. Runs fail closed unless Stage 4 reports complete confirmed
 calendar coverage, 100% candle completeness, and fresh, valid, non-duplicate data. The
-checked-in calendar is intentionally unconfigured, so the dashboard cannot currently
-produce an unblocked run from its default configuration. Phase 2 remains in progress.
+checked-in NSE cash calendar is only CONFIGURED for 2025-2026 and is not CONFIRMED, so the
+dashboard cannot currently produce an unblocked run from its default configuration. Phase 2
+remains in progress.
 Abrupt termination may leave a run `RUNNING`; reconciliation is manual after verifying the
 owning process has ended. Runs are never automatically failed based only on elapsed time.

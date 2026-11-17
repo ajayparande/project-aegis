@@ -1,6 +1,7 @@
 """Tests for deterministic Phase 3 strategy specifications and signal research."""
 
 import json
+import os
 import sqlite3
 from contextlib import closing
 from datetime import date, datetime
@@ -10,10 +11,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import aegis.strategy_lab as strategy_lab_module
 from aegis.database import SCHEMA_VERSION, get_connection, get_database_status, initialize_database
 from aegis.instruments import InstrumentInput, register_instrument
 from aegis.market_data import declare_import_source_use_status, import_ohlcv_csv
-from aegis.market_quality import CalendarRegistry, load_calendar_registry
+from aegis.market_quality import load_calendar_registry
 from aegis.strategy_lab import (
     StrategyCandle,
     StrategyLabError,
@@ -40,6 +42,11 @@ def database_path(tmp_path: Path) -> Path:
         InstrumentInput("NSE", "TCS", "Tata Consultancy Services", "EQUITY", segment="NSE"),
     )
     return path
+
+
+@pytest.fixture(autouse=True)
+def isolate_calendar_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AEGIS_CALENDAR_CONFIG_PATH", raising=False)
 
 
 def _spec(**overrides: object):
@@ -86,7 +93,7 @@ def _write_csv(
     return csv_path
 
 
-def _registry(path: Path, *, close: str = "09:22"):
+def _registry(path: Path, *, close: str = "09:22", confidence: str = "CONFIRMED"):
     config = path / "exchange_calendars.json"
     config.write_text(
         json.dumps(
@@ -98,7 +105,7 @@ def _registry(path: Path, *, close: str = "09:22"):
                         "exchange": "NSE",
                         "segment": "NSE",
                         "timezone": "Asia/Kolkata",
-                        "confidence": "CONFIRMED",
+                        "confidence": confidence,
                         "coverage_start": _DAY.isoformat(),
                         "coverage_end": _DAY.isoformat(),
                         "source": "Deterministic test fixture",
@@ -112,6 +119,7 @@ def _registry(path: Path, *, close: str = "09:22"):
         ),
         encoding="utf-8",
     )
+    os.environ["AEGIS_CALENDAR_CONFIG_PATH"] = str(config)
     return load_calendar_registry(config)
 
 
@@ -125,15 +133,21 @@ def _register(database_path: Path, spec=None) -> int:
     return registration.experiment_id
 
 
-def _import(database_path: Path, tmp_path: Path, *, missing: int | None = None) -> None:
+def _import(
+    database_path: Path,
+    tmp_path: Path,
+    *,
+    missing: int | None = None,
+    closes: tuple[int, ...] = _CLOSES,
+) -> None:
     result = import_ohlcv_csv(
         database_path,
-        _write_csv(tmp_path, missing=missing),
+        _write_csv(tmp_path, closes=closes, missing=missing),
         "NSE",
         "TCS",
         "1m",
     )
-    assert result.accepted_rows == len(_CLOSES) - (missing is not None)
+    assert result.accepted_rows == len(closes) - (missing is not None)
     declare_import_source_use_status(
         database_path,
         result.import_id,
@@ -299,6 +313,54 @@ def test_experiment_registry_scopes_versions_by_instrument_and_interval(
     }
 
 
+def test_run_blocks_when_history_is_one_candle_below_minimum(
+    database_path: Path, tmp_path: Path
+) -> None:
+    _import(database_path, tmp_path, closes=(30, 20, 10))
+    experiment_id = _register(database_path)
+    calendars = _registry(tmp_path, close="09:18")
+
+    result = run_strategy_experiment(
+        database_path, experiment_id, calendars=calendars, as_of=_AS_OF
+    )
+
+    assert result.status == "BLOCKED"
+    assert result.signals == ()
+    assert "requires 4 candles but only 3" in (result.reason or "")
+
+
+def test_run_accepts_exact_minimum_history_and_generates_crossover(
+    database_path: Path, tmp_path: Path
+) -> None:
+    _import(database_path, tmp_path, closes=(30, 20, 10, 40))
+    experiment_id = _register(database_path)
+    calendars = _registry(tmp_path, close="09:19")
+
+    result = run_strategy_experiment(
+        database_path, experiment_id, calendars=calendars, as_of=_AS_OF
+    )
+
+    assert result.status == "COMPLETED"
+    assert [(signal.action, signal.timestamp) for signal in result.signals] == [
+        ("ENTER_LONG", "2026-01-05T03:48:00Z")
+    ]
+
+
+def test_run_keeps_empty_signals_valid_with_sufficient_history(
+    database_path: Path, tmp_path: Path
+) -> None:
+    _import(database_path, tmp_path, closes=(20, 20, 20, 20, 20))
+    experiment_id = _register(database_path)
+    calendars = _registry(tmp_path, close="09:20")
+
+    result = run_strategy_experiment(
+        database_path, experiment_id, calendars=calendars, as_of=_AS_OF
+    )
+
+    assert result.status == "COMPLETED"
+    assert result.signals == ()
+
+
 @pytest.mark.parametrize(
     "dimension",
     [
@@ -312,7 +374,7 @@ def test_experiment_registry_scopes_versions_by_instrument_and_interval(
     ],
 )
 def test_modified_experiment_configuration_is_rejected_before_run(
-    database_path: Path, dimension: str
+    database_path: Path, tmp_path: Path, dimension: str
 ) -> None:
     experiment_id = _register(database_path)
     with closing(get_connection(database_path)) as connection:
@@ -342,7 +404,7 @@ def test_modified_experiment_configuration_is_rejected_before_run(
 
     with pytest.raises(StrategyLabError, match="configuration integrity check failed"):
         run_strategy_experiment(
-            database_path, experiment_id, calendars=CalendarRegistry(()), as_of=_AS_OF
+            database_path, experiment_id, calendars=_registry(tmp_path), as_of=_AS_OF
         )
     with closing(get_connection(database_path)) as connection:
         run_count = connection.execute(
@@ -392,8 +454,63 @@ def test_legacy_experiment_hash_is_backfilled_on_first_run_without_historical_cl
     assert provenance["provenance_status"] == "COMPLETE"
 
 
+def test_qualification_and_candle_loading_share_one_database_snapshot(
+    database_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _import(database_path, tmp_path)
+    experiment_id = _register(database_path)
+    calendars = _registry(tmp_path)
+    observed_connections: list[sqlite3.Connection] = []
+    original_analyze = strategy_lab_module.analyze_dataset
+    original_load = strategy_lab_module._load_completed_candles
+
+    def observe_analysis(*args, **kwargs):
+        connection = kwargs["connection"]
+        assert connection.in_transaction
+        observed_connections.append(connection)
+        return original_analyze(*args, **kwargs)
+
+    def observe_candle_load(*args, **kwargs):
+        connection = kwargs["connection"]
+        assert connection.in_transaction
+        observed_connections.append(connection)
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(strategy_lab_module, "analyze_dataset", observe_analysis)
+    monkeypatch.setattr(strategy_lab_module, "_load_completed_candles", observe_candle_load)
+
+    result = run_strategy_experiment(
+        database_path, experiment_id, calendars=calendars, as_of=_AS_OF
+    )
+
+    assert result.status == "COMPLETED"
+    assert len(observed_connections) == 2
+    assert observed_connections[0] is observed_connections[1]
+
+
+def test_run_blocks_caller_selected_calendar_registry(database_path: Path, tmp_path: Path) -> None:
+    _import(database_path, tmp_path)
+    experiment_id = _register(database_path)
+    approved = _registry(tmp_path)
+    approved_path = approved.configuration_path
+    assert approved_path is not None
+
+    alternate_dir = tmp_path / "alternate_calendar"
+    alternate_dir.mkdir()
+    alternate = _registry(alternate_dir, close="09:21")
+    os.environ["AEGIS_CALENDAR_CONFIG_PATH"] = str(approved_path)
+
+    result = run_strategy_experiment(
+        database_path, experiment_id, calendars=alternate, as_of=_AS_OF
+    )
+
+    assert result.status == "BLOCKED"
+    assert result.signals == ()
+    assert "administrator-approved application path" in (result.reason or "")
+
+
 def test_legacy_backfill_rejects_specification_changed_from_persisted_strategy(
-    database_path: Path,
+    database_path: Path, tmp_path: Path
 ) -> None:
     experiment_id = _register(database_path)
     with closing(get_connection(database_path)) as connection:
@@ -418,7 +535,7 @@ def test_legacy_backfill_rejects_specification_changed_from_persisted_strategy(
 
     with pytest.raises(StrategyLabError, match="does not match its persisted strategy record"):
         run_strategy_experiment(
-            database_path, experiment_id, calendars=CalendarRegistry(()), as_of=_AS_OF
+            database_path, experiment_id, calendars=_registry(tmp_path), as_of=_AS_OF
         )
 
     with closing(get_connection(database_path)) as connection:
@@ -438,7 +555,9 @@ def test_legacy_backfill_rejects_specification_changed_from_persisted_strategy(
     assert strategy["description"] == original_strategy
 
 
-def test_legacy_backfill_rejects_missing_persisted_strategy(database_path: Path) -> None:
+def test_legacy_backfill_rejects_missing_persisted_strategy(
+    database_path: Path, tmp_path: Path
+) -> None:
     experiment_id = _register(database_path)
     with closing(get_connection(database_path)) as connection:
         row = connection.execute(
@@ -461,7 +580,7 @@ def test_legacy_backfill_rejects_missing_persisted_strategy(database_path: Path)
 
     with pytest.raises(StrategyLabError, match="references missing strategy record"):
         run_strategy_experiment(
-            database_path, experiment_id, calendars=CalendarRegistry(()), as_of=_AS_OF
+            database_path, experiment_id, calendars=_registry(tmp_path), as_of=_AS_OF
         )
 
     with closing(get_connection(database_path)) as connection:
@@ -592,7 +711,10 @@ def test_run_is_blocked_without_confirmed_calendar_and_does_not_change_candles(
         ).fetchall()
 
     result = run_strategy_experiment(
-        database_path, experiment_id, calendars=CalendarRegistry(()), as_of=_AS_OF
+        database_path,
+        experiment_id,
+        calendars=_registry(tmp_path, confidence="CONFIGURED"),
+        as_of=_AS_OF,
     )
 
     assert result.status == "BLOCKED"
@@ -629,17 +751,18 @@ def test_run_is_blocked_for_missing_expected_candle(database_path: Path, tmp_pat
     assert "INCOMPLETE" in (result.reason or "")
 
 
-def test_failed_run_has_only_partial_failure_provenance(database_path: Path, monkeypatch) -> None:
+def test_failed_run_has_only_partial_failure_provenance(
+    database_path: Path, tmp_path: Path, monkeypatch
+) -> None:
     experiment_id = _register(database_path)
+    calendars = _registry(tmp_path)
 
     def fail_quality_analysis(*args, **kwargs):
         raise RuntimeError("injected quality analyzer failure")
 
     monkeypatch.setattr("aegis.strategy_lab.analyze_dataset", fail_quality_analysis)
     with pytest.raises(RuntimeError, match="injected quality analyzer failure"):
-        run_strategy_experiment(
-            database_path, experiment_id, calendars=CalendarRegistry(()), as_of=_AS_OF
-        )
+        run_strategy_experiment(database_path, experiment_id, calendars=calendars, as_of=_AS_OF)
 
     with closing(get_connection(database_path)) as connection:
         row = connection.execute(
@@ -775,7 +898,7 @@ def test_run_blocks_missing_source_import_provenance(
     candles = tuple(_candle(index, close) for index, close in enumerate(_CLOSES))
 
     def fake_load_missing(*args, **kwargs):
-        return list(candles), "dataset-sha", (), ()
+        return list(candles), "dataset-sha", (), (), "bindings-sha"
 
     monkeypatch.setattr("aegis.strategy_lab._load_completed_candles", fake_load_missing)
 
@@ -814,6 +937,7 @@ def test_run_blocks_malformed_source_import_status(
                     "declared_at": None,
                 },
             ),
+            "bindings-sha",
         )
 
     monkeypatch.setattr("aegis.strategy_lab._load_completed_candles", fake_load_malformed)

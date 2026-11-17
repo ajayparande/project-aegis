@@ -4,25 +4,95 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
-from contextlib import closing
+from collections.abc import Iterable, Mapping
+from contextlib import closing, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from aegis.config import get_settings
 
 _DEFAULT_TIMEZONE = "Asia/Kolkata"
 _INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60}
 _SUPPORTED_INTERVALS = frozenset((*_INTERVAL_MINUTES, "1d"))
 _TIME_TEXT = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d\Z")
 _UTC_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+_SHA256_TEXT = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class CalendarConfigError(ValueError):
     """Raised when local calendar configuration is malformed or ambiguous."""
+
+
+def _calendar_text(value: object, label: str) -> str:
+    if type(value) is not str:
+        raise TypeError(f"{label} must be text.")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{label} must be non-empty text.")
+    return normalized
+
+
+def _calendar_timezone(value: object, label: str) -> str:
+    timezone_name = _calendar_text(value, label)
+    try:
+        ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"{label} is not a supported IANA timezone.") from exc
+    return timezone_name
+
+
+def _calendar_date(value: object, label: str) -> date:
+    if type(value) is not date:
+        raise TypeError(f"{label} must be a datetime.date value.")
+    return value
+
+
+def _validate_session_window(opens: object, closes: object, label: str) -> None:
+    if type(opens) is not time or type(closes) is not time:
+        raise TypeError(f"{label} boundaries must be immutable datetime.time values.")
+    if opens.tzinfo is not None or closes.tzinfo is not None:
+        raise ValueError(f"{label} boundaries must be local times without timezone offsets.")
+    if opens >= closes:
+        raise ValueError(f"{label} must close later on the same day.")
+
+
+def _session_windows(value: object, label: str) -> tuple[SessionWindow, ...]:
+    if type(value) not in (tuple, list):
+        raise TypeError(f"{label} must be supplied as a tuple or list.")
+    supplied: tuple[object, ...] = tuple(cast(Iterable[object], value))
+    if not supplied:
+        raise ValueError(f"{label} must contain at least one session window.")
+
+    windows: list[SessionWindow] = []
+    for index, window in enumerate(supplied):
+        if type(window) is not SessionWindow:
+            raise TypeError(f"{label}[{index}] must be a SessionWindow.")
+        _validate_session_window(window.opens, window.closes, f"{label}[{index}]")
+        if windows and window.opens < windows[-1].closes:
+            raise ValueError(f"{label} must be ordered and sessions must not overlap.")
+        windows.append(SessionWindow(window.opens, window.closes))
+    return tuple(windows)
+
+
+def _calendar_weekdays(value: object, label: str) -> tuple[int, ...]:
+    if type(value) not in (tuple, list, set, frozenset):
+        raise TypeError(f"{label} must be a tuple, list, set, or frozenset.")
+    weekdays: list[int] = []
+    for day in cast(Iterable[object], value):
+        if type(day) is not int or not 0 <= day <= 6:
+            raise ValueError(f"{label} must contain integers from 0 to 6.")
+        if day in weekdays:
+            raise ValueError(f"{label} must not contain duplicate weekday values.")
+        weekdays.append(day)
+    return tuple(sorted(weekdays))
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,13 +102,38 @@ class SessionWindow:
     opens: time
     closes: time
 
+    def __post_init__(self) -> None:
+        _validate_session_window(self.opens, self.closes, "session window")
+
 
 @dataclass(frozen=True, slots=True)
 class SpecialSession:
-    """Date-specific replacement sessions; an empty tuple means a confirmed closure."""
+    """Date-specific replacement sessions with at least one valid window."""
 
     sessions: tuple[SessionWindow, ...]
     reason: str
+
+    def __post_init__(self) -> None:
+        sessions = _session_windows(self.sessions, "special-session windows")
+        reason = _calendar_text(self.reason, "special-session reason")
+        object.__setattr__(self, "sessions", sessions)
+        object.__setattr__(self, "reason", reason)
+
+    def __reduce__(self) -> tuple[type[SpecialSession], tuple[object, ...]]:
+        return (type(self), (self.sessions, self.reason))
+
+
+@dataclass(frozen=True, slots=True)
+class SpecialSessionClosure:
+    """Date-specific exceptional full-day closure."""
+
+    reason: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "reason", _calendar_text(self.reason, "closure reason"))
+
+    def __reduce__(self) -> tuple[type[SpecialSessionClosure], tuple[object, ...]]:
+        return (type(self), (self.reason,))
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,10 +147,86 @@ class ExchangeCalendar:
     coverage_start: date
     coverage_end: date
     source: str
-    weekdays: frozenset[int]
+    weekdays: tuple[int, ...]
     sessions: tuple[SessionWindow, ...]
-    holidays: dict[date, str]
-    special_sessions: dict[date, SpecialSession]
+    holidays: Mapping[date, str]
+    special_sessions: Mapping[date, SpecialSession | SpecialSessionClosure]
+
+    def __post_init__(self) -> None:
+        exchange = _calendar_text(self.exchange, "exchange").upper()
+        segment = _calendar_text(self.segment, "segment").upper()
+        timezone_name = _calendar_timezone(self.timezone_name, "timezone")
+        confidence = _calendar_text(self.confidence, "confidence").upper()
+        source = _calendar_text(self.source, "source")
+        if confidence not in {"CONFIGURED", "CONFIRMED"}:
+            raise ValueError("calendar confidence must be CONFIGURED or CONFIRMED.")
+        coverage_start = _calendar_date(self.coverage_start, "coverage_start")
+        coverage_end = _calendar_date(self.coverage_end, "coverage_end")
+        if coverage_start > coverage_end:
+            raise ValueError("calendar coverage_start must not exceed coverage_end.")
+
+        weekdays = _calendar_weekdays(self.weekdays, "weekdays")
+        sessions = _session_windows(self.sessions, "regular sessions")
+
+        if not isinstance(self.holidays, Mapping):
+            raise TypeError("calendar holidays must be a mapping.")
+        holidays = dict(self.holidays)
+        normalized_holidays: dict[date, str] = {}
+        for day, reason in holidays.items():
+            _calendar_date(day, "holiday date")
+            if not coverage_start <= day <= coverage_end:
+                raise ValueError(f"holiday {day} is outside declared coverage.")
+            normalized_holidays[day] = _calendar_text(reason, f"holiday {day} reason")
+
+        if not isinstance(self.special_sessions, Mapping):
+            raise TypeError("special sessions must be a mapping.")
+        supplied_special_sessions = dict(self.special_sessions)
+        special_sessions: dict[date, SpecialSession | SpecialSessionClosure] = {}
+        for day, special in supplied_special_sessions.items():
+            _calendar_date(day, "special-session date")
+            if not coverage_start <= day <= coverage_end:
+                raise ValueError(f"special session {day} is outside declared coverage.")
+            if type(special) is SpecialSession:
+                special_sessions[day] = SpecialSession(special.sessions, special.reason)
+            elif type(special) is SpecialSessionClosure:
+                if day in normalized_holidays:
+                    raise ValueError(f"duplicate holiday or closure date {day}.")
+                special_sessions[day] = SpecialSessionClosure(special.reason)
+            else:
+                raise TypeError(
+                    "special sessions must map dates to SpecialSession or "
+                    "SpecialSessionClosure values."
+                )
+
+        object.__setattr__(self, "exchange", exchange)
+        object.__setattr__(self, "segment", segment)
+        object.__setattr__(self, "timezone_name", timezone_name)
+        object.__setattr__(self, "confidence", confidence)
+        object.__setattr__(self, "coverage_start", coverage_start)
+        object.__setattr__(self, "coverage_end", coverage_end)
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "weekdays", weekdays)
+        object.__setattr__(self, "sessions", sessions)
+        object.__setattr__(self, "holidays", MappingProxyType(normalized_holidays))
+        object.__setattr__(self, "special_sessions", MappingProxyType(special_sessions))
+
+    def __reduce__(self) -> tuple[type[ExchangeCalendar], tuple[object, ...]]:
+        return (
+            type(self),
+            (
+                self.exchange,
+                self.segment,
+                self.timezone_name,
+                self.confidence,
+                self.coverage_start,
+                self.coverage_end,
+                self.source,
+                self.weekdays,
+                self.sessions,
+                dict(self.holidays),
+                dict(self.special_sessions),
+            ),
+        )
 
     def covers(self, value: date) -> bool:
         """Return whether this calendar claims coverage for a date."""
@@ -68,6 +239,8 @@ class ExchangeCalendar:
         if not self.covers(value):
             return None
         special = self.special_sessions.get(value)
+        if isinstance(special, SpecialSessionClosure):
+            return ()
         if special is not None:
             return special.sessions
         if value in self.holidays or value.weekday() not in self.weekdays:
@@ -84,7 +257,7 @@ class StalenessPolicy:
 
     def __post_init__(self) -> None:
         if any(
-            isinstance(value, bool) or not isinstance(value, int)
+            type(value) is not int
             for value in (self.potential_after_missing, self.stale_after_missing)
         ):
             raise ValueError("staleness thresholds must be integers.")
@@ -101,6 +274,47 @@ class CalendarRegistry:
     calendars: tuple[ExchangeCalendar, ...]
     staleness_policy: StalenessPolicy = StalenessPolicy()
     configuration_sha256: str | None = None
+    configuration_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.calendars) not in (tuple, list):
+            raise TypeError("registry calendars must be supplied as a tuple or list.")
+        calendars = tuple(self.calendars)
+        if not calendars:
+            raise ValueError("registry calendars must contain at least one ExchangeCalendar.")
+        if any(type(calendar) is not ExchangeCalendar for calendar in calendars):
+            raise TypeError("registry calendars must contain ExchangeCalendar values.")
+        identities = [(calendar.exchange, calendar.segment) for calendar in calendars]
+        if len(identities) != len(set(identities)):
+            raise ValueError("Calendar exchange/segment identities must be unique.")
+        if type(self.staleness_policy) is not StalenessPolicy:
+            raise TypeError("registry staleness policy must be a StalenessPolicy.")
+        if (self.configuration_sha256 is None) != (self.configuration_path is None):
+            raise ValueError("registry configuration hash and path must be supplied together.")
+        if self.configuration_sha256 is not None:
+            if type(self.configuration_sha256) is not str:
+                raise TypeError("registry configuration hash must be text or None.")
+            if _SHA256_TEXT.fullmatch(self.configuration_sha256) is None:
+                raise ValueError("registry configuration hash must be a lowercase SHA-256.")
+        if self.configuration_path is not None:
+            if type(self.configuration_path) is not type(Path()):
+                raise TypeError("registry configuration path must be a pathlib Path.")
+            if ".." in self.configuration_path.parts:
+                raise ValueError("registry configuration path traversal is not permitted.")
+            try:
+                resolved_path = self.configuration_path.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise ValueError(
+                    "registry configuration path must identify an existing file."
+                ) from exc
+            if os.path.normcase(os.path.abspath(os.fspath(resolved_path))) != os.path.normcase(
+                os.path.abspath(os.fspath(self.configuration_path))
+            ):
+                raise ValueError("registry configuration path must not escape through a symlink.")
+            if not resolved_path.is_file():
+                raise ValueError("registry configuration path must identify a file.")
+            object.__setattr__(self, "configuration_path", resolved_path)
+        object.__setattr__(self, "calendars", calendars)
 
     def resolve(self, exchange: str, segment: str | None) -> ExchangeCalendar | None:
         """Resolve by exact exchange/segment, then that exchange's explicit wildcard."""
@@ -189,9 +403,10 @@ def _required_list(value: object, label: str) -> list[object]:
 
 
 def _text(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise CalendarConfigError(f"{label} must be non-empty text.")
-    return value.strip()
+    try:
+        return _calendar_text(value, label)
+    except (TypeError, ValueError) as exc:
+        raise CalendarConfigError(str(exc)) from exc
 
 
 def _parse_date(value: object, label: str) -> date:
@@ -202,7 +417,10 @@ def _parse_date(value: object, label: str) -> date:
         raise CalendarConfigError(f"{label} must use YYYY-MM-DD format.") from exc
     if parsed.isoformat() != raw:
         raise CalendarConfigError(f"{label} must use YYYY-MM-DD format.")
-    return parsed
+    try:
+        return _calendar_date(parsed, label)
+    except (TypeError, ValueError) as exc:
+        raise CalendarConfigError(str(exc)) from exc
 
 
 def _parse_time(value: object, label: str) -> time:
@@ -218,13 +436,14 @@ def _parse_sessions(value: object, label: str) -> tuple[SessionWindow, ...]:
         data = _required_mapping(item, f"{label}[{index}]")
         opens = _parse_time(data.get("open"), f"{label}[{index}].open")
         closes = _parse_time(data.get("close"), f"{label}[{index}].close")
-        if opens >= closes:
-            raise CalendarConfigError(f"{label}[{index}] must close later on the same day.")
-        current = SessionWindow(opens, closes)
-        if result and current.opens < result[-1].closes:
-            raise CalendarConfigError(f"{label} must be ordered and sessions must not overlap.")
-        result.append(current)
-    return tuple(result)
+        try:
+            result.append(SessionWindow(opens, closes))
+        except (TypeError, ValueError) as exc:
+            raise CalendarConfigError(f"{label}[{index}]: {exc}") from exc
+    try:
+        return _session_windows(result, label)
+    except (TypeError, ValueError) as exc:
+        raise CalendarConfigError(str(exc)) from exc
 
 
 def _parse_calendar(value: object, index: int) -> ExchangeCalendar:
@@ -232,30 +451,24 @@ def _parse_calendar(value: object, index: int) -> ExchangeCalendar:
     data = _required_mapping(value, label)
     exchange = _text(data.get("exchange"), f"{label}.exchange").upper()
     segment = _text(data.get("segment"), f"{label}.segment").upper()
-    timezone_name = _text(data.get("timezone", _DEFAULT_TIMEZONE), f"{label}.timezone")
     try:
-        ZoneInfo(timezone_name)
-    except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise CalendarConfigError(f"{label}.timezone is not a supported IANA timezone.") from exc
+        timezone_name = _calendar_timezone(
+            data.get("timezone", _DEFAULT_TIMEZONE), f"{label}.timezone"
+        )
+    except (TypeError, ValueError) as exc:
+        raise CalendarConfigError(str(exc)) from exc
     confidence = _text(data.get("confidence"), f"{label}.confidence").upper()
-    if confidence not in {"CONFIGURED", "CONFIRMED"}:
-        raise CalendarConfigError(f"{label}.confidence must be CONFIGURED or CONFIRMED.")
     coverage_start = _parse_date(data.get("coverage_start"), f"{label}.coverage_start")
     coverage_end = _parse_date(data.get("coverage_end"), f"{label}.coverage_end")
-    if coverage_start > coverage_end:
-        raise CalendarConfigError(f"{label} coverage_start must not exceed coverage_end.")
     source = _text(data.get("source"), f"{label}.source")
 
     raw_weekdays = _required_list(data.get("weekdays", [0, 1, 2, 3, 4]), f"{label}.weekdays")
-    weekdays: set[int] = set()
-    for weekday in raw_weekdays:
-        if isinstance(weekday, bool) or not isinstance(weekday, int) or not 0 <= weekday <= 6:
-            raise CalendarConfigError(f"{label}.weekdays entries must be integers from 0 to 6.")
-        weekdays.add(weekday)
+    try:
+        weekdays = _calendar_weekdays(raw_weekdays, f"{label}.weekdays")
+    except (TypeError, ValueError) as exc:
+        raise CalendarConfigError(str(exc)) from exc
 
     sessions = _parse_sessions(data.get("sessions", []), f"{label}.sessions")
-    if not sessions:
-        raise CalendarConfigError(f"{label}.sessions must contain at least one regular session.")
 
     holidays: dict[date, str] = {}
     for holiday_index, item in enumerate(
@@ -263,13 +476,12 @@ def _parse_calendar(value: object, index: int) -> ExchangeCalendar:
     ):
         holiday_data = _required_mapping(item, f"{label}.holidays[{holiday_index}]")
         holiday = _parse_date(holiday_data.get("date"), f"{label}.holidays[{holiday_index}].date")
-        if not coverage_start <= holiday <= coverage_end:
-            raise CalendarConfigError(f"{label} holiday {holiday} is outside declared coverage.")
         holidays[holiday] = _text(
             holiday_data.get("reason"), f"{label}.holidays[{holiday_index}].reason"
         )
 
-    special_sessions: dict[date, SpecialSession] = {}
+    special_sessions: dict[date, SpecialSession | SpecialSessionClosure] = {}
+    seen_special_dates: set[date] = set()
     for special_index, item in enumerate(
         _required_list(data.get("special_sessions", []), f"{label}.special_sessions")
     ):
@@ -277,52 +489,64 @@ def _parse_calendar(value: object, index: int) -> ExchangeCalendar:
         special_date = _parse_date(
             special_data.get("date"), f"{label}.special_sessions[{special_index}].date"
         )
-        if not coverage_start <= special_date <= coverage_end:
-            raise CalendarConfigError(
-                f"{label} special session {special_date} is outside declared coverage."
-            )
+        if special_date in seen_special_dates:
+            raise CalendarConfigError(f"{label} has duplicate special session date {special_date}.")
+        seen_special_dates.add(special_date)
         special_note = _text(
             special_data.get("reason"), f"{label}.special_sessions[{special_index}].reason"
         )
         closed = special_data.get("closed", False)
-        if not isinstance(closed, bool):
+        if type(closed) is not bool:
             raise CalendarConfigError(
                 f"{label}.special_sessions[{special_index}].closed must be a boolean."
             )
         if closed:
-            special_windows: tuple[SessionWindow, ...] = ()
-        else:
-            special_windows = _parse_sessions(
-                special_data.get("sessions"), f"{label}.special_sessions[{special_index}].sessions"
-            )
-            if not special_windows:
+            if "sessions" in special_data:
                 raise CalendarConfigError(
-                    f"{label} special session must have sessions or set closed to true."
+                    f"{label}.special_sessions[{special_index}] closed entries must not include sessions."
                 )
-        if special_date in special_sessions:
-            raise CalendarConfigError(f"{label} has duplicate special session date {special_date}.")
-        special_sessions[special_date] = SpecialSession(special_windows, special_note)
+            if special_date in holidays:
+                raise CalendarConfigError(
+                    f"{label} has duplicate holiday or closure date {special_date}."
+                )
+            try:
+                special_sessions[special_date] = SpecialSessionClosure(special_note)
+            except (TypeError, ValueError) as exc:
+                raise CalendarConfigError(
+                    f"{label}.special_sessions[{special_index}]: {exc}"
+                ) from exc
+            continue
+        special_windows = _parse_sessions(
+            special_data.get("sessions"), f"{label}.special_sessions[{special_index}].sessions"
+        )
+        try:
+            special_sessions[special_date] = SpecialSession(special_windows, special_note)
+        except (TypeError, ValueError) as exc:
+            raise CalendarConfigError(f"{label}.special_sessions[{special_index}]: {exc}") from exc
 
-    return ExchangeCalendar(
-        exchange=exchange,
-        segment=segment,
-        timezone_name=timezone_name,
-        confidence=confidence,  # type: ignore[arg-type]
-        coverage_start=coverage_start,
-        coverage_end=coverage_end,
-        source=source,
-        weekdays=frozenset(weekdays),
-        sessions=sessions,
-        holidays=holidays,
-        special_sessions=special_sessions,
-    )
+    try:
+        return ExchangeCalendar(
+            exchange=exchange,
+            segment=segment,
+            timezone_name=timezone_name,
+            confidence=confidence,  # type: ignore[arg-type]
+            coverage_start=coverage_start,
+            coverage_end=coverage_end,
+            source=source,
+            weekdays=weekdays,
+            sessions=sessions,
+            holidays=holidays,
+            special_sessions=special_sessions,
+        )
+    except (TypeError, ValueError) as exc:
+        raise CalendarConfigError(f"{label}: {exc}") from exc
 
 
 def load_calendar_registry(config_path: Path) -> CalendarRegistry:
     """Load a validated, local JSON calendar without fetching or inferring holidays."""
 
     if not config_path.exists():
-        return CalendarRegistry(())
+        raise CalendarConfigError("Calendar configuration file does not exist.")
     try:
         config_bytes = config_path.read_bytes()
         document = json.loads(config_bytes.decode("utf-8"))
@@ -336,27 +560,91 @@ def load_calendar_registry(config_path: Path) -> CalendarRegistry:
         or schema_version != 1
     ):
         raise CalendarConfigError("Calendar configuration schema_version must be 1.")
-    calendars = tuple(
-        _parse_calendar(item, index)
-        for index, item in enumerate(_required_list(root.get("calendars", []), "calendars"))
-    )
-    identities = [(item.exchange, item.segment) for item in calendars]
-    if len(identities) != len(set(identities)):
-        raise CalendarConfigError("Calendar exchange/segment identities must be unique.")
+    calendar_values = _required_list(root.get("calendars", []), "calendars")
+    if not calendar_values:
+        raise CalendarConfigError("calendars must contain at least one exchange calendar.")
+    calendars = tuple(_parse_calendar(item, index) for index, item in enumerate(calendar_values))
     policy_data = _required_mapping(root.get("staleness_policy", {}), "staleness_policy")
     potential_after = policy_data.get("potential_after_missing", 1)
     stale_after = policy_data.get("stale_after_missing", 3)
-    if any(isinstance(v, bool) or not isinstance(v, int) for v in (potential_after, stale_after)):
-        raise CalendarConfigError("Staleness thresholds must be integers.")
     try:
         policy = StalenessPolicy(cast(int, potential_after), cast(int, stale_after))
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise CalendarConfigError(str(exc)) from exc
-    return CalendarRegistry(
-        calendars,
-        policy,
-        hashlib.sha256(config_bytes).hexdigest(),
-    )
+    try:
+        return CalendarRegistry(
+            calendars,
+            policy,
+            hashlib.sha256(config_bytes).hexdigest(),
+            config_path.resolve(strict=True),
+        )
+    except (TypeError, ValueError) as exc:
+        raise CalendarConfigError(f"calendar configuration is invalid: {exc}") from exc
+
+
+def load_approved_calendar_registry(
+    config_path: Path | None = None,
+    *,
+    expected_registry: CalendarRegistry | None = None,
+) -> CalendarRegistry:
+    """Load the application-selected calendar and reject request-selected alternatives."""
+
+    try:
+        approved_path = get_settings().calendar_config_path
+    except ValueError as exc:
+        raise CalendarConfigError(f"Application calendar configuration is invalid: {exc}") from exc
+
+    candidate_paths: list[Path] = []
+    if config_path is not None:
+        candidate_paths.append(config_path)
+    if expected_registry is not None:
+        if not isinstance(expected_registry, CalendarRegistry):
+            raise CalendarConfigError("Calendar registry must be a loaded application registry.")
+        if expected_registry.configuration_path is None:
+            raise CalendarConfigError(
+                "Calendar registry must originate from the approved application configuration."
+            )
+        candidate_paths.append(expected_registry.configuration_path)
+
+    for candidate in candidate_paths:
+        if not isinstance(candidate, Path):
+            raise CalendarConfigError("Calendar configuration path must be a pathlib Path.")
+        if ".." in candidate.parts:
+            raise CalendarConfigError("Calendar configuration path traversal is not permitted.")
+        if os.path.normcase(os.path.abspath(os.fspath(candidate))) != os.path.normcase(
+            os.path.abspath(os.fspath(approved_path))
+        ):
+            raise CalendarConfigError(
+                "Calendar configuration path must match the administrator-approved application path."
+            )
+
+    try:
+        resolved_path = approved_path.resolve(strict=True)
+    except OSError as exc:
+        raise CalendarConfigError(
+            f"Administrator-approved calendar configuration is unavailable: {exc}"
+        ) from exc
+    if os.path.normcase(os.path.abspath(os.fspath(resolved_path))) != os.path.normcase(
+        os.path.abspath(os.fspath(approved_path))
+    ):
+        raise CalendarConfigError(
+            "Administrator-approved calendar configuration must not escape through a symlink."
+        )
+    if not resolved_path.is_file():
+        raise CalendarConfigError("Administrator-approved calendar configuration file is missing.")
+
+    registry = load_calendar_registry(resolved_path)
+    if (
+        not registry.calendars
+        or registry.configuration_sha256 is None
+        or registry.configuration_path is None
+    ):
+        raise CalendarConfigError("Calendar configuration is missing or contains no calendars.")
+    if expected_registry is not None and (
+        registry.configuration_sha256 != expected_registry.configuration_sha256
+    ):
+        raise CalendarConfigError("Calendar configuration changed after it was loaded.")
+    return registry
 
 
 def _strict_local_datetime(day: date, local_time: time, timezone: ZoneInfo) -> datetime:
@@ -571,10 +859,12 @@ def analyze_dataset(
     end_date: date,
     *,
     as_of: datetime,
-    calendars: CalendarRegistry,
+    calendars: CalendarRegistry | None,
     source_import_id: int | None = None,
+    connection: sqlite3.Connection | None = None,
+    snapshot_max_id: int | None = None,
 ) -> DatasetQualityReport:
-    """Analyze a date slice without writing to SQLite or modifying stored candles."""
+    """Analyze a date slice read-only, optionally using a caller-owned snapshot."""
 
     if start_date > end_date:
         raise ValueError("start_date must not be after end_date.")
@@ -585,6 +875,12 @@ def analyze_dataset(
         or source_import_id < 1
     ):
         raise ValueError("source_import_id must be a positive integer when supplied.")
+    if snapshot_max_id is not None and (
+        isinstance(snapshot_max_id, bool)
+        or not isinstance(snapshot_max_id, int)
+        or snapshot_max_id < 0
+    ):
+        raise ValueError("snapshot_max_id must be a non-negative integer when supplied.")
     as_of_utc = _aware_utc(as_of, "as_of")
     normalized_exchange = exchange.strip().upper()
     normalized_symbol = trading_symbol.strip().upper()
@@ -600,8 +896,15 @@ def analyze_dataset(
     timestamp_filter = " AND " + " AND ".join(timestamp_conditions) if timestamp_conditions else ""
     import_filter = " AND import_id = ?" if source_import_id is not None else ""
     import_parameters = (source_import_id,) if source_import_id is not None else ()
-    with closing(_readonly_connection(database_path)) as connection:
-        instrument = connection.execute(
+    snapshot_filter = " AND id <= ?" if snapshot_max_id is not None else ""
+    snapshot_parameters = (snapshot_max_id,) if snapshot_max_id is not None else ()
+    connection_context = (
+        nullcontext(connection)
+        if connection is not None
+        else closing(_readonly_connection(database_path))
+    )
+    with connection_context as active_connection:
+        instrument = active_connection.execute(
             "SELECT id, segment FROM instruments "
             "WHERE exchange = ? COLLATE NOCASE AND trading_symbol = ? COLLATE NOCASE",
             (normalized_exchange, normalized_symbol),
@@ -610,36 +913,48 @@ def analyze_dataset(
             raise ValueError(
                 f"Instrument {normalized_exchange}:{normalized_symbol} is not registered."
             )
-        rows = connection.execute(
+        rows = active_connection.execute(
             f"""SELECT id, interval, candle_timestamp, open_decimal, high_decimal,
                       low_decimal, close_decimal, volume, import_id
                FROM historical_candles WHERE instrument_id = ? AND interval = ?
-                 {import_filter} {timestamp_filter}
+                 {import_filter} {timestamp_filter} {snapshot_filter}
                ORDER BY candle_timestamp, id""",
-            (instrument["id"], interval, *import_parameters, *timestamp_parameters),
+            (
+                instrument["id"],
+                interval,
+                *import_parameters,
+                *timestamp_parameters,
+                *snapshot_parameters,
+            ),
         ).fetchall()
-        duplicate_groups = connection.execute(
+        duplicate_groups = active_connection.execute(
             f"""SELECT candle_timestamp FROM historical_candles
                WHERE instrument_id = ? AND interval = ?
-                 {import_filter} {timestamp_filter}
+                 {import_filter} {timestamp_filter} {snapshot_filter}
                GROUP BY instrument_id, interval, candle_timestamp HAVING COUNT(*) > 1""",
-            (instrument["id"], interval, *import_parameters, *timestamp_parameters),
+            (
+                instrument["id"],
+                interval,
+                *import_parameters,
+                *timestamp_parameters,
+                *snapshot_parameters,
+            ),
         ).fetchall()
         # Keep detecting malformed timestamps anywhere in this instrument/interval.
         # They cannot be assigned to a requested date range, so this narrow covering
         # index scan preserves the existing report semantics without materializing
         # every historical candle and its OHLC values in memory.
         invalid_timestamp_count = 0
-        for timestamp_row in connection.execute(
+        for timestamp_row in active_connection.execute(
             f"SELECT candle_timestamp FROM historical_candles "
-            f"WHERE instrument_id = ? AND interval = ? {import_filter}",
-            (instrument["id"], interval, *import_parameters),
+            f"WHERE instrument_id = ? AND interval = ? {import_filter}{snapshot_filter}",
+            (instrument["id"], interval, *import_parameters, *snapshot_parameters),
         ):
             try:
                 _parse_stored_timestamp(timestamp_row["candle_timestamp"])
             except ValueError:
                 invalid_timestamp_count += 1
-        issue_rows = connection.execute(
+        issue_rows = active_connection.execute(
             """SELECT issue_type, affected_timestamp FROM data_quality_issues
                WHERE instrument_id = ? AND interval = ?
                  AND (? IS NULL OR import_id = ?)
@@ -647,7 +962,11 @@ def analyze_dataset(
             (instrument["id"], interval, source_import_id, source_import_id),
         ).fetchall()
 
-    calendar = calendars.resolve(normalized_exchange, instrument["segment"])
+    calendar = (
+        calendars.resolve(normalized_exchange, instrument["segment"])
+        if calendars is not None
+        else None
+    )
     timezone_name = calendar.timezone_name if calendar is not None else _DEFAULT_TIMEZONE
     timezone = ZoneInfo(timezone_name)
     if source_import_id is not None:
@@ -717,7 +1036,7 @@ def analyze_dataset(
             allowed = scheduled_by_day.get(local_day, set())
             if timestamp not in allowed:
                 special = calendar.special_sessions.get(local_day)
-                if special is not None and not special.sessions:
+                if isinstance(special, SpecialSessionClosure):
                     detail = f"configured exceptional closure: {special.reason}"
                 elif local_day in calendar.holidays:
                     detail = f"configured holiday: {calendar.holidays[local_day]}"
@@ -785,7 +1104,7 @@ def analyze_dataset(
     missing_since_latest: int | None = None
     if end_date < as_of_local_date or start_date > as_of_local_date:
         reasons.append("Requested date range does not include the supplied as_of date.")
-    elif not staleness_calendar_ready or not valid_times:
+    elif not staleness_calendar_ready or not valid_times or calendars is None:
         staleness_status = "INSUFFICIENT_DATA"
     else:
         completed_set = {item.timestamp for item in completed}

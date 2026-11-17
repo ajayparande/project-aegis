@@ -55,7 +55,7 @@ def test_db(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def test_calendar(tmp_path: Path):
+def test_calendar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Create an isolated test calendar registry."""
     calendar_path = tmp_path / "calendar.json"
     calendar_path.write_text(
@@ -82,6 +82,7 @@ def test_calendar(tmp_path: Path):
         ),
         encoding="utf-8",
     )
+    monkeypatch.setenv("AEGIS_CALENDAR_CONFIG_PATH", str(calendar_path))
     return load_calendar_registry(calendar_path)
 
 

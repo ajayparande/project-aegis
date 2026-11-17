@@ -29,6 +29,7 @@ class Settings:
     app_name: str
     mode: AppMode
     database_path: Path
+    calendar_config_path: Path
     log_level: str
     log_file: Path | None
 
@@ -66,6 +67,15 @@ class Settings:
 
         database_path = _resolve_path(os.getenv("AEGIS_DATABASE_PATH", "data/aegis.db"))
 
+        raw_calendar_config_path = os.getenv(
+            "AEGIS_CALENDAR_CONFIG_PATH", "config/exchange_calendars.json"
+        ).strip()
+        if not raw_calendar_config_path:
+            raise ValueError("AEGIS_CALENDAR_CONFIG_PATH must not be empty.")
+        if ".." in Path(raw_calendar_config_path).parts:
+            raise ValueError("AEGIS_CALENDAR_CONFIG_PATH must not contain path traversal.")
+        calendar_config_path = _resolve_path(raw_calendar_config_path)
+
         raw_log_file = os.getenv(
             "AEGIS_LOG_FILE",
             "logs/aegis.log",
@@ -77,6 +87,7 @@ class Settings:
             app_name=os.getenv("AEGIS_APP_NAME", "Project Aegis").strip(),
             mode=mode,
             database_path=database_path,
+            calendar_config_path=calendar_config_path,
             log_level=log_level,
             log_file=log_file,
         )

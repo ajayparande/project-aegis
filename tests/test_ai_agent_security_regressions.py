@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import multiprocessing
+import os
 import time
 from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
@@ -192,6 +193,11 @@ def test_decimal_numeric_bounds_and_defaults_are_validated_and_serialized() -> N
     assert schema["default"] == 0.25
 
 
+@pytest.fixture(autouse=True)
+def isolate_calendar_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AEGIS_CALENDAR_CONFIG_PATH", raising=False)
+
+
 def _synthetic_calendar(path: Path, *, as_of: str) -> object:
     path.write_text(
         json.dumps(
@@ -217,6 +223,7 @@ def _synthetic_calendar(path: Path, *, as_of: str) -> object:
         ),
         encoding="utf-8",
     )
+    os.environ["AEGIS_CALENDAR_CONFIG_PATH"] = str(path)
     return load_calendar_registry(path)
 
 

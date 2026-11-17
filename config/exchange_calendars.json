@@ -4,5 +4,204 @@
     "potential_after_missing": 1,
     "stale_after_missing": 3
   },
-  "calendars": []
+  "calendars": [
+    {
+      "exchange": "NSE",
+      "segment": "NSE",
+      "timezone": "Asia/Kolkata",
+      "confidence": "CONFIGURED",
+      "coverage_start": "2025-01-01",
+      "coverage_end": "2026-12-31",
+      "source": "NSE Capital Market (Equities) candidate. Annual holiday circulars: NSE/CMTR/65587 (2024-12-13) and NSE/CMTR/71775 (2025-12-12). Subsequent cash-segment Muhurat circulars: NSE/CMTR/70319 (2025-09-22) and NSE/CMTR/76941 (2026-10-19). The 2026-01-15 closure is from the NSE holiday-master CM update retrieved 2026-11-15. Regular hours are from the NSE Market Timings page. Evidence, URLs, hashes, and limitations: docs/EXCHANGE_CALENDAR_NSE_CASH_2025_2026_EVIDENCE.md. Candidate only; not independently reviewed or operationally accepted.",
+      "weekdays": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "sessions": [
+        {
+          "open": "09:15",
+          "close": "15:30"
+        }
+      ],
+      "holidays": [
+        {
+          "date": "2025-01-26",
+          "reason": "Republic Day; NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2025-02-26",
+          "reason": "Mahashivratri; NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2025-03-14",
+          "reason": "Holi; NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2025-03-31",
+          "reason": "Id-Ul-Fitr (Ramadan Eid); NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2025-04-06",
+          "reason": "Shri Ram Navami; NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2025-04-10",
+          "reason": "Shri Mahavir Jayanti; NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2025-04-14",
+          "reason": "Dr. Baba Saheb Ambedkar Jayanti; NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2025-04-18",
+          "reason": "Good Friday; NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2025-05-01",
+          "reason": "Maharashtra Day; NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2025-06-07",
+          "reason": "Bakri Id; NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2025-07-06",
+          "reason": "Muharram; NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2025-08-15",
+          "reason": "Independence Day / Parsi New Year; NSE/CMTR/65587 annual holiday circular and subsequent NSE holiday-master CM row."
+        },
+        {
+          "date": "2025-08-27",
+          "reason": "Shri Ganesh Chaturthi; NSE/CMTR/65587 annual holiday circular and subsequent NSE holiday-master CM row."
+        },
+        {
+          "date": "2025-10-02",
+          "reason": "Mahatma Gandhi Jayanti / Dussehra; NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2025-10-21",
+          "reason": "Diwali Laxmi Pujan special-session date; listed in NSE/CMTR/65587 and separately scheduled by cash-segment NSE/CMTR/70319."
+        },
+        {
+          "date": "2025-10-22",
+          "reason": "Balipratipada; NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2025-11-05",
+          "reason": "Prakash Gurpurb Sri Guru Nanak Dev; NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2025-12-25",
+          "reason": "Christmas; NSE/CMTR/65587 annual holiday circular."
+        },
+        {
+          "date": "2026-01-15",
+          "reason": "Municipal Corporation Election - Maharashtra; subsequent NSE holiday-master CM update retrieved 2026-11-15, not listed in the 2026 annual circular."
+        },
+        {
+          "date": "2026-01-26",
+          "reason": "Republic Day; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-02-15",
+          "reason": "Mahashivratri; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-03-03",
+          "reason": "Holi; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-03-21",
+          "reason": "Id-Ul-Fitr (Ramadan Eid); NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-03-26",
+          "reason": "Shri Ram Navami; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-03-31",
+          "reason": "Shri Mahavir Jayanti; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-04-03",
+          "reason": "Good Friday; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-04-14",
+          "reason": "Dr. Baba Saheb Ambedkar Jayanti; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-05-01",
+          "reason": "Maharashtra Day; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-05-28",
+          "reason": "Bakri Id; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-06-26",
+          "reason": "Muharram; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-08-15",
+          "reason": "Independence Day; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-09-14",
+          "reason": "Ganesh Chaturthi; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-10-02",
+          "reason": "Mahatma Gandhi Jayanti; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-10-20",
+          "reason": "Dussehra; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-11-08",
+          "reason": "Diwali Laxmi Pujan special-session date; listed in NSE/CMTR/71775 and separately scheduled by cash-segment NSE/CMTR/76941."
+        },
+        {
+          "date": "2026-11-10",
+          "reason": "Diwali-Balipratipada; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-11-24",
+          "reason": "Prakash Gurpurb Sri Guru Nanak Dev; NSE/CMTR/71775 annual holiday circular."
+        },
+        {
+          "date": "2026-12-25",
+          "reason": "Christmas; NSE/CMTR/71775 annual holiday circular."
+        }
+      ],
+      "special_sessions": [
+        {
+          "date": "2025-10-21",
+          "reason": "Cash-segment Muhurat session; NSE/CMTR/70319 (published 2025-09-22). Normal market 13:45-14:45 IST; replaces the ordinary closure.",
+          "sessions": [
+            {
+              "open": "13:45",
+              "close": "14:45"
+            }
+          ]
+        },
+        {
+          "date": "2026-11-08",
+          "reason": "Cash-segment Muhurat session; NSE/CMTR/76941 (published 2026-10-19). Normal market 14:20-15:30 IST; replaces the ordinary Sunday/holiday closure. Instrument-specific CAS schedule is not represented.",
+          "sessions": [
+            {
+              "open": "14:20",
+              "close": "15:30"
+            }
+          ]
+        }
+      ]
+    }
+  ]
 }

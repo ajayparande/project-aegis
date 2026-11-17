@@ -1,11 +1,13 @@
 """Comprehensive tests for Phase 4 deterministic backtesting engine."""
 
 import json
+import os
 import sqlite3
 import tempfile
 from collections.abc import Callable
 from contextlib import closing
-from datetime import date, datetime
+from dataclasses import replace
+from datetime import UTC, date, datetime
 from decimal import (
     ROUND_DOWN,
     ROUND_FLOOR,
@@ -28,10 +30,12 @@ from aegis.backtesting import (
     _buy_and_hold_benchmark,
     _calculate_brokerage,
     _daily_metrics,
+    _execution_time,
     _fees,
     _fill_price,
     _simulate,
     default_cost_assumptions,
+    execute_one_instrument,
     list_backtest_runs,
     list_backtests,
     register_backtest,
@@ -47,13 +51,23 @@ from aegis.market_data import (
     import_ohlcv_csv,
     list_recent_imports,
 )
-from aegis.market_quality import ExchangeCalendar, load_calendar_registry
+from aegis.market_quality import (
+    CalendarRegistry,
+    ExchangeCalendar,
+    SpecialSessionClosure,
+    analyze_dataset,
+    calculate_expected_candles,
+    load_calendar_registry,
+)
 from aegis.strategy_lab import (
+    DataQualityGateError,
     StrategyCandle,
     StrategyLabError,
     StrategySignal,
     _canonical_hash,
+    _load_completed_candles,
     _validate_candles,
+    _validate_source_imports,
     create_sma_crossover_spec,
     generate_sma_crossover_signals,
     list_strategy_experiments,
@@ -62,6 +76,11 @@ from aegis.strategy_lab import (
 
 _DAY = date(2026, 1, 5)
 _AS_OF = datetime(2026, 1, 5, 9, 25, tzinfo=ZoneInfo("Asia/Kolkata"))
+
+
+@pytest.fixture(autouse=True)
+def isolate_calendar_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AEGIS_CALENDAR_CONFIG_PATH", raising=False)
 
 
 @pytest.fixture
@@ -109,6 +128,26 @@ def _calendar_fixture() -> ExchangeCalendar:
         cal = registry.resolve("NSE", "NSE")
         assert cal is not None
         return cal
+
+
+def test_daily_execution_time_rejects_exceptional_calendar_closure() -> None:
+    calendar = replace(
+        _calendar_fixture(),
+        special_sessions={
+            _DAY: SpecialSessionClosure("verified exceptional closure"),
+        },
+    )
+    candle = StrategyCandle(
+        timestamp="2026-01-05T00:00:00Z",
+        open=Decimal(100),
+        high=Decimal(101),
+        low=Decimal(99),
+        close=Decimal(100),
+        volume=10,
+    )
+
+    with pytest.raises(BacktestError, match="no configured market session"):
+        _execution_time(candle, "1d", calendar)
 
 
 def _write_csv(
@@ -182,7 +221,14 @@ def _create_calendar_file(tmp_path: Path, candle_count: int, name: str) -> Path:
         ),
         encoding="utf-8",
     )
+    os.environ["AEGIS_CALENDAR_CONFIG_PATH"] = str(path)
     return path
+
+
+def _calendar_config_path(registry: CalendarRegistry) -> Path:
+    if registry.configuration_path is None:
+        raise AssertionError("Test calendar must have a source configuration path.")
+    return registry.configuration_path
 
 
 def _run_synthetic_backtest(
@@ -246,6 +292,85 @@ def _run_synthetic_backtest(
     )
     record = list_backtest_runs(database_path, registration.experiment_id)[0]
     return registration.experiment_id, record["result"]
+
+
+def _run_execution_parity_case(
+    database_path: Path,
+    tmp_path: Path,
+    *,
+    name: str,
+    closes: list[int],
+    config: BacktestConfig,
+    volumes: list[int] | None = None,
+    source_use_status: SourceUseStatus = "VERIFIED_PERMITTED",
+    missing_candle_index: int | None = None,
+) -> tuple[
+    dict[str, object],
+    tuple[StrategySignal, ...],
+    CalendarRegistry,
+    datetime,
+    tuple[StrategyCandle, ...],
+]:
+    candle_volumes = volumes or [1000] * len(closes)
+    rows = [
+        (
+            f"2026-01-05T09:{15 + index:02d}:00+05:30",
+            close,
+            close + 2,
+            close - 2,
+            close,
+            candle_volumes[index],
+        )
+        for index, close in enumerate(closes)
+    ]
+    if missing_candle_index is not None:
+        rows.pop(missing_candle_index)
+
+    csv_path = _write_csv(tmp_path, rows, filename=f"{name}.csv")
+    imported = import_ohlcv_csv(database_path, csv_path, "NSE", "TCS", "1m")
+    if source_use_status != "UNVERIFIED":
+        declare_import_source_use_status(
+            database_path,
+            imported.import_id,
+            source_use_status,
+            declared_by="synthetic parity test",
+            rationale="Isolated synthetic data for execution parity.",
+        )
+    strategy_id = _create_strategy_experiment(database_path)
+    registration = register_backtest(database_path, strategy_id, config)
+    calendars = load_calendar_registry(_create_calendar_file(tmp_path, len(closes), name))
+    as_of = datetime(
+        2026,
+        1,
+        5,
+        9,
+        16 + len(closes),
+        tzinfo=ZoneInfo("Asia/Kolkata"),
+    )
+    run_backtest(
+        database_path,
+        registration.experiment_id,
+        calendars=calendars,
+        as_of=as_of,
+    )
+    persisted = list_backtest_runs(database_path, registration.experiment_id)[0]["result"]
+
+    candles = tuple(
+        StrategyCandle(
+            timestamp=datetime.fromisoformat(timestamp)
+            .astimezone(UTC)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+            open=Decimal(open_price),
+            high=Decimal(high),
+            low=Decimal(low),
+            close=Decimal(close),
+            volume=volume,
+        )
+        for timestamp, open_price, high, low, close, volume in rows
+    )
+    signals = generate_sma_crossover_signals(candles, fast_window=2, slow_window=3)
+    return persisted, signals, calendars, as_of, candles
 
 
 def _rewrite_backtest_configuration(
@@ -317,10 +442,10 @@ def test_public_run_backtest_is_independent_of_decimal_context(
             assert actual_result == expected_result
             assert _decimal_context_state(context) == original_state
 
-    empty_calendar_path = tmp_path / "empty_context_calendars.json"
-    empty_calendar_path.write_text(
-        json.dumps({"schema_version": 1, "calendars": []}), encoding="utf-8"
-    )
+    unconfirmed_calendar_path = _create_calendar_file(tmp_path, 6, "unconfirmed_context")
+    unconfirmed_document = json.loads(unconfirmed_calendar_path.read_text(encoding="utf-8"))
+    unconfirmed_document["calendars"][0]["confidence"] = "CONFIGURED"
+    unconfirmed_calendar_path.write_text(json.dumps(unconfirmed_document), encoding="utf-8")
     with localcontext() as context:
         context.prec = 3
         context.rounding = ROUND_DOWN
@@ -328,11 +453,38 @@ def test_public_run_backtest_is_independent_of_decimal_context(
         blocked_run = run_backtest(
             database_path,
             experiment_id,
-            calendars=load_calendar_registry(empty_calendar_path),
+            calendars=load_calendar_registry(unconfirmed_calendar_path),
             as_of=as_of,
         )
         assert blocked_run.status == "BLOCKED"
         assert _decimal_context_state(context) == original_state
+
+
+def test_registered_execution_error_retains_failed_status(
+    database_path: Path, tmp_path: Path, monkeypatch
+) -> None:
+    experiment_id, _ = _run_synthetic_backtest(
+        database_path,
+        tmp_path,
+        [30, 20, 10, 20, 40, 50],
+        name="execution_failure_status",
+    )
+    calendars = load_calendar_registry(
+        _create_calendar_file(tmp_path, 6, "execution_failure_status")
+    )
+    as_of = datetime(2026, 1, 5, 9, 22, tzinfo=ZoneInfo("Asia/Kolkata"))
+
+    def fail_simulation(*args, **kwargs):
+        raise RuntimeError("controlled simulator failure")
+
+    monkeypatch.setattr("aegis.backtesting._simulate", fail_simulation)
+    with pytest.raises(RuntimeError, match="controlled simulator failure"):
+        run_backtest(database_path, experiment_id, calendars=calendars, as_of=as_of)
+
+    persisted = list_backtest_runs(database_path, experiment_id)[0]
+    assert persisted["status"] == "FAILED"
+    assert persisted["result"]["status"] == "FAILED"
+    assert persisted["error_message"] == "RuntimeError: controlled simulator failure"
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +716,23 @@ def test_daily_metrics_report_daily_returns_and_trade_aggregates() -> None:
     assert metrics["gross_loss"] == "10"
     assert metrics["profit_factor"] == "1"
     assert metrics["win_rate"] == "0.5"
+
+
+def test_daily_metrics_uses_last_equity_mark_per_local_date() -> None:
+    metrics = _daily_metrics(
+        [
+            {"local_date": "2026-01-05", "equity": "105"},
+            {"local_date": "2026-01-05", "equity": "110"},
+            {"local_date": "2026-01-06", "equity": "121"},
+        ],
+        Decimal(100),
+        [],
+    )
+
+    assert metrics["daily_returns"] == [
+        {"local_date": "2026-01-05", "return": "0.1"},
+        {"local_date": "2026-01-06", "return": "0.1"},
+    ]
 
 
 def test_daily_metrics_boundary_cases_keep_undefined_values_explicit() -> None:
@@ -1206,7 +1375,16 @@ def test_open_position_at_end_of_dataset_is_not_silently_liquidated() -> None:
     ending_equity = Decimal(str(summary["ending_equity"]))
     liq_costs = Decimal(str(summary["estimated_liquidation_costs"]))
     net_liq_val = Decimal(str(summary["net_liquidation_value"]))
+    assert summary["ending_cash"] == "98996.96"
+    assert summary["ending_equity"] == "100496.96"
+    assert summary["total_fees"] == "1.54"
+    assert summary["estimated_liquidation_costs"] == "4.59"
     assert net_liq_val == ending_equity - liq_costs
+    assert net_liq_val == Decimal("100492.37")
+    assert summary["realized_net_pnl"] == "0"
+    assert summary["total_return"] == "0.0049696"
+    assert summary["net_liquidation_return"] == "0.0049237"
+    assert summary["daily_returns"] == [{"local_date": "2026-01-05", "return": "0.0049696"}]
 
 
 def test_maximum_drawdown_includes_open_position_mark_to_market() -> None:
@@ -1773,8 +1951,7 @@ def test_inactive_instrument_blocks_later_run(database_path: Path, tmp_path: Pat
         connection.execute("UPDATE instruments SET is_active = 0 WHERE trading_symbol = 'TCS'")
         connection.commit()
 
-    calendar_path = tmp_path / "empty_calendars.json"
-    calendar_path.write_text(json.dumps({"schema_version": 1, "calendars": []}), encoding="utf-8")
+    calendar_path = _create_calendar_file(tmp_path, 10, "inactive_instrument")
     result = run_backtest(
         database_path,
         registration.experiment_id,
@@ -1844,9 +2021,11 @@ def test_run_backtest_fails_closed_when_data_gate_blocks(
     )
     reg = register_backtest(database_path, nse_exp_id, config)
 
-    # Using default unconfirmed/empty exchange calendar
-    cal_path = tmp_path / "empty_calendars.json"
-    cal_path.write_text(json.dumps({"schema_version": 1, "calendars": []}), encoding="utf-8")
+    # A valid unconfirmed calendar reaches the persisted data-quality gate.
+    cal_path = _create_calendar_file(tmp_path, 10, "unconfirmed_data_gate")
+    document = json.loads(cal_path.read_text(encoding="utf-8"))
+    document["calendars"][0]["confidence"] = "CONFIGURED"
+    cal_path.write_text(json.dumps(document), encoding="utf-8")
     registry = load_calendar_registry(cal_path)
 
     run_res = run_backtest(
@@ -1896,6 +2075,7 @@ def test_run_backtest_end_to_end_with_confirmed_calendar_and_complete_data(
         encoding="utf-8",
     )
     calendars = load_calendar_registry(cal_file)
+    os.environ["AEGIS_CALENDAR_CONFIG_PATH"] = str(cal_file)
 
     # 2. Import 6 completed candles
     # Fast window = 2, slow window = 3
@@ -2341,6 +2521,59 @@ def test_backtest_accepts_exact_and_above_minimum_strategy_history(
     assert above["open_position"]["quantity"] == 1
 
 
+def test_direct_execution_matches_registered_minimum_history_qualification(
+    database_path: Path, tmp_path: Path
+) -> None:
+    config = BacktestConfig(Decimal(100000), 1, Decimal("0.5"), zero_cost_assumptions())
+
+    below, _, calendars, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="direct_history_below_minimum",
+        closes=[30, 20, 10],
+        config=config,
+    )
+    assert below["status"] == "BLOCKED"
+    with pytest.raises(BacktestError, match="requires 4 candles but only 3"):
+        execute_one_instrument(
+            database_path,
+            exchange="NSE",
+            trading_symbol="TCS",
+            interval="1m",
+            start_date=_DAY,
+            end_date=_DAY,
+            fast_window=2,
+            slow_window=3,
+            config=config,
+            calendar_config_path=_calendar_config_path(calendars),
+            as_of=as_of,
+        )
+
+    exact, _, exact_calendars, exact_as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="direct_history_exact_minimum",
+        closes=[20, 20, 20, 20],
+        config=config,
+    )
+    assert exact["status"] == "COMPLETED"
+    execution = execute_one_instrument(
+        database_path,
+        exchange="NSE",
+        trading_symbol="TCS",
+        interval="1m",
+        start_date=_DAY,
+        end_date=_DAY,
+        fast_window=2,
+        slow_window=3,
+        config=config,
+        calendar_config_path=_calendar_config_path(exact_calendars),
+        as_of=exact_as_of,
+    )
+    assert execution.diagnostics["signal_provenance"]["strategy_key"] == "sma_crossover"
+    assert execution.diagnostics["signals_sha256"] == _canonical_hash([])
+
+
 def test_history_requirement_comes_from_registered_strategy_configuration(
     database_path: Path, tmp_path: Path
 ) -> None:
@@ -2560,7 +2793,7 @@ def test_backtest_blocks_missing_source_import_provenance(
     as_of = datetime(2026, 1, 5, 9, 16 + len(rows), tzinfo=ZoneInfo("Asia/Kolkata"))
 
     def empty_provenance(*args, **kwargs):
-        return [], "dataset-sha", (), ()
+        return [], "dataset-sha", (), (), "bindings-sha"
 
     monkeypatch.setattr("aegis.backtesting._load_completed_candles", empty_provenance)
 
@@ -2668,3 +2901,1124 @@ def test_legacy_backtest_provenance_is_marked_incomplete_without_fabrication(
         "source_imports",
     ]
     assert "instrument_snapshot" not in legacy["metadata"]
+
+
+@pytest.mark.parametrize(
+    ("name", "closes", "starting_cash", "volumes", "costs", "fill_count", "trade_count"),
+    [
+        (
+            "parity_round_trip",
+            [30, 20, 10, 20, 40, 50, 40, 20, 10],
+            Decimal(100000),
+            None,
+            default_cost_assumptions(),
+            2,
+            1,
+        ),
+        (
+            "parity_unaffordable",
+            [30, 20, 10, 20, 40, 50, 40, 20, 10],
+            Decimal(1),
+            None,
+            zero_cost_assumptions(),
+            0,
+            0,
+        ),
+        (
+            "parity_volume_limited",
+            [30, 20, 10, 20, 40, 50, 40, 20, 10],
+            Decimal(100000),
+            [1000, 1000, 1000, 1000, 1, 1000, 1000, 1000, 1000],
+            zero_cost_assumptions(),
+            0,
+            0,
+        ),
+        (
+            "parity_open_position",
+            [30, 20, 10, 20, 40, 50],
+            Decimal(100000),
+            None,
+            default_cost_assumptions(),
+            1,
+            0,
+        ),
+    ],
+)
+def test_one_instrument_execution_matches_registered_backtest(
+    database_path: Path,
+    tmp_path: Path,
+    name: str,
+    closes: list[int],
+    starting_cash: Decimal,
+    volumes: list[int] | None,
+    costs: CostAssumptions,
+    fill_count: int,
+    trade_count: int,
+) -> None:
+    config = BacktestConfig(
+        starting_cash=starting_cash,
+        order_quantity=10,
+        max_volume_participation=Decimal("0.5"),
+        costs=costs,
+    )
+    persisted, signals, calendars, as_of, candles = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name=name,
+        closes=closes,
+        config=config,
+        volumes=volumes,
+    )
+
+    assert persisted["status"] == "COMPLETED"
+    calendar = calendars.resolve("NSE", "NSE")
+    assert calendar is not None
+    _, completed, _, _ = calculate_expected_candles(calendar, "1m", _DAY, _DAY, as_of=as_of)
+    expected_by_timestamp = {item.timestamp: item.completes_at for item in completed}
+    legacy_output = _simulate(
+        list(candles),
+        signals,
+        config=config,
+        tick_size=Decimal("0.05"),
+        interval="1m",
+        calendar=calendar,
+        expected_by_timestamp=expected_by_timestamp,
+    )
+    for field in ("orders", "trades", "equity_curve", "open_position"):
+        assert persisted[field] == legacy_output[field]
+    for key, value in legacy_output["summary"].items():
+        assert persisted["summary"][key] == value
+    assert persisted["benchmark"] == _buy_and_hold_benchmark(
+        list(candles),
+        config=config,
+        tick_size=Decimal("0.05"),
+    )
+
+    with closing(get_connection(database_path)) as connection:
+        run_count_before = connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    execution = execute_one_instrument(
+        database_path,
+        exchange="NSE",
+        trading_symbol="TCS",
+        interval="1m",
+        start_date=_DAY,
+        end_date=_DAY,
+        fast_window=2,
+        slow_window=3,
+        config=config,
+        calendar_config_path=_calendar_config_path(calendars),
+        as_of=as_of,
+    )
+    assert execution == execute_one_instrument(
+        database_path,
+        exchange="NSE",
+        trading_symbol="TCS",
+        interval="1m",
+        start_date=_DAY,
+        end_date=_DAY,
+        fast_window=2,
+        slow_window=3,
+        config=config,
+        calendar_config_path=_calendar_config_path(calendars),
+        as_of=as_of,
+    )
+    with closing(get_connection(database_path)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == run_count_before
+    simulation = execution.to_simulation_output()
+    for field in ("orders", "trades", "equity_curve", "open_position"):
+        assert persisted[field] == simulation[field]
+    for key, value in simulation["summary"].items():
+        assert persisted["summary"][key] == value
+    assert persisted["benchmark"] == execution.to_benchmark_output()
+    assert len(execution.fills) == fill_count
+    assert len(execution.trades) == trade_count
+    assert execution.diagnostics["data_quality"]["status"] == "COMPLETE"
+    assert execution.diagnostics["source_imports"][0]["source_use_status"] == "VERIFIED_PERMITTED"
+    direct_spec = create_sma_crossover_spec(
+        exchange="NSE",
+        trading_symbol="TCS",
+        instrument_type="EQUITY",
+        interval="1m",
+        fast_window=2,
+        slow_window=3,
+        hypothesis="Deterministic direct-execution baseline for qualified candles.",
+    )
+    direct_strategy_hash = _canonical_hash(direct_spec.to_dict())
+    assert execution.diagnostics["signal_provenance"] == {
+        "status": "CAUSAL_GENERATION_FROM_QUALIFIED_CANDLES",
+        "strategy_key": "sma_crossover",
+        "name": "Simple moving-average crossover",
+        "version": "1.0.0",
+        "parameters": {"fast_window": 2, "slow_window": 3},
+        "strategy_spec_sha256": direct_strategy_hash,
+    }
+    assert len(execution.diagnostics["signals_sha256"]) == 64
+    assert (
+        execution.diagnostics["strategy_implementation_sha256"]
+        == persisted["metadata"]["strategy_implementation_sha256"]
+    )
+    for fingerprint in (
+        "dataset_sha256",
+        "candle_source_bindings_sha256",
+        "source_imports_sha256",
+        "calendar_configuration_sha256",
+        "effective_calendar_configuration_sha256",
+        "expected_schedule_sha256",
+        "quality_report_sha256",
+    ):
+        assert len(execution.diagnostics[fingerprint]) == 64
+    for fill in execution.fills:
+        mark = next(
+            point
+            for point in execution.equity_curve
+            if point["timestamp"] == fill["execution_bar_timestamp"]
+        )
+        assert fill["cash_after"] == mark["cash"]
+        assert fill["position_quantity_after"] == mark["position_quantity"]
+        execution_index = next(
+            index
+            for index, candle in enumerate(candles)
+            if candle.timestamp == fill["execution_bar_timestamp"]
+        )
+        prior_timestamp = candles[execution_index - 1].timestamp
+        prior_mark = next(
+            point for point in execution.equity_curve if point["timestamp"] == prior_timestamp
+        )
+        assert fill["cash_before"] == prior_mark["cash"]
+        assert fill["position_quantity_before"] == prior_mark["position_quantity"]
+
+    if name == "parity_round_trip":
+        assert execution.fills[0]["fill_price"] == "50.05"
+        assert execution.fills[0]["fees"] == {
+            "brokerage": "0.15",
+            "exchange_charges": "0.02",
+            "regulatory_charges": "0",
+            "transaction_tax": "0.5",
+            "stamp_duty": "0.08",
+            "gst": "0.03",
+        }
+        assert execution.fills[0]["total_fees"] == "0.78"
+        assert execution.fills[1]["fill_price"] == "9.95"
+        assert execution.fills[1]["fees"] == {
+            "brokerage": "0.03",
+            "exchange_charges": "0",
+            "regulatory_charges": "0",
+            "transaction_tax": "0.1",
+            "stamp_duty": "0",
+            "gst": "0.01",
+        }
+        assert execution.fills[1]["total_fees"] == "0.14"
+        assert execution.trades[0]["net_pnl"] != execution.trades[0]["gross_pnl"]
+        assert execution.summary["ending_cash"] == "99598.08"
+        assert execution.summary["ending_equity"] == "99598.08"
+        assert execution.summary["total_fees"] == "0.92"
+        assert persisted["benchmark"]["ending_cash"] == "99798.39"
+        assert persisted["benchmark"]["total_return"] == "-0.0020161"
+        assert persisted["summary"]["benchmark_total_return"] == "-0.0020161"
+        assert (
+            persisted["summary"]["relative_performance_vs_same_instrument_buy_and_hold"]
+            == "-0.0020031"
+        )
+
+        serialized = execution.to_simulation_output()
+        serialized["orders"][0]["fill_price"] = "0"
+        serialized["orders"][0]["fees"]["brokerage"] = "0"
+        serialized["summary"]["ending_cash"] = "0"
+        assert execution.orders[0]["fill_price"] == "50.05"
+        assert execution.orders[0]["fees"]["brokerage"] == "0.15"
+        assert execution.summary["ending_cash"] == "99598.08"
+        with pytest.raises(TypeError):
+            execution.orders[0]["fill_price"] = "0"
+        with pytest.raises(TypeError):
+            execution.orders[0]["fees"]["brokerage"] = "0"
+        assert execution.to_simulation_output()["orders"][0]["fill_price"] == "50.05"
+    elif name == "parity_unaffordable":
+        assert execution.orders[0]["status"] == "REJECTED"
+        assert execution.summary["ending_cash"] == "1"
+    elif name == "parity_volume_limited":
+        assert execution.orders[0]["status"] == "REJECTED"
+        assert execution.orders[0]["prior_bar_volume"] == 1
+        assert execution.orders[0]["volume_capacity"] == 0
+    else:
+        assert execution.open_position is not None
+        assert execution.open_position["quantity"] == 10
+        assert execution.summary["ending_cash"] == "99498.72"
+        assert execution.summary["ending_equity"] == "99998.72"
+        assert execution.summary["estimated_liquidation_costs"] == "1.2"
+        assert execution.summary["net_liquidation_value"] == "99997.52"
+        assert execution.summary["total_fees"] == "0.78"
+        assert len(execution.fills) == 1
+        assert persisted["benchmark"]["total_return"] == "0.0019783"
+        assert (
+            persisted["summary"]["relative_performance_vs_same_instrument_buy_and_hold"]
+            == "-0.0020031"
+        )
+
+
+@pytest.mark.parametrize("source_use_status", ["UNVERIFIED", "PROHIBITED"])
+def test_one_instrument_execution_rejects_ineligible_source_use(
+    database_path: Path, tmp_path: Path, source_use_status: SourceUseStatus
+) -> None:
+    config = BacktestConfig(
+        Decimal(100000),
+        10,
+        Decimal("0.5"),
+        zero_cost_assumptions(),
+    )
+    persisted, _, calendars, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name=f"parity_{source_use_status.lower()}",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+        source_use_status=source_use_status,
+    )
+
+    assert persisted["status"] == "BLOCKED"
+    with pytest.raises(BacktestError, match="VERIFIED_PERMITTED"):
+        execute_one_instrument(
+            database_path,
+            exchange="NSE",
+            trading_symbol="TCS",
+            interval="1m",
+            start_date=_DAY,
+            end_date=_DAY,
+            fast_window=2,
+            slow_window=3,
+            config=config,
+            calendar_config_path=_calendar_config_path(calendars),
+            as_of=as_of,
+        )
+
+
+def test_one_instrument_execution_rejects_missing_expected_candle(
+    database_path: Path, tmp_path: Path
+) -> None:
+    config = BacktestConfig(
+        Decimal(100000),
+        10,
+        Decimal("0.5"),
+        zero_cost_assumptions(),
+    )
+    persisted, _, calendars, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="parity_missing_candle",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+        missing_candle_index=2,
+    )
+
+    assert persisted["status"] == "BLOCKED"
+    with pytest.raises(BacktestError, match="Data quality status|Expected, reported"):
+        execute_one_instrument(
+            database_path,
+            exchange="NSE",
+            trading_symbol="TCS",
+            interval="1m",
+            start_date=_DAY,
+            end_date=_DAY,
+            fast_window=2,
+            slow_window=3,
+            config=config,
+            calendar_config_path=_calendar_config_path(calendars),
+            as_of=as_of,
+        )
+
+
+def test_direct_execution_rejects_verified_status_without_history(
+    database_path: Path, tmp_path: Path
+) -> None:
+    config = BacktestConfig(Decimal(100000), 10, Decimal("0.5"), zero_cost_assumptions())
+    _, _, calendars, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="missing_source_history",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+    )
+    with closing(get_connection(database_path)) as connection:
+        import_id = connection.execute(
+            "SELECT DISTINCT import_id FROM historical_candles"
+        ).fetchone()["import_id"]
+        connection.execute(
+            "DELETE FROM import_source_use_history WHERE import_id = ?", (import_id,)
+        )
+        connection.commit()
+
+    with pytest.raises(BacktestError, match="declaration history"):
+        execute_one_instrument(
+            database_path,
+            exchange="NSE",
+            trading_symbol="TCS",
+            interval="1m",
+            start_date=_DAY,
+            end_date=_DAY,
+            fast_window=2,
+            slow_window=3,
+            config=config,
+            calendar_config_path=_calendar_config_path(calendars),
+            as_of=as_of,
+        )
+
+
+def test_direct_execution_rejects_mismatched_latest_source_declaration(
+    database_path: Path, tmp_path: Path
+) -> None:
+    config = BacktestConfig(Decimal(100000), 10, Decimal("0.5"), zero_cost_assumptions())
+    _, _, calendars, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="contradictory_source_history",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+    )
+    with closing(get_connection(database_path)) as connection:
+        connection.execute(
+            """UPDATE import_source_use_history
+               SET new_status = 'PROHIBITED'
+               WHERE id = (SELECT MAX(id) FROM import_source_use_history)"""
+        )
+        connection.commit()
+
+    with pytest.raises(BacktestError, match="declaration history"):
+        execute_one_instrument(
+            database_path,
+            exchange="NSE",
+            trading_symbol="TCS",
+            interval="1m",
+            start_date=_DAY,
+            end_date=_DAY,
+            fast_window=2,
+            slow_window=3,
+            config=config,
+            calendar_config_path=_calendar_config_path(calendars),
+            as_of=as_of,
+        )
+
+
+def test_direct_execution_uses_latest_complete_source_declaration(
+    database_path: Path, tmp_path: Path
+) -> None:
+    config = BacktestConfig(Decimal(100000), 10, Decimal("0.5"), zero_cost_assumptions())
+    _, _, calendars, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="latest_source_history",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+    )
+    with closing(get_connection(database_path)) as connection:
+        import_id = connection.execute(
+            "SELECT DISTINCT import_id FROM historical_candles"
+        ).fetchone()["import_id"]
+    declare_import_source_use_status(
+        database_path,
+        import_id,
+        "UNVERIFIED",
+        declared_by="synthetic test administrator",
+        rationale="Intermediate declaration for deterministic history-order testing.",
+    )
+    latest_id = declare_import_source_use_status(
+        database_path,
+        import_id,
+        "VERIFIED_PERMITTED",
+        declared_by="synthetic test administrator",
+        rationale="Latest explicit synthetic test declaration.",
+    )
+
+    execution = execute_one_instrument(
+        database_path,
+        exchange="NSE",
+        trading_symbol="TCS",
+        interval="1m",
+        start_date=_DAY,
+        end_date=_DAY,
+        fast_window=2,
+        slow_window=3,
+        config=config,
+        calendar_config_path=_calendar_config_path(calendars),
+        as_of=as_of,
+    )
+
+    declaration = execution.diagnostics["source_imports"][0]
+    assert declaration["declaration_id"] == latest_id
+    assert declaration["declaration_import_id"] == import_id
+    assert declaration["declaration_previous_status"] == "UNVERIFIED"
+    assert declaration["declaration_new_status"] == "VERIFIED_PERMITTED"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("rationale", ""),
+        ("declared_at", "not-a-timestamp"),
+        ("declared_at", "2026-01-05"),
+        ("declared_at", "2026-02-30 09:00:00"),
+        ("declared_at", "2026-01-05T09:00:00"),
+        ("declared_at", "2026-01-05 09:00:00+00:00"),
+    ],
+)
+def test_direct_execution_rejects_malformed_source_declaration_metadata(
+    database_path: Path,
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    config = BacktestConfig(Decimal(100000), 10, Decimal("0.5"), zero_cost_assumptions())
+    _, _, calendars, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name=f"malformed_declaration_{field}",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+    )
+    with closing(get_connection(database_path)) as connection:
+        connection.execute(
+            f"UPDATE import_source_use_history SET {field} = ? WHERE id = "
+            "(SELECT MAX(id) FROM import_source_use_history)",
+            (value,),
+        )
+        connection.commit()
+
+    with pytest.raises(BacktestError, match="declaration history"):
+        execute_one_instrument(
+            database_path,
+            exchange="NSE",
+            trading_symbol="TCS",
+            interval="1m",
+            start_date=_DAY,
+            end_date=_DAY,
+            fast_window=2,
+            slow_window=3,
+            config=config,
+            calendar_config_path=_calendar_config_path(calendars),
+            as_of=as_of,
+        )
+
+
+def test_source_declaration_requires_a_timestamp_and_accepts_writer_convention(
+    database_path: Path, tmp_path: Path
+) -> None:
+    config = BacktestConfig(Decimal(100000), 10, Decimal("0.5"), zero_cost_assumptions())
+    _, _, calendars, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="source_declaration_timestamp",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+    )
+    execution = execute_one_instrument(
+        database_path,
+        exchange="NSE",
+        trading_symbol="TCS",
+        interval="1m",
+        start_date=_DAY,
+        end_date=_DAY,
+        fast_window=2,
+        slow_window=3,
+        config=config,
+        calendar_config_path=_calendar_config_path(calendars),
+        as_of=as_of,
+    )
+    source_import = dict(execution.diagnostics["source_imports"][0])
+    assert datetime.strptime(str(source_import["declared_at"]), "%Y-%m-%d %H:%M:%S")
+    _validate_source_imports((source_import,))
+
+    source_import["declared_at"] = None
+    with pytest.raises(DataQualityGateError, match="declaration history"):
+        _validate_source_imports((source_import,))
+
+
+def test_direct_execution_rejects_import_candle_identity_mismatch(
+    database_path: Path, tmp_path: Path
+) -> None:
+    config = BacktestConfig(Decimal(100000), 10, Decimal("0.5"), zero_cost_assumptions())
+    _, _, calendars, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="import_candle_mismatch",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+    )
+    with closing(get_connection(database_path)) as connection:
+        connection.execute("UPDATE data_imports SET requested_trading_symbol = 'INFY'")
+        connection.commit()
+
+    with pytest.raises(BacktestError, match="does not match its contributing candle"):
+        execute_one_instrument(
+            database_path,
+            exchange="NSE",
+            trading_symbol="TCS",
+            interval="1m",
+            start_date=_DAY,
+            end_date=_DAY,
+            fast_window=2,
+            slow_window=3,
+            config=config,
+            calendar_config_path=_calendar_config_path(calendars),
+            as_of=as_of,
+        )
+
+
+def test_one_instrument_execution_rejects_caller_supplied_evidence_and_mismatches(
+    database_path: Path, tmp_path: Path
+) -> None:
+    config = BacktestConfig(
+        Decimal(100000),
+        10,
+        Decimal("0.5"),
+        zero_cost_assumptions(),
+    )
+    _, signals, calendars, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="qualification_binding",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+    )
+    report = analyze_dataset(
+        database_path,
+        "NSE",
+        "TCS",
+        "1m",
+        _DAY,
+        _DAY,
+        as_of=as_of,
+        calendars=calendars,
+    )
+    fabricated_passing_report = replace(
+        report,
+        overall_status="COMPLETE",
+        completeness_percentage=Decimal("100.00"),
+    )
+    common_inputs = {
+        "exchange": "NSE",
+        "trading_symbol": "TCS",
+        "interval": "1m",
+        "start_date": _DAY,
+        "end_date": _DAY,
+        "fast_window": 2,
+        "slow_window": 3,
+        "config": config,
+        "calendar_config_path": _calendar_config_path(calendars),
+        "as_of": as_of,
+    }
+    dynamic_entrypoint: Callable[..., object] = execute_one_instrument
+
+    with pytest.raises(TypeError, match="quality_report"):
+        dynamic_entrypoint(
+            database_path,
+            **common_inputs,
+            quality_report=fabricated_passing_report,
+        )
+    with pytest.raises(TypeError, match="source_imports"):
+        dynamic_entrypoint(
+            database_path,
+            **common_inputs,
+            source_imports=({"import_id": 999, "source_use_status": "VERIFIED_PERMITTED"},),
+        )
+    for evidence_name, evidence in (("instrument", {}), ("calendar", object())):
+        with pytest.raises(TypeError, match=evidence_name):
+            dynamic_entrypoint(
+                database_path,
+                **{**common_inputs, evidence_name: evidence},
+            )
+    forged_calendar = replace(
+        calendars,
+        configuration_sha256="f" * 64,
+    )
+    with pytest.raises(TypeError, match="calendars"):
+        dynamic_entrypoint(database_path, **common_inputs, calendars=forged_calendar)
+    with pytest.raises(BacktestError, match="administrator-approved"):
+        execute_one_instrument(
+            database_path,
+            **{
+                **common_inputs,
+                "calendar_config_path": tmp_path / "missing-calendar.json",
+            },
+        )
+
+    assert signals
+    untrusted_signal_payloads = (
+        signals,
+        tuple(reversed(signals)),
+        (*signals, *signals),
+        (object(),),
+        (replace(signals[0], timestamp="2099-01-01T00:00:00Z"),),
+    )
+    for untrusted_signals in untrusted_signal_payloads:
+        with pytest.raises(TypeError, match="signals"):
+            dynamic_entrypoint(
+                database_path,
+                **common_inputs,
+                signals=untrusted_signals,
+            )
+
+    with pytest.raises(BacktestError, match="not registered"):
+        execute_one_instrument(
+            database_path,
+            **{**common_inputs, "trading_symbol": "INFY"},
+        )
+
+    mismatched_calendar = load_calendar_registry(
+        _create_calendar_file(tmp_path, 3, "mismatched_schedule")
+    )
+    with pytest.raises(BacktestError, match="Data quality status"):
+        execute_one_instrument(
+            database_path,
+            **{
+                **common_inputs,
+                "calendar_config_path": _calendar_config_path(mismatched_calendar),
+            },
+        )
+
+
+def test_direct_and_registered_execution_reject_unapproved_calendar_paths(
+    database_path: Path, tmp_path: Path
+) -> None:
+    config = BacktestConfig(Decimal(100000), 10, Decimal("0.5"), zero_cost_assumptions())
+    experiment_id, _ = _run_synthetic_backtest(
+        database_path,
+        tmp_path,
+        [30, 20, 10, 20, 40, 50],
+        name="approved_calendar_path",
+    )
+    approved_path = Path(os.environ["AEGIS_CALENDAR_CONFIG_PATH"])
+    as_of = datetime(2026, 1, 5, 9, 22, tzinfo=ZoneInfo("Asia/Kolkata"))
+    alternate_path = tmp_path / "alternate_calendar.json"
+    alternate_path.write_text(approved_path.read_text(encoding="utf-8"), encoding="utf-8")
+    os.environ["AEGIS_CALENDAR_CONFIG_PATH"] = str(approved_path)
+    common_inputs = {
+        "exchange": "NSE",
+        "trading_symbol": "TCS",
+        "interval": "1m",
+        "start_date": _DAY,
+        "end_date": _DAY,
+        "fast_window": 2,
+        "slow_window": 3,
+        "config": config,
+        "as_of": as_of,
+    }
+
+    with pytest.raises(BacktestError, match="administrator-approved application path"):
+        execute_one_instrument(
+            database_path,
+            **common_inputs,
+            calendar_config_path=alternate_path,
+        )
+    traversal_path = approved_path.parent / "nested" / ".." / approved_path.name
+    with pytest.raises(BacktestError, match="path traversal"):
+        execute_one_instrument(
+            database_path,
+            **common_inputs,
+            calendar_config_path=traversal_path,
+        )
+
+    registered_result = run_backtest(
+        database_path,
+        experiment_id,
+        calendars=load_calendar_registry(alternate_path),
+        as_of=as_of,
+    )
+    assert registered_result.status == "BLOCKED"
+    assert "administrator-approved application path" in (registered_result.reason or "")
+
+
+def test_direct_execution_rejects_missing_and_malformed_approved_calendar(
+    database_path: Path, tmp_path: Path
+) -> None:
+    config = BacktestConfig(Decimal(100000), 10, Decimal("0.5"), zero_cost_assumptions())
+    _, _, _, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="invalid_approved_calendar",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+    )
+
+    missing_path = tmp_path / "missing_approved_calendar.json"
+    os.environ["AEGIS_CALENDAR_CONFIG_PATH"] = str(missing_path)
+    with pytest.raises(BacktestError, match="unavailable"):
+        execute_one_instrument(
+            database_path,
+            exchange="NSE",
+            trading_symbol="TCS",
+            interval="1m",
+            start_date=_DAY,
+            end_date=_DAY,
+            fast_window=2,
+            slow_window=3,
+            config=config,
+            calendar_config_path=missing_path,
+            as_of=as_of,
+        )
+
+    malformed_path = tmp_path / "malformed_approved_calendar.json"
+    malformed_path.write_text("{", encoding="utf-8")
+    os.environ["AEGIS_CALENDAR_CONFIG_PATH"] = str(malformed_path)
+    with pytest.raises(BacktestError, match="Calendar configuration is invalid"):
+        execute_one_instrument(
+            database_path,
+            exchange="NSE",
+            trading_symbol="TCS",
+            interval="1m",
+            start_date=_DAY,
+            end_date=_DAY,
+            fast_window=2,
+            slow_window=3,
+            config=config,
+            calendar_config_path=malformed_path,
+            as_of=as_of,
+        )
+
+
+def test_direct_execution_rejects_approved_calendar_symlink_escape(
+    database_path: Path, tmp_path: Path
+) -> None:
+    config = BacktestConfig(Decimal(100000), 10, Decimal("0.5"), zero_cost_assumptions())
+    _, _, calendars, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="symlink_calendar_escape",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+    )
+    target_path = _calendar_config_path(calendars)
+    symlink_path = tmp_path / "approved_link" / "exchange_calendars.json"
+    symlink_path.parent.mkdir()
+    try:
+        symlink_path.symlink_to(target_path)
+    except OSError as exc:
+        pytest.skip(f"Symlinks are unavailable on this system: {exc}")
+    os.environ["AEGIS_CALENDAR_CONFIG_PATH"] = str(symlink_path)
+
+    with pytest.raises(BacktestError, match="symlink"):
+        execute_one_instrument(
+            database_path,
+            exchange="NSE",
+            trading_symbol="TCS",
+            interval="1m",
+            start_date=_DAY,
+            end_date=_DAY,
+            fast_window=2,
+            slow_window=3,
+            config=config,
+            calendar_config_path=symlink_path,
+            as_of=as_of,
+        )
+
+
+def test_direct_execution_detects_calendar_file_changes_in_fingerprint(
+    database_path: Path, tmp_path: Path
+) -> None:
+    config = BacktestConfig(Decimal(100000), 10, Decimal("0.5"), zero_cost_assumptions())
+    _, _, calendars, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="calendar_fingerprint",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+    )
+    config_path = _calendar_config_path(calendars)
+    original_hash = calendars.configuration_sha256
+    document = json.loads(config_path.read_text(encoding="utf-8"))
+    document["calendars"][0]["source"] = "Updated administrator-reviewed test fixture."
+    config_path.write_text(json.dumps(document), encoding="utf-8")
+
+    execution = execute_one_instrument(
+        database_path,
+        exchange="NSE",
+        trading_symbol="TCS",
+        interval="1m",
+        start_date=_DAY,
+        end_date=_DAY,
+        fast_window=2,
+        slow_window=3,
+        config=config,
+        calendar_config_path=config_path,
+        as_of=as_of,
+    )
+
+    assert execution.diagnostics["calendar_configuration_sha256"] != original_hash
+    assert (
+        execution.diagnostics["calendar_configuration_sha256"]
+        == load_calendar_registry(config_path).configuration_sha256
+    )
+
+
+def test_direct_execution_uses_qualified_calendar_for_simulation(
+    database_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = BacktestConfig(Decimal(100000), 10, Decimal("0.5"), zero_cost_assumptions())
+    _, _, calendars, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="calendar_identity",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+    )
+    calendar_ids: list[int] = []
+    original_analyze = analyze_dataset
+    original_simulate = _simulate
+    original_schedule = calculate_expected_candles
+
+    def observe_analysis(*args, **kwargs):
+        registry = kwargs["calendars"]
+        selected = registry.resolve("NSE", "NSE")
+        assert selected is not None
+        calendar_ids.append(id(selected))
+        return original_analyze(*args, **kwargs)
+
+    def observe_schedule(calendar, *args, **kwargs):
+        calendar_ids.append(id(calendar))
+        return original_schedule(calendar, *args, **kwargs)
+
+    def observe_simulation(*args, **kwargs):
+        calendar_ids.append(id(kwargs["calendar"]))
+        return original_simulate(*args, **kwargs)
+
+    monkeypatch.setattr("aegis.backtesting.analyze_dataset", observe_analysis)
+    monkeypatch.setattr("aegis.backtesting.calculate_expected_candles", observe_schedule)
+    monkeypatch.setattr("aegis.backtesting._simulate", observe_simulation)
+    execute_one_instrument(
+        database_path,
+        exchange="NSE",
+        trading_symbol="TCS",
+        interval="1m",
+        start_date=_DAY,
+        end_date=_DAY,
+        fast_window=2,
+        slow_window=3,
+        config=config,
+        calendar_config_path=_calendar_config_path(calendars),
+        as_of=as_of,
+    )
+
+    assert len(calendar_ids) >= 3
+    assert len(set(calendar_ids)) == 1
+
+
+def test_registered_backtest_blocks_calendar_changed_after_loading(
+    database_path: Path, tmp_path: Path
+) -> None:
+    experiment_id, _ = _run_synthetic_backtest(
+        database_path,
+        tmp_path,
+        [30, 20, 10, 20, 40, 50],
+        name="stale_calendar_registry",
+    )
+    config_path = tmp_path / "stale_calendar_registry_calendars.json"
+    calendars = load_calendar_registry(config_path)
+    document = json.loads(config_path.read_text(encoding="utf-8"))
+    document["calendars"][0]["source"] = "Changed after the registry was loaded."
+    config_path.write_text(json.dumps(document), encoding="utf-8")
+
+    result = run_backtest(
+        database_path,
+        experiment_id,
+        calendars=calendars,
+        as_of=datetime(2026, 1, 5, 9, 22, tzinfo=ZoneInfo("Asia/Kolkata")),
+    )
+
+    assert result.status == "BLOCKED"
+    assert "changed after it was loaded" in (result.reason or "")
+
+
+def test_registered_backtest_qualifies_from_one_read_only_snapshot(
+    database_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = BacktestConfig(Decimal(100000), 1, Decimal("0.5"), zero_cost_assumptions())
+    rows = [
+        (
+            f"2026-01-05T09:{15 + index:02d}:00+05:30",
+            close,
+            close + 2,
+            close - 2,
+            close,
+            1000,
+        )
+        for index, close in enumerate((30, 20, 10, 20, 40, 50))
+    ]
+    imported = import_ohlcv_csv(
+        database_path,
+        _write_csv(tmp_path, rows, filename="single_snapshot.csv"),
+        "NSE",
+        "TCS",
+        "1m",
+    )
+    declare_import_source_use_status(
+        database_path,
+        imported.import_id,
+        "VERIFIED_PERMITTED",
+        declared_by="synthetic test administrator",
+        rationale="Isolated test fixture; not licensing evidence.",
+    )
+    strategy_id = _create_strategy_experiment(database_path)
+    registration = register_backtest(database_path, strategy_id, config)
+    calendars = load_calendar_registry(
+        _create_calendar_file(tmp_path, len(rows), "single_snapshot")
+    )
+    observed_connections: list[sqlite3.Connection] = []
+    calendar_ids: list[int] = []
+    real_analyze = analyze_dataset
+    real_load = _load_completed_candles
+    real_schedule = calculate_expected_candles
+
+    def observe_analysis(*args, **kwargs):
+        connection = kwargs["connection"]
+        assert connection.in_transaction
+        assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        registry = kwargs["calendars"]
+        selected = registry.resolve("NSE", "NSE")
+        assert selected is not None
+        calendar_ids.append(id(selected))
+        observed_connections.append(connection)
+        return real_analyze(*args, **kwargs)
+
+    def observe_schedule(calendar, *args, **kwargs):
+        calendar_ids.append(id(calendar))
+        return real_schedule(calendar, *args, **kwargs)
+
+    def observe_candle_load(*args, **kwargs):
+        connection = kwargs["connection"]
+        assert connection.in_transaction
+        assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        observed_connections.append(connection)
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr("aegis.backtesting.analyze_dataset", observe_analysis)
+    monkeypatch.setattr("aegis.backtesting.calculate_expected_candles", observe_schedule)
+    monkeypatch.setattr("aegis.backtesting._load_completed_candles", observe_candle_load)
+    result = run_backtest(
+        database_path,
+        registration.experiment_id,
+        calendars=calendars,
+        as_of=datetime(2026, 1, 5, 9, 22, tzinfo=ZoneInfo("Asia/Kolkata")),
+    )
+
+    assert result.status == "COMPLETED"
+    assert len(observed_connections) == 2
+    assert observed_connections[0] is observed_connections[1]
+    assert len(calendar_ids) >= 2
+    assert len(set(calendar_ids)) == 1
+
+
+def test_one_instrument_execution_rejects_unconfirmed_calendar(
+    database_path: Path, tmp_path: Path
+) -> None:
+    config = BacktestConfig(
+        Decimal(100000),
+        10,
+        Decimal("0.5"),
+        zero_cost_assumptions(),
+    )
+    _, _, _, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="unconfirmed_calendar",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+    )
+    document = json.loads(_create_calendar_file(tmp_path, 6, "unconfirmed_source").read_text())
+    document["calendars"][0]["confidence"] = "CONFIGURED"
+    calendar_path = tmp_path / "unconfirmed_calendar.json"
+    calendar_path.write_text(json.dumps(document), encoding="utf-8")
+    os.environ["AEGIS_CALENDAR_CONFIG_PATH"] = str(calendar_path)
+
+    with pytest.raises(BacktestError, match="CONFIRMED"):
+        execute_one_instrument(
+            database_path,
+            exchange="NSE",
+            trading_symbol="TCS",
+            interval="1m",
+            start_date=_DAY,
+            end_date=_DAY,
+            fast_window=2,
+            slow_window=3,
+            config=config,
+            calendar_config_path=calendar_path,
+            as_of=as_of,
+        )
+
+
+def test_one_instrument_execution_rejects_unknown_calendar_mapping(
+    database_path: Path, tmp_path: Path
+) -> None:
+    config = BacktestConfig(Decimal(100000), 10, Decimal("0.5"), zero_cost_assumptions())
+    _, _, calendars, as_of, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="unknown_calendar_mapping",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+    )
+    document = json.loads(_calendar_config_path(calendars).read_text(encoding="utf-8"))
+    document["calendars"][0]["exchange"] = "BSE"
+    unknown_path = tmp_path / "unknown_calendar_mapping.json"
+    unknown_path.write_text(json.dumps(document), encoding="utf-8")
+    os.environ["AEGIS_CALENDAR_CONFIG_PATH"] = str(unknown_path)
+
+    with pytest.raises(BacktestError, match="Data quality status|calendar"):
+        execute_one_instrument(
+            database_path,
+            exchange="NSE",
+            trading_symbol="TCS",
+            interval="1m",
+            start_date=_DAY,
+            end_date=_DAY,
+            fast_window=2,
+            slow_window=3,
+            config=config,
+            calendar_config_path=unknown_path,
+            as_of=as_of,
+        )
+
+
+def test_one_instrument_execution_rejects_stale_data(database_path: Path, tmp_path: Path) -> None:
+    config = BacktestConfig(
+        Decimal(100000),
+        10,
+        Decimal("0.5"),
+        zero_cost_assumptions(),
+    )
+    _, _, _, _, _ = _run_execution_parity_case(
+        database_path,
+        tmp_path,
+        name="stale_dataset",
+        closes=[30, 20, 10, 20, 40, 50],
+        config=config,
+    )
+    document = json.loads(_create_calendar_file(tmp_path, 6, "stale_calendar").read_text())
+    document["calendars"][0]["coverage_end"] = "2026-01-06"
+    calendar_path = tmp_path / "stale_calendar_range.json"
+    calendar_path.write_text(json.dumps(document), encoding="utf-8")
+    os.environ["AEGIS_CALENDAR_CONFIG_PATH"] = str(calendar_path)
+    calendars = load_calendar_registry(calendar_path)
+    as_of = datetime(2026, 1, 6, 9, 18, tzinfo=ZoneInfo("Asia/Kolkata"))
+    report = analyze_dataset(
+        database_path,
+        "NSE",
+        "TCS",
+        "1m",
+        _DAY,
+        date(2026, 1, 6),
+        as_of=as_of,
+        calendars=calendars,
+    )
+    assert report.staleness_status == "STALE"
+
+    with pytest.raises(BacktestError, match="Data quality status|Data freshness status"):
+        execute_one_instrument(
+            database_path,
+            exchange="NSE",
+            trading_symbol="TCS",
+            interval="1m",
+            start_date=_DAY,
+            end_date=date(2026, 1, 6),
+            fast_window=2,
+            slow_window=3,
+            config=config,
+            calendar_config_path=_calendar_config_path(calendars),
+            as_of=as_of,
+        )
