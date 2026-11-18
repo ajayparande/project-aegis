@@ -1,7 +1,11 @@
 # Risk Management and Safety
 
 ## Initial mode
-RESEARCH_ONLY. No live order placement. Paper trading only after the simulator passes tests.
+`RESEARCH_ONLY` is the current and only application mode. No live order placement is
+authorized. The Phase 8 simulation foundation does not enable paper mode or authorize
+forward-paper operation; any such activity remains separately scoped and prerequisite-
+gated. See [`PROJECT_STATE.md`](./PROJECT_STATE.md) and
+[`DEVELOPMENT_GUARDRAILS.md`](./DEVELOPMENT_GUARDRAILS.md).
 
 ## Hard safety requirements
 - No broker order-placement methods in the initial application.

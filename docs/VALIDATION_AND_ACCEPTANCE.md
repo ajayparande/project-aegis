@@ -1,5 +1,10 @@
 # Validation and Acceptance Standard
 
+> This document defines acceptance requirements; it does not report current feature
+> status. Use [`PROJECT_STATE.md`](./PROJECT_STATE.md) for the dated status snapshot.
+> Passing tests, implementation reports, and independent review are distinct from
+> authorized acceptance and operational or empirical readiness.
+
 ## Software quality
 - Unit tests for calculations, data validation, portfolio accounting and order state.
 - Integration tests using fixtures/mocks; never place real broker orders in tests.

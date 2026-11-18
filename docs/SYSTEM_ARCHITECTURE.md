@@ -1,6 +1,57 @@
 # System Architecture
 
-## High-level components
+> This document describes the architecture and bounded implementation behaviors; it is
+> not a current acceptance ledger. Read [`PROJECT_STATE.md`](./PROJECT_STATE.md) for
+> current status, [`ARCHITECTURE_DECISIONS.md`](./ARCHITECTURE_DECISIONS.md) for
+> approved decisions, and the relevant `tasks/` specification for milestone contracts.
+> `RESEARCH_ONLY` remains the active application mode, and Phase 8 remains the sole
+> execution/risk boundary.
+
+## M2 portfolio architecture status
+
+
+The approved M2 v1 design is specified in
+[`tasks/M2_PORTFOLIO_ACCOUNTING.md`](../tasks/M2_PORTFOLIO_ACCOUNTING.md). M2-A is
+recorded as accepted according to project-owner-supplied history. M2-B shared
+qualification received an independent read-only ACCEPT on 2026-11-16 for its bounded
+scope according to owner-reported history; the original audit artifact is absent. The
+schema-provenance correction requires focused independent review. M2-C is independently
+accepted for qualified historical per-sleeve M1B composition. M2-D accounting is
+implemented and technically ACCEPTED; distinct-reviewer independent sign-off remains
+pending. These decisions are recorded from project-owner-supplied acceptance history;
+technical ACCEPT does not establish independent acceptance of M2-D. M2-E has not
+started and is not authorized; overall M2 is not accepted.
+See [`PROJECT_STATE.md`](./PROJECT_STATE.md) for the dated status snapshot. M2 itself is
+historical research/backtesting only and must not invoke Phase 8. The implementation
+status is not inferred from this architecture description.
+
+
+## AI-1B bounded historical research review
+
+The AI-1B implementation is conditionally accepted as a read-only research layer, not as a
+live-trading or autonomous-execution system. It is intentionally bounded: the tool layer
+exposes historical discovery, coverage inspection, candle retrieval, and quality analysis
+using read-only SQLite connections, explicit cursor validation, and provenance-aware
+eligibility checks.
+
+The implementation is acceptable for offline research only when the caller continues to
+separate four distinct concepts: (1) completeness and integrity, (2) source-use eligibility,
+(3) evidence verification status, and (4) execution/risk validation. A dataset can pass
+quality checks and still be ineligible because its imports are unverified or prohibited, and
+proof of a valid hash is not itself a legal or operational authorization.
+
+The current design remains intentionally conservative: it validates cursor continuity and
+page-level continuity using a bounded change-detection fingerprint rather than a snapshot
+model, and it fails closed when the dataset exceeds the verification bound. This is a
+research integrity guardrail, not a guarantee that the database has an immutable historical
+state across an arbitrary time window.
+
+## High-level target components
+
+This list describes the intended system decomposition, not a claim that every adapter,
+workflow, or integration is currently available. See
+[`PROJECT_STATE.md`](./PROJECT_STATE.md) for implementation and acceptance status.
+
 1. **Instrument master:** provider-neutral exchange, symbol, contract metadata, and active status stored in SQLite.
 2. **Data adapters:** retrieve permitted historical/live market data.
 3. **Data validation:** check timestamps, missing bars, duplicates, outliers and stale feeds.
@@ -182,6 +233,39 @@ Any future Kite Connect integration must initially be limited to approved read-o
 
 Broker order placement requires a separate implementation review, explicit authorization and independent safety controls. It must remain disabled by default and require explicit human enablement.
 
+## Research protocol and architecture invariants before AI-1C
+
+The project must keep separate the following layers:
+
+1. Development data: exploratory analysis and hypothesis generation.
+2. Validation data: bounded model and strategy selection.
+3. Locked holdout data: final evaluation only, with access logged and controlled.
+
+A proposal or strategy must never be treated as valid merely because it produces a positive
+raw result on exploratory data. Research integrity requires a pre-registered evaluation rule
+set, a frozen model/prompt/tool configuration, and a written holdout policy.
+
+Historical contamination controls are required. Where the model may know historical market
+outcomes, the project must reduce this risk by masking identifiers where practical, noting the
+model's training cutoff, and treating in-window periods as lower-confidence evidence until
+post-cutoff or independent validation is available. Model and prompt versions, tool versions,
+parameters, and data windows must be fixed before the locked holdout is examined.
+
+Look-ahead, leakage, and survivorship-bias assumptions are prohibited. Feature generation,
+benchmark comparison, and strategy testing must be point-in-time and time-ordered. The project
+must also treat incomplete or disputed calendar coverage and source-use eligibility as separate
+concerns from performance evaluation.
+
+The project must also keep the following separations explicit:
+
+- Data completeness/integrity.
+- Source-use eligibility.
+- Evidence verification status.
+- Execution/risk validation.
+
+This separation is required before the AI-1C workflow can claim a valid research proposal or
+comparison against deterministic baselines.
+
 ## ML research (Phase 7)
 
 `src/aegis/ml_research.py` provides an in-memory, provenance-gated research harness. It
@@ -265,6 +349,14 @@ feed health, mark freshness, recovery, valuation, and reconciliation status.
 This phase is a research-only simulation. It adds no live market feed, broker connection,
 real-order path, or AI trading brain; `RESEARCH_ONLY` remains mandatory.
 
+The Phase 10A-2 independent review initially rejected its reviewed implementation scope;
+a later safety-remediation report is conditional. The Phase 10A-3 calendar candidate has
+an implementation report but remains `CONFIGURED`, not operationally accepted. These
+subtask reports do not mean that Phase 10 live-data forward paper is complete, accepted,
+or authorized. Phase 10 remains planned and prerequisite-gated; see
+[`PROJECT_STATE.md`](./PROJECT_STATE.md) and
+[`OPEN_DECISIONS.md`](./OPEN_DECISIONS.md).
+
 ## AI Agent and Controlled Tool Framework (Phase 9)
 
 `src/aegis/ai_agent/` provides a provider-agnostic, bounded AI research assistant.
@@ -273,7 +365,7 @@ The module exposes four sub-components:
 - **`models.py`**: Typed data classes for messages (`ChatMessage`, `Role`), tool calls (`ToolCall`, `ToolResult`), provider responses (`LLMResponse`, `ModelUsage`), and audit records (`AgentAuditRecord`, `AgentResearchResult`).
 - **`security.py`**: Deterministic permission enforcement (`enforce_tool_permission`), secret redaction (`redact_secrets`, `redact_nested_secrets`), prompt-injection defense (`tag_untrusted_data`), and query-bound validation (`validate_query_bounds`). Security is enforced by Python code, not by prompt instructions alone.
 - **`providers.py`**: `LLMProvider` abstract base class. Concrete implementations: `MockLLMProvider` (fully offline, deterministic, no API key required), `GeminiProvider` (REST via stdlib `urllib`), `OpenAIProvider` (REST), `AnthropicProvider` (REST). No provider SDK dependency is required; standard library only.
-- **`tools.py`**: `ToolRegistry` with strict recursive argument validation, permission gates, bounded output, and process-isolated handler timeouts. Custom handlers must be importable/pickleable for Windows `spawn` execution. The default registry exposes six read-only tools: `get_instrument_info`, `get_dataset_quality_summary`, `compute_technical_indicators`, `detect_price_action_patterns`, `get_backtest_summary`, and `get_strategy_experiment_results`. Paper-account reports and positions are deliberately excluded from provider-visible tools.
+- **`tools.py`**: `ToolRegistry` with strict recursive argument validation, permission gates, bounded output, and process-isolated handler timeouts. Custom handlers must be importable/pickleable for Windows `spawn` execution. The default registry exposes ten read-only tools: `get_instrument_info`, `get_dataset_quality_summary`, `compute_technical_indicators`, `detect_price_action_patterns`, `get_backtest_summary`, `get_strategy_experiment_results`, `discover_historical_instruments`, `inspect_historical_coverage`, `retrieve_historical_candles`, and `inspect_historical_data_quality`. Paper-account reports and positions are deliberately excluded from provider-visible tools.
 - **`orchestrator.py`**: `AIAgent` executes bounded loops (defaults: `max_steps=5`, `max_total_tool_calls=10`, aggregate token ceiling 20,000). Constructor ceilings cap configurable resources. Provider outputs, token usage, tool-call shapes, and audit arguments are validated; malformed provider results fail closed. Citations contain bounded tool-output evidence, and confidence is never elevated solely because a tool completed.
 
 Architectural constraints:
@@ -287,3 +379,53 @@ Architectural constraints:
 - Provider outages, timeouts, and malformed responses fail closed: they produce an `AgentResearchResult` with `status="FAILED"` and do not affect any deterministic service.
 - AI agent cannot change execution modes, risk limits, strategy configurations, database schemas, or place orders.
 - The Streamlit dashboard exposes an optional AI Research Assistant panel with a prominent disclaimer and no order-submission capability.
+
+### Historical research data tools (AI-1B)
+
+`src/aegis/historical_research.py` reuses the existing Instrument Master,
+`historical_candles`/`data_imports` records, read-only SQLite connections, and the
+`analyze_dataset` quality engine. It does not create a second registry, candle store, or
+quality implementation. The four registered tools have these contracts:
+
+| Tool | Inputs | Result |
+|---|---|---|
+| `discover_historical_instruments` | Required timeframe; optional exact exchange/symbol, inclusive timezone-aware timestamp range, minimum record count, quality status (`ANY`/`PASS`/`FAIL`/`UNKNOWN`), limit (max 100), and continuation cursor. | Bounded page of instruments with actual stored history, source-use status, quality, and eligibility; discovery scans at most 500 candidates per call. `complete`, `has_more`, `next_cursor`, and `completeness_status` distinguish a finished result from an incomplete scan or page. Instrument Master membership alone is not eligibility. |
+| `inspect_historical_coverage` | Exchange, exact symbol, timeframe; optional inclusive timestamp bounds. | First/last stored candle, count, duplicate/continuity information, source-use status, quality and exclusion/eligibility status. |
+| `retrieve_historical_candles` | Exchange, exact symbol, timeframe, required inclusive timezone-aware bounds, limit (max 100), and optional continuation cursor. | Chronologically ordered unique candle page, requested/actual range and count, source identities, quality summary, and deterministic page evidence reference. `has_more`, `next_cursor`, and `complete` indicate whether more pages remain. Only data whose contributing imports are all `VERIFIED_PERMITTED` is returned. |
+| `inspect_historical_data_quality` | Exchange, exact symbol, timeframe, and inclusive exchange-local `YYYY-MM-DD` bounds. | Existing quality-engine results and warnings, distinct from source-use and research-eligibility status. |
+
+All four tools have `READ_ONLY` permission and execute through the existing registry's
+strict schemas and isolated, time-limited handlers. Cursor tokens bind continuation to the
+normalized query and page size, validate their position against stored data, and bound
+candle pages to the row-ID snapshot captured on the first request. They are continuation
+tokens, not authenticated credentials or immutable database snapshots. If data changes so
+a continuation cannot produce a page, retrieval reports `DATA_CHANGED` rather than a
+success-shaped empty page. The service caps timestamp queries at 3,660 days; intraday
+quality evaluation is further bounded to 92 days. Invalid arguments are rejected, and the
+tools expose no SQL, Python, filesystem, network, broker, order, or database-write
+interface.
+
+Tool output is size-limited by the registry. Oversized responses are replaced with a
+structured JSON envelope whose status is `TRUNCATED` and `complete` is false; any preview
+is explicitly partial and must not be interpreted as a complete research result.
+
+Quality `PASS` requires the existing engine to report complete data with confirmed full
+calendar coverage and an expected-candle count. Detected integrity/completeness failures
+remain `FAIL`; unavailable or unconfirmed evidence remains `UNKNOWN`. Eligibility also
+requires every contributing source-use declaration to be `VERIFIED_PERMITTED`. The
+declaration records the user's permission decision; Aegis does not independently decide
+legal rights. Candle-page evidence references hash the canonical request, page cursor and
+snapshot, returned candle values, contributing import/source identities and statuses, and
+quality status and warnings. Identical page inputs and data reproduce the same reference;
+distinct pages or material provenance/quality changes have distinct references. Generated
+references and all current proposal evidence remain verification `UNKNOWN`; reference
+generation is not independent provenance verification.
+
+Known limitations: retrieval returns at most 100 records per call; discovery scans at most
+500 candidates per call and callers must follow cursors until `complete` is true before
+treating results as exhaustive; calendar-dependent quality cannot pass without locally
+confirmed coverage; and import permission is user-declared rather than independently
+verified.
+AI-1C remains responsible for any bounded research/decision workflow that consumes these
+tools, including evidence resolution and validation before it can create proposals. No
+autonomous decision, provider, or execution path is added by AI-1B.

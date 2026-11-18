@@ -1,5 +1,10 @@
 # Product Requirements
 
+> These are product requirements and target behaviors, not an implementation-status
+> checklist. For current implementation, acceptance, and readiness, see
+> [`PROJECT_STATE.md`](./PROJECT_STATE.md). For approved decisions and constraints, see
+> [`ARCHITECTURE_DECISIONS.md`](./ARCHITECTURE_DECISIONS.md).
+
 ## Functional requirements
 ### FR-01 Research library
 Store curated educational references, source, date accessed, topic, and summary. AI-generated summaries must link back to source material.

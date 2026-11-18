@@ -2,6 +2,12 @@
 
 These instructions apply to all future development work in this repository.
 
+For Claude and other coding agents, read [`CLAUDE.md`](./CLAUDE.md) first. It defines
+the document hierarchy, status vocabulary, required workflow, and conflict-handling
+rules. Current milestone status is maintained in
+[`docs/PROJECT_STATE.md`](./docs/PROJECT_STATE.md); the detailed M2 contract is
+[`tasks/M2_PORTFOLIO_ACCOUNTING.md`](./tasks/M2_PORTFOLIO_ACCOUNTING.md).
+
 ## Project purpose
 
 Project Aegis is a local, AI-assisted quantitative trading research and paper-trading platform for Indian markets.
@@ -11,14 +17,17 @@ Deterministic Python components handle market data, data validation, strategy re
 ## Mandatory safety rules
 
 - Keep the application in `RESEARCH_ONLY` mode.
-- Do not connect to Zerodha or another broker unless a separate live-readiness phase has been explicitly approved.
+- No broker integration is authorized in the current scope. Do not connect to Zerodha or
+  another broker; any future broker or live-data connection requires its own explicit,
+  separately reviewed approval.
 - Never place live orders.
 - Never access, expose, or request broker credentials.
 - Never weaken risk controls.
 - Do not spend money or subscribe to paid services without explicit approval.
 - Never claim profitability or guaranteed returns.
 - Do not commit or push unless explicitly requested.
-- Never delete or recreate the user's database.
+- Normal application databases must never be deleted or recreated as part of routine
+  development or testing. Tests must use isolated disposable databases.
 - Protect existing research data.
 
 ## Development environment
@@ -49,8 +58,14 @@ Deterministic Python components handle market data, data validation, strategy re
 
 ## Current database
 
-- Schema version: 7.
-- Tables: sources, hypotheses, strategies, experiments, runs, schema_metadata, instruments, data_imports, market_data, data_quality_issues, historical_candles, and import_source_use_history.
+- Schema and migration history are defined in `src/aegis/database.py`; its source
+  constant is not evidence of the user's on-disk database version or contents.
+- Do not access, initialize, migrate, or modify the normal application database without
+  explicit approval for the exact operation. Destructive operations are never implied by
+  general approval. Any exceptional destructive operation requires separate explicit
+  approval identifying the exact database and operation.
+- Do not delete or recreate a normal application database as part of routine
+  development or testing; use isolated disposable databases for tests.
 - Preserve migration history and all existing records.
 - New historical OHLC prices belong in historical_candles as canonical decimal text; do not use SQLite REAL for new financial price storage.
 - The legacy market_data REAL table is preserved and is not used by the CSV importer.
@@ -61,27 +76,37 @@ Deterministic Python components handle market data, data validation, strategy re
 
 ## Current development phase
 
-Phase 1 foundation is complete. The Phase 2 market-data components and deterministic
-Phase 3 Strategy Lab are implemented; Phase 2 remains in progress while verified calendar
-coverage and source-use permissions are outstanding. Phase 3 AI-assisted hypothesis drafting
-and generated-code isolation remain deferred and are not prerequisites for backtesting.
+Use [`docs/PROJECT_STATE.md`](./docs/PROJECT_STATE.md) for the dated milestone snapshot.
+M1B is recorded as accepted, according to project-owner-supplied history, only for
+bounded qualified one-instrument execution; no dated independent acceptance artifact is
+identified in the repository, and full Phase 4 acceptance remains separate. M2-A is
+recorded as accepted according to project-owner-supplied history; no dated independent
+acceptance artifact is identified in the repository. M2-B has owner-reported independent ACCEPT on 2026-11-16 for qualification-only
+scope; the original audit artifact is not yet in the repository. Its schema-provenance
+defect is corrected and requires focused independent review, not automatic reacceptance.
+M2-C is independently accepted for qualified historical per-sleeve M1B composition.
+M2-D is implemented and technically ACCEPTED; distinct-reviewer independent sign-off
+remains pending. These M2-C/M2-D decisions are recorded from project-owner-supplied
+acceptance history; see the evidence limitations in `docs/PROJECT_STATE.md`.
+M2-E has not started and is not authorized. Overall M2 is not accepted; it remains
+historical research/backtesting only.
 
-Phase 4 Backtesting is the current development milestone. An initial deterministic
-implementation exists and must meet the acceptance criteria in `tasks/PHASE_04_BACKTESTING.md`
-before the phase is considered complete.
+The application remains `RESEARCH_ONLY`. Phase 10 forward paper is planned and
+prerequisite-gated; Phase 11 and Phase 12 are future scope. No broker or live trading
+connectivity is authorized. Do not treat roadmap priorities as permission to begin a
+later phase.
 
-Next objectives:
+The full workflow, prohibition list, and status distinctions are in
+[`CLAUDE.md`](./CLAUDE.md) and [`docs/DEVELOPMENT_GUARDRAILS.md`](./docs/DEVELOPMENT_GUARDRAILS.md).
 
-1. Maintain locally verified NSE/BSE session and holiday coverage before using confirmed completeness reports.
-2. Verify market-data source permissions and integrate freshness and quality gates into dependent workflows.
-3. Complete and validate Phase 4 backtesting without weakening data-quality or financial controls.
-4. Keep deferred AI-assisted hypothesis drafting and generated-code review under their separately scoped safety controls.
+## General quality-check baseline
 
-Do not implement Zerodha connectivity yet.
+Task-specific validation restrictions override this general checklist. If the full test
+suite is prohibited, do not run it. Report which checks were and were not executed.
+Never claim completion or acceptance without the required evidence; if required checks
+are prohibited, report the limitation and do not claim completion or acceptance.
 
-## Required quality checks
-
-Run these before declaring a feature complete:
+When permitted and applicable, run these checks before declaring a feature complete:
 
 ```powershell
 python -m pytest -v

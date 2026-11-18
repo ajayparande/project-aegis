@@ -1,5 +1,11 @@
 # Project Vision
 
+> This concise background document is retained for existing links. The canonical
+> product charter and AI researcher-first goals are in
+> [`PROJECT_CHARTER.md`](./PROJECT_CHARTER.md); current implementation status is in
+> [`PROJECT_STATE.md`](./PROJECT_STATE.md). This page does not establish feature status
+> or authorization.
+
 ## Purpose
 Create a transparent, evidence-driven platform that helps a non-expert user research Indian-market trading approaches. AI assists with education, research hypotheses, code explanations and experiment summaries. It does not act as an unchecked financial decision-maker.
 
