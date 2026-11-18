@@ -408,3 +408,126 @@ def test_m3a4c_environment_proxy_is_not_inherited(monkeypatch):
         assert not settings["proxies"]
     finally:
         instance._session.close()
+
+
+def test_m3a4d_transport_exception_redacts_token():
+    import traceback
+
+    token = "AEGIS_TEST_SECRET_TOKEN_9X"
+    session = Mock(spec=requests.Session)
+    session.get.side_effect = requests.ConnectionError(
+        f"synthetic transport failure containing {token}"
+    )
+    instance = UpstoxHistoricalHTTPClient(
+        token,
+        session=session,
+        sleep=lambda _: None,
+        min_request_interval=0,
+        max_attempts=1,
+    )
+
+    with pytest.raises(UpstoxHistoricalHTTPError) as captured:
+        fetch(instance)
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(captured.value),
+            captured.value,
+            captured.value.__traceback__,
+        )
+    )
+    assert token not in rendered
+    assert captured.value.__cause__ is None
+
+
+def test_m3a4d_redirect_is_rejected_without_following():
+    session = Mock(spec=requests.Session)
+    redirect = Mock()
+    redirect.status_code = 302
+    redirect.headers = {"Location": "https://untrusted.example/"}
+    session.get.return_value = redirect
+
+    instance = UpstoxHistoricalHTTPClient(
+        "test-token-do-not-log",
+        session=session,
+        sleep=lambda _: None,
+        min_request_interval=0,
+        max_attempts=1,
+    )
+
+    with pytest.raises(UpstoxHistoricalHTTPError):
+        fetch(instance)
+
+    assert session.get.call_count == 1
+    assert session.get.call_args.kwargs["allow_redirects"] is False
+    redirect.close.assert_called_once()
+
+
+def test_m3a4d_fixed_https_endpoint_and_header():
+    session = Mock(spec=requests.Session)
+    forbidden = Mock()
+    forbidden.status_code = 403
+    forbidden.headers = {}
+    session.get.return_value = forbidden
+
+    token = "AEGIS_TEST_SECRET_TOKEN_9X"
+    instance = UpstoxHistoricalHTTPClient(
+        token,
+        session=session,
+        sleep=lambda _: None,
+        min_request_interval=0,
+        max_attempts=1,
+    )
+
+    with pytest.raises(UpstoxHistoricalHTTPError):
+        fetch(instance)
+
+    args, kwargs = session.get.call_args
+    assert args[0].startswith("https://api.upstox.com/v3/historical-candle/")
+    assert token not in args[0]
+    assert kwargs["headers"]["Authorization"] == f"Bearer {token}"
+    assert kwargs["stream"] is True
+    assert kwargs["allow_redirects"] is False
+    forbidden.close.assert_called_once()
+
+
+def test_m3a4d_http_401_is_sanitized():
+    token = "AEGIS_TEST_SECRET_TOKEN_9X"
+    session = Mock(spec=requests.Session)
+    unauthorized = Mock()
+    unauthorized.status_code = 401
+    unauthorized.headers = {}
+    session.get.return_value = unauthorized
+
+    instance = UpstoxHistoricalHTTPClient(
+        token,
+        session=session,
+        sleep=lambda _: None,
+        min_request_interval=0,
+        max_attempts=1,
+    )
+
+    with pytest.raises(UpstoxHistoricalHTTPError) as captured:
+        fetch(instance)
+
+    assert token not in str(captured.value)
+    unauthorized.close.assert_called_once()
+
+
+def test_m3a4d_owned_session_does_not_inherit_environment(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9876")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:9876")
+
+    instance = UpstoxHistoricalHTTPClient("test-token-do-not-log")
+    try:
+        assert instance._session.trust_env is False
+        settings = instance._session.merge_environment_settings(
+            "https://api.upstox.com/v3/historical-candle/test",
+            {},
+            None,
+            None,
+            None,
+        )
+        assert not settings["proxies"]
+    finally:
+        instance._session.close()
