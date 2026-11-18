@@ -277,3 +277,163 @@ def test_corrupted_decimal_raises_integrity_error(tmp_path: Path):
 
     with pytest.raises(HistoricalCollectionIntegrityError, match="invalid"):
         store.load_verified(**arguments)
+
+
+def test_m3a4e_deeply_nested_json_is_integrity_error(tmp_path: Path):
+    """Untrusted nested JSON must not escape as a raw RecursionError."""
+    from aegis.providers.collection_store import _read_json
+
+    path = tmp_path / "nested.json"
+    path.write_bytes(b"[" * 1500 + b"0" + b"]" * 1500)
+
+    with pytest.raises(HistoricalCollectionIntegrityError):
+        _read_json(path)
+
+
+def test_m3a4e_nonfinite_manifest_is_integrity_error(tmp_path: Path):
+    """NaN in a stored manifest must fail closed with the expected error."""
+    store = HistoricalCollectionStore(tmp_path / "collector")
+    window = CollectionWindow(date(2026, 11, 1), date(2026, 11, 7))
+
+    arguments = {
+        "provider_id": "upstox",
+        "instrument_key": KEY,
+        "interval": "1m",
+        "window": window,
+    }
+
+    store.save(**arguments, batch=_batch(date(2026, 11, 1)))
+
+    manifest_file = next((tmp_path / "collector").rglob("*.manifest.json"))
+    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    manifest["candle_count"] = float("nan")
+
+    corrupted = (
+        json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=True,
+        )
+        + "\n"
+    )
+
+    manifest_file.write_text(corrupted, encoding="utf-8")
+
+    with pytest.raises(
+        HistoricalCollectionIntegrityError,
+        match="invalid JSON values",
+    ):
+        store.load_verified(**arguments)
+
+
+def test_m3a4f_symlinked_ancestor_is_rejected(tmp_path: Path, monkeypatch):
+    """Reject a root beneath a symlinked parent before any collection."""
+    original = Path.is_symlink
+    ancestor = tmp_path / "linked-parent"
+    root = ancestor / "collector"
+
+    def simulated_symlink(path):
+        if path == ancestor:
+            return True
+        return original(path)
+
+    monkeypatch.setattr(Path, "is_symlink", simulated_symlink)
+
+    with pytest.raises(ValueError, match="symbolic links"):
+        HistoricalCollectionStore(root)
+
+    assert not root.exists()
+
+
+def test_m3a4f_real_ancestor_is_allowed(tmp_path: Path):
+    """An ordinary storage root beneath normal directories remains usable."""
+    parent = tmp_path / "ordinary-parent"
+    parent.mkdir()
+    root = parent / "collector"
+
+    store = HistoricalCollectionStore(root)
+
+    assert store.root == root
+    assert not root.exists()
+
+
+def test_m3a4g_reparse_parent_rejected(tmp_path: Path, monkeypatch):
+    """Synthetic Windows junction attribute blocks storage construction."""
+    import stat
+    from types import SimpleNamespace
+
+    parent = tmp_path / "junction-parent"
+    root = parent / "collector"
+    original = Path.lstat
+
+    def synthetic_lstat(path):
+        if path == parent:
+            return SimpleNamespace(
+                st_mode=stat.S_IFDIR,
+                st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+            )
+        return original(path)
+
+    monkeypatch.setattr(Path, "lstat", synthetic_lstat)
+
+    with pytest.raises(ValueError, match="reparse points"):
+        HistoricalCollectionStore(root)
+
+
+def test_m3a4g_reparse_substitution_blocks_load(tmp_path: Path, monkeypatch):
+    """A reparse point introduced after construction blocks reads."""
+    import stat
+    from types import SimpleNamespace
+
+    root = tmp_path / "collector"
+    store = HistoricalCollectionStore(root)
+    original = Path.lstat
+
+    def synthetic_lstat(path):
+        if path == root:
+            return SimpleNamespace(
+                st_mode=stat.S_IFDIR,
+                st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+            )
+        return original(path)
+
+    monkeypatch.setattr(Path, "lstat", synthetic_lstat)
+
+    with pytest.raises(HistoricalCollectionIntegrityError, match="reparse"):
+        store.load_verified(
+            provider_id="upstox",
+            instrument_key=KEY,
+            interval="1m",
+            window=CollectionWindow(date(2026, 11, 1), date(2026, 11, 7)),
+        )
+
+
+def test_m3a4g_reparse_substitution_blocks_save(tmp_path: Path, monkeypatch):
+    """A reparse point introduced after construction blocks writes."""
+    import stat
+    from types import SimpleNamespace
+
+    root = tmp_path / "collector"
+    store = HistoricalCollectionStore(root)
+    original = Path.lstat
+
+    def synthetic_lstat(path):
+        if path == root:
+            return SimpleNamespace(
+                st_mode=stat.S_IFDIR,
+                st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+            )
+        return original(path)
+
+    monkeypatch.setattr(Path, "lstat", synthetic_lstat)
+
+    with pytest.raises(HistoricalCollectionIntegrityError, match="reparse"):
+        store.save(
+            provider_id="upstox",
+            instrument_key=KEY,
+            interval="1m",
+            window=CollectionWindow(date(2026, 11, 1), date(2026, 11, 7)),
+            batch=_batch(date(2026, 11, 1)),
+        )

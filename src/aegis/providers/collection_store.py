@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -125,7 +126,7 @@ def _read_json(path: Path) -> tuple[object, bytes]:
         if len(payload) > _MAX_JSON_BYTES:
             raise HistoricalCollectionIntegrityError("stored window exceeds size limit")
         return json.loads(payload), payload
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
         raise HistoricalCollectionIntegrityError(
             "stored window is unreadable or invalid JSON"
         ) from exc
@@ -206,13 +207,32 @@ def _atomic_new_file(destination: Path, content: bytes) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+def _is_reparse_point(path: Path) -> bool:
+    """Recognize symbolic links and Windows filesystem reparse points."""
+    if path.is_symlink():
+        return True
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    return bool(getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _has_reparse_ancestor(path: Path) -> bool:
+    return any(_is_reparse_point(part) for part in (path, *path.parents))
+
+
 class HistoricalCollectionStore:
     """Locally persisted windows; disk hashes detect accidental damage, not malicious forgery."""
 
     def __init__(self, root: Path) -> None:
         if not isinstance(root, Path):
             raise TypeError("storage root must be a Path")
-        if root.is_symlink() or (root.exists() and not root.is_dir()):
+        # Reject existing symlinks throughout the storage root ancestry.
+        # This is a static path check, not a concurrent-replacement guarantee.
+        if _has_reparse_ancestor(root):
+            raise ValueError("storage root cannot traverse symbolic links or reparse points")
+        if root.exists() and not root.is_dir():
             raise ValueError("storage root must be a real directory")
         self.root = root
 
@@ -229,6 +249,9 @@ class HistoricalCollectionStore:
         self, *, provider_id: str, instrument_key: str, interval: str, window: CollectionWindow
     ) -> HistoricalCandleBatch | None:
         data_path, manifest_path = self._paths(provider_id, instrument_key, interval, window)
+        if _has_reparse_ancestor(data_path) or _has_reparse_ancestor(manifest_path):
+            raise HistoricalCollectionIntegrityError("reparse point in collection storage path")
+
         if (
             self.root.is_symlink()
             or any(
@@ -267,7 +290,13 @@ class HistoricalCollectionStore:
             "calendar_quality_status",
         }:
             raise HistoricalCollectionIntegrityError("stored manifest schema mismatch")
-        if manifest_bytes != _canonical_bytes(manifest):
+        try:
+            canonical_manifest = _canonical_bytes(manifest)
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+            raise HistoricalCollectionIntegrityError(
+                "stored manifest contains invalid JSON values"
+            ) from exc
+        if manifest_bytes != canonical_manifest:
             raise HistoricalCollectionIntegrityError("stored manifest not canonical")
         if type(manifest["version"]) is not int or manifest["version"] != 1:
             raise HistoricalCollectionIntegrityError("unsupported manifest version")
@@ -325,6 +354,9 @@ class HistoricalCollectionStore:
         batch: HistoricalCandleBatch,
     ) -> None:
         data_path, manifest_path = self._paths(provider_id, instrument_key, interval, window)
+        if _has_reparse_ancestor(data_path) or _has_reparse_ancestor(manifest_path):
+            raise HistoricalCollectionIntegrityError("reparse point in collection storage path")
+
         _validate_batch(batch, provider_id, instrument_key, interval, window)
         if (
             self.load_verified(
