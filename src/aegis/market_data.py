@@ -7,10 +7,10 @@ import hashlib
 import io
 import re
 import sqlite3
-from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from collections.abc import Iterable, Iterator
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal
@@ -40,6 +40,12 @@ class SourceUseStatusError(ValueError):
 
 SourceUseStatus = Literal["VERIFIED_PERMITTED", "UNVERIFIED", "PROHIBITED"]
 _SOURCE_USE_STATUSES = frozenset({"VERIFIED_PERMITTED", "UNVERIFIED", "PROHIBITED"})
+
+
+def source_use_is_eligible(statuses: Iterable[str]) -> bool:
+    """Return whether every contributing import is explicitly permitted."""
+
+    return set(statuses) == {"VERIFIED_PERMITTED"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -848,9 +854,10 @@ def list_historical_candles(
     query = """
         SELECT c.id, i.exchange, i.trading_symbol, c.interval, c.candle_timestamp,
                c.open_decimal, c.high_decimal, c.low_decimal, c.close_decimal,
-               c.volume, c.import_id
+               c.volume, c.import_id, d.source_use_status
         FROM historical_candles AS c
         JOIN instruments AS i ON i.id = c.instrument_id
+        LEFT JOIN data_imports AS d ON d.id = c.import_id
     """
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
@@ -858,4 +865,117 @@ def list_historical_candles(
     parameters.append(limit)
     with closing(get_readonly_connection(database_path)) as connection:
         rows = connection.execute(query, parameters).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_historical_candles_in_range(
+    database_path: Path,
+    *,
+    exchange: str,
+    trading_symbol: str,
+    interval: str,
+    start_timestamp: str,
+    end_timestamp: str,
+    limit: int,
+    after_timestamp: str | None = None,
+    after_id: int | None = None,
+    snapshot_max_id: int | None = None,
+    connection: sqlite3.Connection | None = None,
+) -> list[dict[str, object]]:
+    """Return bounded UTC-ordered candles and provenance, optionally on a caller snapshot."""
+
+    if not isinstance(exchange, str) or not exchange.strip():
+        raise ValueError("exchange must be non-empty text.")
+    if not isinstance(trading_symbol, str) or not trading_symbol.strip():
+        raise ValueError("trading_symbol must be non-empty text.")
+    if not isinstance(interval, str) or interval not in SUPPORTED_INTERVALS:
+        raise ValueError(f"interval must be one of {SUPPORTED_INTERVALS}.")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+        raise ValueError("limit must be an integer between 1 and 1000.")
+    if (after_timestamp is None) != (after_id is None):
+        raise ValueError("after_timestamp and after_id must be supplied together.")
+    if after_id is not None and (
+        isinstance(after_id, bool) or not isinstance(after_id, int) or after_id < 1
+    ):
+        raise ValueError("after_id must be a positive integer.")
+    if snapshot_max_id is not None and (
+        isinstance(snapshot_max_id, bool)
+        or not isinstance(snapshot_max_id, int)
+        or snapshot_max_id < 0
+    ):
+        raise ValueError("snapshot_max_id must be a non-negative integer.")
+
+    def parse_bound(value: str, label: str, *, round_up: bool) -> str:
+        if not isinstance(value, str) or _ISO_TIMESTAMP.fullmatch(value) is None:
+            raise ValueError(f"{label} must be an ISO-8601 timestamp with timezone.")
+        raw = value[:-1] + "+00:00" if value.endswith("Z") else value
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be a valid ISO-8601 timestamp.") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(f"{label} must include a timezone offset.")
+        parsed = parsed.astimezone(UTC)
+        if round_up and parsed.microsecond:
+            parsed = parsed.replace(microsecond=0) + timedelta(seconds=1)
+        else:
+            parsed = parsed.replace(microsecond=0)
+        return parsed.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    start = parse_bound(start_timestamp, "start_timestamp", round_up=True)
+    end = parse_bound(end_timestamp, "end_timestamp", round_up=False)
+    after = (
+        parse_bound(after_timestamp, "after_timestamp", round_up=False)
+        if after_timestamp is not None
+        else None
+    )
+    if start > end:
+        return []
+    if after is not None and not start <= after <= end:
+        raise ValueError("after_timestamp must be within the requested timestamp range.")
+    cursor_filter = (
+        " AND (c.candle_timestamp > ? OR (c.candle_timestamp = ? AND c.id > ?))"
+        if after is not None
+        else ""
+    )
+    cursor_values: tuple[object, ...] = (after, after, after_id) if after is not None else ()
+    snapshot_filter = " AND c.id <= ?" if snapshot_max_id is not None else ""
+    snapshot_values: tuple[object, ...] = (snapshot_max_id,) if snapshot_max_id is not None else ()
+
+    connection_context = (
+        nullcontext(connection)
+        if connection is not None
+        else closing(get_readonly_connection(database_path))
+    )
+    with connection_context as active_connection:
+        rows = active_connection.execute(
+            f"""
+            SELECT c.id, i.exchange, i.trading_symbol, c.interval, c.candle_timestamp,
+                   c.open_decimal, c.high_decimal, c.low_decimal, c.close_decimal,
+                   c.volume, c.import_id, d.status AS import_status,
+                   d.source_use_status, d.file_sha256, d.source_id AS source_id,
+                   s.name AS source_name
+            FROM historical_candles AS c
+            JOIN instruments AS i ON i.id = c.instrument_id
+            JOIN data_imports AS d ON d.id = c.import_id
+            LEFT JOIN sources AS s ON s.id = d.source_id
+            WHERE i.exchange = ? COLLATE NOCASE
+              AND i.trading_symbol = ? COLLATE NOCASE
+              AND c.interval = ?
+              AND c.candle_timestamp >= ?
+              AND c.candle_timestamp <= ?{cursor_filter}{snapshot_filter}
+            ORDER BY c.candle_timestamp ASC, c.id ASC
+            LIMIT ?
+            """,
+            (
+                exchange.strip().upper(),
+                trading_symbol.strip().upper(),
+                interval,
+                start,
+                end,
+                *cursor_values,
+                *snapshot_values,
+                limit,
+            ),
+        ).fetchall()
     return [dict(row) for row in rows]

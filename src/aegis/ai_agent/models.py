@@ -110,12 +110,61 @@ class ToolParameter:
             raise ValueError("Parameter minimum must be a finite number.")
         if self.maximum is not None and not _is_finite_numeric(self.maximum):
             raise ValueError("Parameter maximum must be a finite number.")
-        if self.default is not None and self.type_name in {"integer", "number"}:
-            if self.type_name == "integer":
+        if self.default is not None:
+            if self.type_name == "string":
+                if not isinstance(self.default, str):
+                    raise ValueError("String defaults must be strings.")
+                if self.min_length is not None and len(self.default) < self.min_length:
+                    raise ValueError("String default is below its minimum length.")
+                if self.max_length is not None and len(self.default) > self.max_length:
+                    raise ValueError("String default exceeds its maximum length.")
+            elif self.type_name == "integer":
                 if isinstance(self.default, bool) or not isinstance(self.default, int):
                     raise ValueError("Integer defaults must be integers.")
-            elif not _is_finite_numeric(self.default):
-                raise ValueError("Numeric defaults must be finite numbers.")
+                if self.minimum is not None and self.default < self.minimum:
+                    raise ValueError("Integer default is below its minimum.")
+                if self.maximum is not None and self.default > self.maximum:
+                    raise ValueError("Integer default exceeds its maximum.")
+            elif self.type_name == "number":
+                if not _is_finite_numeric(self.default):
+                    raise ValueError("Numeric defaults must be finite numbers.")
+                if self.minimum is not None and Decimal(str(self.default)) < Decimal(
+                    str(self.minimum)
+                ):
+                    raise ValueError("Numeric default is below its minimum.")
+                if self.maximum is not None and Decimal(str(self.default)) > Decimal(
+                    str(self.maximum)
+                ):
+                    raise ValueError("Numeric default exceeds its maximum.")
+            elif self.type_name == "boolean":
+                if not isinstance(self.default, bool):
+                    raise ValueError("Boolean defaults must be booleans.")
+            elif self.type_name == "array":
+                if not isinstance(self.default, list):
+                    raise ValueError("Array defaults must be lists.")
+                if self.min_items is not None and len(self.default) < self.min_items:
+                    raise ValueError("Array default is below its minimum size.")
+                if self.max_items is not None and len(self.default) > self.max_items:
+                    raise ValueError("Array default exceeds its maximum size.")
+                if self.items_type is not None:
+                    for index, item in enumerate(self.default):
+                        if self.items_type == "string" and not isinstance(item, str):
+                            raise ValueError(f"Array default item {index} must be a string.")
+                        if self.items_type == "integer" and (
+                            isinstance(item, bool) or not isinstance(item, int)
+                        ):
+                            raise ValueError(f"Array default item {index} must be an integer.")
+                        if self.items_type == "number" and not _is_finite_numeric(item):
+                            raise ValueError(f"Array default item {index} must be a finite number.")
+                        if self.items_type == "boolean" and not isinstance(item, bool):
+                            raise ValueError(f"Array default item {index} must be a boolean.")
+                        if self.items_type == "object" and not isinstance(item, dict):
+                            raise ValueError(f"Array default item {index} must be an object.")
+            elif self.type_name == "object":
+                if not isinstance(self.default, dict):
+                    raise ValueError("Object defaults must be dictionaries.")
+                if self.max_properties is not None and len(self.default) > self.max_properties:
+                    raise ValueError("Object default exceeds its maximum property count.")
         if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
             raise ValueError("Parameter minimum cannot exceed its maximum.")
         for name, value in (
@@ -167,10 +216,41 @@ class ToolParameter:
             names = [item.name for item in self.properties]
             if len(names) != len(set(names)):
                 raise ValueError("Nested object property names must be unique.")
-        if self.choices is not None and not self.choices:
-            raise ValueError("Parameter choices cannot be empty.")
-        if self.item_choices is not None and not self.item_choices:
-            raise ValueError("Array item choices cannot be empty.")
+        if self.choices is not None:
+            if not self.choices:
+                raise ValueError("Parameter choices cannot be empty.")
+            for choice in self.choices:
+                if self.type_name == "string" and not isinstance(choice, str):
+                    raise ValueError("String choices must be strings.")
+                if self.type_name == "integer" and (
+                    isinstance(choice, bool) or not isinstance(choice, int)
+                ):
+                    raise ValueError("Integer choices must be integers.")
+                if self.type_name == "number" and not _is_finite_numeric(choice):
+                    raise ValueError("Numeric choices must be finite numbers.")
+                if self.type_name == "boolean" and not isinstance(choice, bool):
+                    raise ValueError("Boolean choices must be booleans.")
+                if self.type_name in {"array", "object"}:
+                    raise ValueError("Array and object parameters do not support scalar choices.")
+        if self.item_choices is not None:
+            if not self.item_choices:
+                raise ValueError("Array item choices cannot be empty.")
+            if self.items_type == "string":
+                for choice in self.item_choices:
+                    if not isinstance(choice, str):
+                        raise TypeError("String array item choices must be strings.")
+            elif self.items_type == "integer":
+                for choice in self.item_choices:
+                    if isinstance(choice, bool) or not isinstance(choice, int):
+                        raise TypeError("Integer array item choices must be integers.")
+            elif self.items_type == "number":
+                for choice in self.item_choices:
+                    if not _is_finite_numeric(choice):
+                        raise TypeError("Numeric array item choices must be finite numbers.")
+            elif self.items_type == "boolean":
+                for choice in self.item_choices:
+                    if not isinstance(choice, bool):
+                        raise TypeError("Boolean array item choices must be booleans.")
         if (
             self.max_properties is not None
             and self.type_name != "object"
@@ -203,22 +283,25 @@ class ToolDefinition:
         """Convert tool definition to JSON-schema compatible format for LLMs."""
 
         def parameter_schema(param: ToolParameter) -> dict[str, Any]:
+            def normalize_value(value: Any) -> Any:
+                if isinstance(value, Decimal):
+                    return _json_number(value)
+                if isinstance(value, list):
+                    return [normalize_value(item) for item in value]
+                if isinstance(value, dict):
+                    return {str(key): normalize_value(item) for key, item in value.items()}
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return _json_number(value)
+                return value
+
             param_spec: dict[str, Any] = {
                 "type": param.type_name,
                 "description": param.description,
             }
             if param.choices:
-                param_spec["enum"] = [
-                    _json_number(choice) if isinstance(choice, Decimal) else choice
-                    for choice in param.choices
-                ]
+                param_spec["enum"] = [normalize_value(choice) for choice in param.choices]
             if param.default is not None:
-                param_spec["default"] = (
-                    _json_number(param.default)
-                    if isinstance(param.default, (Decimal, int, float))
-                    and not isinstance(param.default, bool)
-                    else param.default
-                )
+                param_spec["default"] = normalize_value(param.default)
             if param.minimum is not None:
                 param_spec["minimum"] = _json_number(param.minimum)
             if param.maximum is not None:
@@ -242,7 +325,13 @@ class ToolDefinition:
                     )
                 )
                 if param.item_choices:
-                    param_spec["items"]["enum"] = list(param.item_choices)
+                    param_spec["items"]["enum"] = [
+                        _json_number(choice)
+                        if isinstance(choice, (Decimal, int, float))
+                        and not isinstance(choice, bool)
+                        else choice
+                        for choice in param.item_choices
+                    ]
                 if param.min_items is not None:
                     param_spec["minItems"] = param.min_items
                 param_spec["maxItems"] = param.max_items if param.max_items is not None else 100

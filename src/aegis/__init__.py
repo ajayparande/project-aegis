@@ -62,8 +62,18 @@ from aegis.indicators import (
     volume_weighted_average_price,
     weighted_moving_average,
 )
+from aegis.proposals import (
+    PROPOSAL_CONTRACT_VERSION,
+    ProposalContract,
+    ProposalDecision,
+    validate_proposal_contract,
+)
+from aegis.proposals import (
+    ProposalValidationResult as ResearchProposalValidationResult,
+)
 
 __all__ = [
+    "PROPOSAL_CONTRACT_VERSION",
     "AIAgent",
     "Candle",
     "CandlestickPatternError",
@@ -81,12 +91,15 @@ __all__ = [
     "MarketEvidence",
     "MockLLMProvider",
     "PatternResult",
+    "ProposalContract",
+    "ProposalDecision",
     "ProposalExecutionResult",
     "ProposalValidationError",
     "ProposalValidationResult",
     "Quote",
     "QuoteProvider",
     "QuoteResult",
+    "ResearchProposalValidationResult",
     "SessionContext",
     "ToolRegistry",
     "__version__",
@@ -114,6 +127,7 @@ __all__ = [
     "simple_moving_average",
     "stochastic_oscillator",
     "typical_price",
+    "validate_proposal_contract",
     "volume_moving_average",
     "volume_weighted_average_price",
     "weighted_moving_average",

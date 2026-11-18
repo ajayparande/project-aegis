@@ -6,13 +6,15 @@ import json
 import math
 import multiprocessing
 import pickle
+import threading
+import time
 from collections.abc import Callable
-from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from aegis.ai_agent.models import (
+    SecurityViolationError,
     ToolDefinition,
     ToolExecutionError,
     ToolParameter,
@@ -30,6 +32,14 @@ from aegis.candlesticks import (
     detect_price_action,
     prepare_candles,
 )
+from aegis.historical_research import (
+    MAX_INSTRUMENT_RESULTS,
+    MAX_RESEARCH_CANDLE_LIMIT,
+    discover_historical_instruments,
+    inspect_historical_coverage,
+    inspect_historical_data_quality,
+    retrieve_historical_candles,
+)
 from aegis.indicators import (
     average_true_range,
     bollinger_bands,
@@ -42,13 +52,70 @@ from aegis.indicators import (
     volume_weighted_average_price,
 )
 from aegis.instruments import get_instrument, search_instruments
-from aegis.market_data import list_historical_candles
+from aegis.market_data import (
+    SUPPORTED_INTERVALS,
+    list_historical_candles,
+    source_use_is_eligible,
+)
 from aegis.market_quality import (
     CalendarConfigError,
     CalendarRegistry,
-    analyze_dataset,
     load_approved_calendar_registry,
 )
+
+_MIN_TRUNCATED_JSON_LENGTH = len('{"status":"TRUNCATED","complete":false}')
+_TOOL_SUCCESS_STATUS = "OK"
+_TOOL_ERROR_FRAME = b'["ERROR","Tool handler failed; internal details are withheld."]'
+
+
+def _maximum_tool_frame_bytes(max_output_chars: int) -> int:
+    """Bound both worker frames using exact integer arithmetic and ASCII JSON encoding."""
+    if isinstance(max_output_chars, bool) or not isinstance(max_output_chars, int):
+        raise TypeError("max_output_chars must be a positive integer.")
+    if not _MIN_TRUNCATED_JSON_LENGTH <= max_output_chars <= 1_000_000:
+        raise ValueError("max_output_chars is outside the permitted transport range.")
+    # OK has a fixed status and envelope; each output code point can require two
+    # six-byte surrogate escapes. ERROR has a fixed status and fixed message.
+    success_overhead = len(
+        json.dumps([_TOOL_SUCCESS_STATUS, ""], ensure_ascii=True).encode("utf-8")
+    )
+    return max(success_overhead + 12 * max_output_chars, len(_TOOL_ERROR_FRAME))
+
+
+def _bounded_tool_output(output: str, max_output_chars: int) -> str:
+    if len(output) <= max_output_chars:
+        return output
+
+    envelope: dict[str, Any] = {
+        "status": "TRUNCATED",
+        "complete": False,
+        "truncated": True,
+    }
+
+    def compact(value: dict[str, Any]) -> str:
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=True)
+
+    if len(compact(envelope)) > max_output_chars:
+        envelope = {"status": "TRUNCATED", "complete": False}
+    if len(compact(envelope)) > max_output_chars:
+        raise ValueError("max_output_chars cannot fit the truncation envelope.")
+
+    preview_envelope = {**envelope, "preview": ""}
+    if len(compact(preview_envelope)) > max_output_chars:
+        return compact(envelope)
+
+    low = 0
+    high = len(output)
+    best = compact(preview_envelope)
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = compact({**envelope, "preview": output[:middle]})
+        if len(candidate) <= max_output_chars:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
 
 
 def _tool_worker(
@@ -64,15 +131,12 @@ def _tool_worker(
             result = json.dumps(redact_nested_secrets(result), default=str)
         else:
             result = redact_secrets(str(result))
-        truncation_marker = "\n... [OUTPUT TRUNCATED]"
-        if len(result) > max_output_chars:
-            if max_output_chars <= len(truncation_marker):
-                result = truncation_marker[:max_output_chars]
-            else:
-                result = result[: max_output_chars - len(truncation_marker)] + truncation_marker
-        connection.send(("OK", result))
+        result = _bounded_tool_output(result, max_output_chars)
+        connection.send_bytes(
+            json.dumps([_TOOL_SUCCESS_STATUS, result], ensure_ascii=True).encode("utf-8")
+        )
     except Exception:  # noqa: BLE001
-        connection.send(("ERROR", "Tool handler failed; internal details are withheld."))
+        connection.send_bytes(_TOOL_ERROR_FRAME)
     finally:
         connection.close()
 
@@ -88,8 +152,10 @@ class ToolRegistry:
         self._tools: dict[str, tuple[ToolDefinition, Callable[..., Any]]] = {}
         if isinstance(max_output_chars, bool) or not isinstance(max_output_chars, int):
             raise TypeError("max_output_chars must be a positive integer.")
-        if not 0 < max_output_chars <= 1_000_000:
-            raise ValueError("max_output_chars must be between 1 and 1000000.")
+        if not _MIN_TRUNCATED_JSON_LENGTH <= max_output_chars <= 1_000_000:
+            raise ValueError(
+                f"max_output_chars must be between {_MIN_TRUNCATED_JSON_LENGTH} and 1000000."
+            )
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
@@ -127,6 +193,10 @@ class ToolRegistry:
         arguments: dict[str, Any],
         context: dict[str, Any],
     ) -> str:
+        # A readable pipe may contain only a partial frame. Receive on a disposable
+        # reader thread so even an incomplete frame cannot defeat the deadline.
+        deadline = time.monotonic() + self._timeout_seconds
+        max_frame_bytes = _maximum_tool_frame_bytes(self._max_output_chars)
         process_context = multiprocessing.get_context("spawn")
         receiver, sender = process_context.Pipe(duplex=False)
         process = process_context.Process(
@@ -135,30 +205,63 @@ class ToolRegistry:
             daemon=True,
         )
         started = False
+        received = threading.Event()
+        messages: list[bytes | Exception] = []
+        reader: threading.Thread | None = None
+
+        def receive() -> None:
+            try:
+                # Bound the encoded frame independently of the decoded character limit.
+                messages.append(receiver.recv_bytes(max_frame_bytes))
+            except Exception as exc:  # noqa: BLE001
+                messages.append(exc)
+            finally:
+                received.set()
+
         try:
             process.start()
             started = True
             sender.close()
-            process.join(self._timeout_seconds)
+            reader = threading.Thread(target=receive, name="aegis-tool-receiver", daemon=True)
+            reader.start()
+            if not received.wait(max(0.0, deadline - time.monotonic())):
+                raise TimeoutError("Tool execution exceeded its time limit.")
+            message = messages[0]
+            if isinstance(message, Exception):
+                raise RuntimeError("Tool worker transport failed.") from message  # noqa: TRY004
+            try:
+                document = json.loads(message.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+                raise RuntimeError("Tool worker returned an invalid result.") from exc
+            if (
+                type(document) is not list
+                or len(document) != 2
+                or document[0] != _TOOL_SUCCESS_STATUS
+                or type(document[1]) is not str
+                or len(document[1]) > self._max_output_chars
+            ):
+                raise RuntimeError("Tool worker failed; internal details are withheld.")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Tool execution exceeded its time limit.")
+            process.join(max(0.0, deadline - time.monotonic()))
             if process.is_alive():
+                raise TimeoutError("Tool execution exceeded its time limit.")
+            if process.exitcode != 0:
+                raise RuntimeError("Tool worker exited unsuccessfully.")
+            return str(document[1])
+        finally:
+            if started and process.is_alive():
                 process.terminate()
                 process.join(1.0)
                 if process.is_alive():
                     process.kill()
-                    process.join()
-                raise TimeoutError("Tool execution exceeded its time limit.")
-            if not receiver.poll():
-                raise RuntimeError("Tool worker exited without a result.")
-            status, result = receiver.recv()
-            if status != "OK" or not isinstance(result, str):
-                raise RuntimeError("Tool worker failed; internal details are withheld.")
-            return result
-        finally:
+                    process.join(1.0)
             receiver.close()
             sender.close()
-            if started and process.is_alive():
-                process.terminate()
-                process.join(1.0)
+            if reader is not None:
+                reader.join(1.0)
+            if started and not process.is_alive():
+                process.close()
 
     def execute(
         self,
@@ -207,12 +310,7 @@ class ToolRegistry:
             else:
                 output_str = redact_secrets(str(raw_result))
 
-            # Truncate if output exceeds safety limit
-            if len(output_str) > self._max_output_chars:
-                output_str = (
-                    output_str[: self._max_output_chars]
-                    + f"\n... [OUTPUT TRUNCATED: Exceeded {self._max_output_chars} characters]"
-                )
+            output_str = _bounded_tool_output(output_str, self._max_output_chars)
 
             return tag_untrusted_data(output_str, label=tool_name)
 
@@ -225,6 +323,16 @@ class ToolRegistry:
                     }
                 ),
                 label=f"{tool_name}_timeout",
+            )
+        except (SecurityViolationError, TypeError, ValueError) as exc:
+            return tag_untrusted_data(
+                json.dumps(
+                    {
+                        "error": str(exc),
+                        "status": "REJECTED",
+                    }
+                ),
+                label=f"{tool_name}_rejected",
             )
         except Exception:  # noqa: BLE001
             return tag_untrusted_data(
@@ -433,46 +541,75 @@ def _tool_get_dataset_quality_summary(
         calendars = load_approved_calendar_registry(expected_registry=context.get("calendars"))
     except (CalendarConfigError, OSError) as exc:
         raise ValueError("Approved calendar evidence is unavailable or invalid.") from exc
+    report = inspect_historical_data_quality(
+        database_path,
+        exchange=exchange,
+        trading_symbol=symbol,
+        interval=interval,
+        start_date=start_date,
+        end_date=end_date,
+        calendars=calendars,
+    )
+    quality = report["data_quality"]
+    if (
+        quality.get("calendar_status") != "FULL"
+        or quality.get("calendar_confidence") != "CONFIRMED"
+    ):
+        raise ValueError("Quality summaries require full CONFIRMED approved calendar coverage.")
+    expected_candles = quality.get("expected_candles")
+    passes_data_quality_gate = (
+        quality.get("overall_status") == "COMPLETE"
+        and quality.get("calendar_status") == "FULL"
+        and quality.get("calendar_confidence") == "CONFIRMED"
+        and type(expected_candles) is int
+        and expected_candles > 0
+    )
+    source_use_eligibility = report["source_use_eligibility_status"]
+    passes_backtest_gate = passes_data_quality_gate and source_use_eligibility == "PASS"
 
-    try:
-        start_d = date.fromisoformat(start_date)
-        end_d = date.fromisoformat(end_date)
-    except ValueError as exc:
-        raise ValueError(f"Dates must be in ISO format 'YYYY-MM-DD': {exc}") from exc
+    return {
+        "exchange": exchange,
+        "trading_symbol": symbol,
+        "interval": interval,
+        "requested_start": report["requested_start_date"],
+        "requested_end": report["requested_end_date"],
+        "overall_status": quality.get("overall_status"),
+        "data_quality_status": quality.get("status", "UNKNOWN"),
+        "calendar_status": quality.get("calendar_status"),
+        "calendar_confidence": quality.get("calendar_confidence"),
+        "actual_candles": quality.get("actual_candles"),
+        "expected_candles": expected_candles,
+        "missing_candles": quality.get("missing_candle_count"),
+        "duplicate_candles": quality.get("duplicate_identity_count"),
+        "invalid_candles": quality.get("invalid_candle_count"),
+        "completeness_percentage": str(quality.get("completeness_percentage")),
+        "passes_data_quality_gate": passes_data_quality_gate,
+        "source_use_statuses": report["source_use_statuses"],
+        "source_use_eligibility_status": source_use_eligibility,
+        "eligibility_status": report["eligibility_status"],
+        "eligible_for_research": passes_backtest_gate,
+        "passes_backtest_gate": passes_backtest_gate,
+        "reasons": quality.get("warnings", []),
+    }
 
-    report = analyze_dataset(
+
+def _list_research_candles(
+    database_path: Path,
+    *,
+    exchange: str,
+    symbol: str,
+    interval: str,
+    limit: int,
+) -> tuple[list[dict[str, object]], list[str], bool]:
+    candles = list_historical_candles(
         database_path=database_path,
         exchange=exchange,
         trading_symbol=symbol,
         interval=interval,
-        start_date=start_d,
-        end_date=end_d,
-        as_of=datetime.now(UTC),
-        calendars=calendars,
+        limit=limit,
     )
-
-    if report.calendar_status != "FULL" or report.calendar_confidence != "CONFIRMED":
-        raise ValueError("Quality summaries require full CONFIRMED approved calendar coverage.")
-    passes_gate = report.overall_status == "COMPLETE" and report.calendar_status == "FULL"
-
-    return {
-        "exchange": report.exchange,
-        "trading_symbol": report.trading_symbol,
-        "interval": report.interval,
-        "requested_start": report.requested_start,
-        "requested_end": report.requested_end,
-        "overall_status": report.overall_status,
-        "calendar_status": report.calendar_status,
-        "calendar_confidence": report.calendar_confidence,
-        "actual_candles": report.actual_candles,
-        "expected_candles": report.expected_candles,
-        "missing_candles": len(report.missing_timestamps),
-        "duplicate_candles": report.duplicate_identity_count,
-        "invalid_candles": report.invalid_candle_count,
-        "completeness_percentage": str(report.completeness_percentage),
-        "passes_backtest_gate": passes_gate,
-        "reasons": list(report.reasons),
-    }
+    source_statuses = sorted({str(row.get("source_use_status")) for row in candles})
+    return candles, source_statuses, source_use_is_eligible(source_statuses)
 
 
 def _tool_compute_technical_indicators(
@@ -488,10 +625,10 @@ def _tool_compute_technical_indicators(
     database_path: Path = context["database_path"]
     requested_indicators = [ind.lower().strip() for ind in (indicators or ["sma", "rsi"])]
 
-    candle_dicts = list_historical_candles(
-        database_path=database_path,
+    candle_dicts, source_statuses, source_eligible = _list_research_candles(
+        database_path,
         exchange=exchange,
-        trading_symbol=symbol,
+        symbol=symbol,
         interval=interval,
         limit=min(limit, 500),
     )
@@ -505,6 +642,17 @@ def _tool_compute_technical_indicators(
             "message": "No historical candles found in database for the given instrument and interval.",
         }
 
+    if not source_eligible:
+        return {
+            "status": "INELIGIBLE_SOURCE_USE",
+            "symbol": symbol,
+            "exchange": exchange,
+            "interval": interval,
+            "candles_analyzed": 0,
+            "source_use_statuses": source_statuses,
+            "message": "Every contributing import must be declared VERIFIED_PERMITTED.",
+        }
+
     # Stored candles are newest first; prepare_candles sorts and validates chronologically
     candles = prepare_candles(_to_standard_candles(candle_dicts), normalize=True)
 
@@ -516,6 +664,7 @@ def _tool_compute_technical_indicators(
         "first_candle_time": candles[0].timestamp,
         "last_candle_time": candles[-1].timestamp,
         "latest_close": str(candles[-1].close),
+        "source_use_statuses": source_statuses,
         "indicators": {},
     }
 
@@ -616,10 +765,10 @@ def _tool_detect_price_action_patterns(
     """Detect deterministic candlestick and price action patterns over historical candles."""
     database_path: Path = context["database_path"]
 
-    candle_dicts = list_historical_candles(
-        database_path=database_path,
+    candle_dicts, source_statuses, source_eligible = _list_research_candles(
+        database_path,
         exchange=exchange,
-        trading_symbol=symbol,
+        symbol=symbol,
         interval=interval,
         limit=min(limit, 200),
     )
@@ -631,6 +780,17 @@ def _tool_detect_price_action_patterns(
             "interval": interval,
             "patterns_detected": [],
             "message": "No historical candles found in database.",
+        }
+
+    if not source_eligible:
+        return {
+            "status": "INELIGIBLE_SOURCE_USE",
+            "symbol": symbol,
+            "exchange": exchange,
+            "interval": interval,
+            "candles_analyzed": 0,
+            "source_use_statuses": source_statuses,
+            "message": "Every contributing import must be declared VERIFIED_PERMITTED.",
         }
 
     candles = prepare_candles(_to_standard_candles(candle_dicts), normalize=True)
@@ -664,6 +824,7 @@ def _tool_detect_price_action_patterns(
         "exchange": exchange,
         "interval": interval,
         "candles_analyzed": len(candles),
+        "source_use_statuses": source_statuses,
         "total_patterns_detected": len(patterns),
         "recent_patterns": pattern_summaries,
         "price_action_signals": pa_summaries,
@@ -737,6 +898,106 @@ def _tool_get_strategy_experiment_results(
         "total_strategy_experiments": len(experiments),
         "experiments": experiments[:10],
     }
+
+
+def _tool_discover_historical_instruments(
+    interval: str,
+    exchange: str | None = None,
+    trading_symbol: str | None = None,
+    start_timestamp: str | None = None,
+    end_timestamp: str | None = None,
+    minimum_candles: int = 1,
+    quality_status: str = "ANY",
+    limit: int = 50,
+    cursor: str | None = None,
+    *,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return discover_historical_instruments(
+            context["database_path"],
+            interval=interval,
+            exchange=exchange,
+            trading_symbol=trading_symbol,
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+            minimum_candles=minimum_candles,
+            quality_status=quality_status,
+            limit=limit,
+            cursor=cursor,
+        )
+    except (TypeError, ValueError) as exc:
+        return {"status": "REJECTED", "error": str(exc)}
+
+
+def _tool_inspect_historical_coverage(
+    exchange: str,
+    trading_symbol: str,
+    interval: str,
+    start_timestamp: str | None = None,
+    end_timestamp: str | None = None,
+    *,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return inspect_historical_coverage(
+            context["database_path"],
+            exchange=exchange,
+            trading_symbol=trading_symbol,
+            interval=interval,
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+        )
+    except (TypeError, ValueError) as exc:
+        return {"status": "REJECTED", "error": str(exc)}
+
+
+def _tool_retrieve_historical_candles(
+    exchange: str,
+    trading_symbol: str,
+    interval: str,
+    start_timestamp: str,
+    end_timestamp: str,
+    limit: int = 50,
+    cursor: str | None = None,
+    *,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return retrieve_historical_candles(
+            context["database_path"],
+            exchange=exchange,
+            trading_symbol=trading_symbol,
+            interval=interval,
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+            limit=limit,
+            cursor=cursor,
+        )
+    except (TypeError, ValueError) as exc:
+        return {"status": "REJECTED", "error": str(exc)}
+
+
+def _tool_inspect_historical_data_quality(
+    exchange: str,
+    trading_symbol: str,
+    interval: str,
+    start_date: str,
+    end_date: str,
+    *,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return inspect_historical_data_quality(
+            context["database_path"],
+            exchange=exchange,
+            trading_symbol=trading_symbol,
+            interval=interval,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except (TypeError, ValueError) as exc:
+        return {"status": "REJECTED", "error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
@@ -975,6 +1236,259 @@ def create_default_tool_registry(
             permission=ToolPermission.READ_ONLY,
         ),
         _tool_get_strategy_experiment_results,
+    )
+
+    # 7. discover_historical_instruments
+    registry.register(
+        ToolDefinition(
+            name="discover_historical_instruments",
+            description=(
+                "Discover instruments with stored candles and report separate source-use, "
+                "data-quality, and research-eligibility statuses. Results are paginated; "
+                "follow next_cursor until complete is true before treating discovery as exhaustive."
+            ),
+            parameters=(
+                ToolParameter(
+                    name="interval",
+                    type_name="string",
+                    description="Stored candle timeframe.",
+                    choices=SUPPORTED_INTERVALS,
+                ),
+                ToolParameter(
+                    name="exchange",
+                    type_name="string",
+                    description="Optional exact exchange filter (NSE or BSE).",
+                    required=False,
+                    default=None,
+                    choices=("NSE", "BSE"),
+                ),
+                ToolParameter(
+                    name="trading_symbol",
+                    type_name="string",
+                    description="Optional exact trading-symbol filter.",
+                    required=False,
+                    default=None,
+                    min_length=1,
+                    max_length=64,
+                ),
+                ToolParameter(
+                    name="start_timestamp",
+                    type_name="string",
+                    description="Optional inclusive ISO-8601 timestamp with timezone.",
+                    required=False,
+                    default=None,
+                    max_length=40,
+                ),
+                ToolParameter(
+                    name="end_timestamp",
+                    type_name="string",
+                    description="Optional inclusive ISO-8601 timestamp with timezone.",
+                    required=False,
+                    default=None,
+                    max_length=40,
+                ),
+                ToolParameter(
+                    name="minimum_candles",
+                    type_name="integer",
+                    description="Minimum stored records required for discovery.",
+                    required=False,
+                    default=1,
+                    minimum=1,
+                    maximum=1_000_000,
+                ),
+                ToolParameter(
+                    name="quality_status",
+                    type_name="string",
+                    description="Quality filter: ANY, PASS, FAIL, or UNKNOWN.",
+                    required=False,
+                    default="ANY",
+                    choices=("ANY", "PASS", "FAIL", "UNKNOWN"),
+                ),
+                ToolParameter(
+                    name="limit",
+                    type_name="integer",
+                    description=f"Maximum instruments to return (1-{MAX_INSTRUMENT_RESULTS}).",
+                    required=False,
+                    default=50,
+                    minimum=1,
+                    maximum=MAX_INSTRUMENT_RESULTS,
+                ),
+                ToolParameter(
+                    name="cursor",
+                    type_name="string",
+                    description="Opaque continuation cursor from a prior partial discovery result.",
+                    required=False,
+                    default=None,
+                    min_length=1,
+                    max_length=2048,
+                ),
+            ),
+            permission=ToolPermission.READ_ONLY,
+        ),
+        _tool_discover_historical_instruments,
+    )
+
+    # 8. inspect_historical_coverage
+    registry.register(
+        ToolDefinition(
+            name="inspect_historical_coverage",
+            description=(
+                "Inspect first/last candle, stored record count, continuity, source-use status, "
+                "and data-quality eligibility for one instrument and timeframe."
+            ),
+            parameters=(
+                ToolParameter(
+                    name="exchange",
+                    type_name="string",
+                    description="Instrument exchange (NSE or BSE).",
+                    choices=("NSE", "BSE"),
+                ),
+                ToolParameter(
+                    name="trading_symbol",
+                    type_name="string",
+                    description="Exact instrument trading symbol.",
+                    min_length=1,
+                    max_length=64,
+                ),
+                ToolParameter(
+                    name="interval",
+                    type_name="string",
+                    description="Stored candle timeframe.",
+                    choices=SUPPORTED_INTERVALS,
+                ),
+                ToolParameter(
+                    name="start_timestamp",
+                    type_name="string",
+                    description="Optional inclusive ISO-8601 timestamp with timezone.",
+                    required=False,
+                    default=None,
+                    max_length=40,
+                ),
+                ToolParameter(
+                    name="end_timestamp",
+                    type_name="string",
+                    description="Optional inclusive ISO-8601 timestamp with timezone.",
+                    required=False,
+                    default=None,
+                    max_length=40,
+                ),
+            ),
+            permission=ToolPermission.READ_ONLY,
+        ),
+        _tool_inspect_historical_coverage,
+    )
+
+    # 9. retrieve_historical_candles
+    registry.register(
+        ToolDefinition(
+            name="retrieve_historical_candles",
+            description=(
+                "Retrieve a page of at most 100 chronological candles using inclusive "
+                "timezone-aware timestamps. Follow next_cursor while has_more is true; "
+                "all contributing imports must be VERIFIED_PERMITTED."
+            ),
+            parameters=(
+                ToolParameter(
+                    name="exchange",
+                    type_name="string",
+                    description="Instrument exchange (NSE or BSE).",
+                    choices=("NSE", "BSE"),
+                ),
+                ToolParameter(
+                    name="trading_symbol",
+                    type_name="string",
+                    description="Exact instrument trading symbol.",
+                    min_length=1,
+                    max_length=64,
+                ),
+                ToolParameter(
+                    name="interval",
+                    type_name="string",
+                    description="Stored candle timeframe.",
+                    choices=SUPPORTED_INTERVALS,
+                ),
+                ToolParameter(
+                    name="start_timestamp",
+                    type_name="string",
+                    description="Inclusive ISO-8601 start timestamp with timezone.",
+                    max_length=40,
+                ),
+                ToolParameter(
+                    name="end_timestamp",
+                    type_name="string",
+                    description="Inclusive ISO-8601 end timestamp with timezone.",
+                    max_length=40,
+                ),
+                ToolParameter(
+                    name="limit",
+                    type_name="integer",
+                    description=f"Maximum candles to return (1-{MAX_RESEARCH_CANDLE_LIMIT}).",
+                    required=False,
+                    default=50,
+                    minimum=1,
+                    maximum=MAX_RESEARCH_CANDLE_LIMIT,
+                ),
+                ToolParameter(
+                    name="cursor",
+                    type_name="string",
+                    description="Opaque continuation cursor from a prior candle page.",
+                    required=False,
+                    default=None,
+                    min_length=1,
+                    max_length=2048,
+                ),
+            ),
+            permission=ToolPermission.READ_ONLY,
+        ),
+        _tool_retrieve_historical_candles,
+    )
+
+    # 10. inspect_historical_data_quality
+    registry.register(
+        ToolDefinition(
+            name="inspect_historical_data_quality",
+            description=(
+                "Expose the existing local quality report for an exchange-local inclusive "
+                "date range; unavailable calendar confidence remains UNKNOWN."
+            ),
+            parameters=(
+                ToolParameter(
+                    name="exchange",
+                    type_name="string",
+                    description="Instrument exchange (NSE or BSE).",
+                    choices=("NSE", "BSE"),
+                ),
+                ToolParameter(
+                    name="trading_symbol",
+                    type_name="string",
+                    description="Exact instrument trading symbol.",
+                    min_length=1,
+                    max_length=64,
+                ),
+                ToolParameter(
+                    name="interval",
+                    type_name="string",
+                    description="Stored candle timeframe.",
+                    choices=SUPPORTED_INTERVALS,
+                ),
+                ToolParameter(
+                    name="start_date",
+                    type_name="string",
+                    description="Inclusive exchange-local date in YYYY-MM-DD format.",
+                    min_length=10,
+                    max_length=10,
+                ),
+                ToolParameter(
+                    name="end_date",
+                    type_name="string",
+                    description="Inclusive exchange-local date in YYYY-MM-DD format.",
+                    min_length=10,
+                    max_length=10,
+                ),
+            ),
+            permission=ToolPermission.READ_ONLY,
+        ),
+        _tool_inspect_historical_data_quality,
     )
 
     return registry
