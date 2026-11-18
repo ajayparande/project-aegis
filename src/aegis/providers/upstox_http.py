@@ -69,7 +69,13 @@ class UpstoxHistoricalHTTPClient:
             raise ValueError("timeout must contain two positive bounded values")
 
         self._token = access_token
-        self._session = session if session is not None else requests.Session()
+        if session is None:
+            self._session = requests.Session()
+            # Prevent implicit environment proxy, netrc, and CA configuration.
+            self._session.trust_env = False
+        else:
+            # Explicitly injected sessions are trusted caller-owned dependencies.
+            self._session = session
         self._sleep = sleep
         self._timeout = timeout
         self._min_request_interval = float(min_request_interval)

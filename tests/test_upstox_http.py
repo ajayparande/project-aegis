@@ -378,3 +378,33 @@ def test_m2a_actual_elapsed_request_pacing(monkeypatch):
     assert len(request_times) == 2
     assert request_times[1] - request_times[0] >= 2.0
     assert session.get.call_count == 2
+
+
+def test_m3a4c_owned_session_disables_environment_inheritance():
+    """Default HTTP session must not inherit environment transport settings."""
+    instance = UpstoxHistoricalHTTPClient("test-token-do-not-log")
+    try:
+        assert isinstance(instance._session, requests.Session)
+        assert instance._session.trust_env is False
+    finally:
+        instance._session.close()
+
+
+def test_m3a4c_environment_proxy_is_not_inherited(monkeypatch):
+    """Environment proxy configuration must not affect owned sessions."""
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9876")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9876")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:9876")
+
+    instance = UpstoxHistoricalHTTPClient("test-token-do-not-log")
+    try:
+        settings = instance._session.merge_environment_settings(
+            "https://api.upstox.com/v3/historical-candle/test",
+            {},
+            None,
+            None,
+            None,
+        )
+        assert not settings["proxies"]
+    finally:
+        instance._session.close()
