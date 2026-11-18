@@ -1,9 +1,11 @@
 """Deterministic tests for local exchange calendars and market-data quality."""
 
 import json
+import pickle
 import sqlite3
 from collections import UserDict
 from contextlib import closing
+from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from pathlib import Path
@@ -11,7 +13,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from aegis import portfolio_qualification
 from aegis.database import get_connection, initialize_database
+from aegis.forward_paper_trading import ForwardTradingError, _resolve_calendar_registry
 from aegis.instruments import InstrumentInput, register_instrument
 from aegis.market_data import import_ohlcv_csv
 from aegis.market_quality import (
@@ -24,6 +28,7 @@ from aegis.market_quality import (
     StalenessPolicy,
     analyze_dataset,
     calculate_expected_candles,
+    load_approved_calendar_registry,
     load_calendar_registry,
 )
 from aegis.strategy_lab import _calendar_document, _calendar_registry_hash
@@ -137,6 +142,66 @@ def test_nse_cash_calendar_candidate_covers_only_2025_and_2026() -> None:
     assert calendar.coverage_end == date(2026, 12, 31)
     assert calendar.sessions_for(date(2027, 1, 4)) is None
     assert registry.resolve("NSE", "NFO") is None
+
+
+def test_calendar_dataclasses_defensively_freeze_nested_collections(tmp_path: Path) -> None:
+    registry = write_registry(tmp_path, calendar_entry())
+    base_calendar = registry.resolve("NSE", "NSE")
+    assert base_calendar is not None
+
+    special_day = date(2026, 1, 5)
+    window = SessionWindow(time(9, 15), time(9, 30))
+    nested_windows = [window]
+    special = SpecialSession(nested_windows, "synthetic special session")
+    holidays = {special_day: "synthetic closure"}
+    special_sessions = {special_day: special}
+    weekdays = {0, 1}
+    regular_sessions = [window]
+    calendar = replace(
+        base_calendar,
+        weekdays=weekdays,
+        sessions=regular_sessions,
+        holidays=holidays,
+        special_sessions=special_sessions,
+    )
+    registry_calendars = [calendar]
+    detached_registry = replace(registry, calendars=registry_calendars)
+    serialized_calendar = portfolio_qualification._registry_document(detached_registry)
+
+    nested_windows.clear()
+    holidays[special_day] = "changed source mapping"
+    special_sessions.clear()
+    weekdays.clear()
+    regular_sessions.clear()
+    registry_calendars.clear()
+
+    assert type(calendar.weekdays) is tuple
+    assert calendar.weekdays == (0, 1)
+    assert type(calendar.sessions) is tuple
+    assert calendar.sessions == (window,)
+    assert type(special.sessions) is tuple
+    assert special.sessions == (window,)
+    assert type(detached_registry.calendars) is tuple
+    assert detached_registry.calendars == (calendar,)
+    assert calendar.holidays[special_day] == "synthetic closure"
+    assert calendar.special_sessions[special_day].sessions == (window,)
+    assert calendar.sessions_for(special_day) == (window,)
+    assert portfolio_qualification._registry_document(detached_registry) == serialized_calendar
+
+    with pytest.raises(TypeError):
+        calendar.holidays[special_day] = "mutated"
+    with pytest.raises(TypeError):
+        calendar.special_sessions[special_day] = special
+    with pytest.raises(FrozenInstanceError):
+        special.sessions[0].opens = time(10, 0)
+    with pytest.raises(TypeError, match="SessionWindow"):
+        replace(calendar, sessions=[object()])
+    with pytest.raises(ValueError, match="weekdays"):
+        replace(calendar, weekdays=[0, True])
+    with pytest.raises(TypeError, match="tuple or list"):
+        SpecialSession({window}, "unsupported unordered sessions")
+    with pytest.raises(TypeError, match="ExchangeCalendar"):
+        CalendarRegistry([object()])
 
 
 @pytest.mark.parametrize(
@@ -357,6 +422,97 @@ def test_calendar_registry_constructor_validates_provenance_and_detaches_input(
     assert normalized.configuration_path == existing_path.resolve()
 
 
+def test_immutable_calendar_registry_can_cross_process_boundary() -> None:
+    calendar = direct_calendar(
+        holidays={date(2026, 1, 6): "closure"},
+        special_sessions={
+            date(2026, 1, 7): SpecialSession(
+                [SessionWindow(time(9, 15), time(10, 0))], "special session"
+            ),
+            date(2026, 1, 8): SpecialSessionClosure("exceptional full-day closure"),
+        },
+    )
+    registry = CalendarRegistry([calendar])
+
+    restored = pickle.loads(pickle.dumps(registry))
+
+    assert restored == registry
+    assert restored.calendars[0].special_sessions == calendar.special_sessions
+    restored_fingerprint = portfolio_qualification._canonical_hash(
+        portfolio_qualification._registry_document(restored)
+    )
+    original_fingerprint = portfolio_qualification._canonical_hash(
+        portfolio_qualification._registry_document(registry)
+    )
+    assert restored_fingerprint == original_fingerprint
+    with pytest.raises(TypeError):
+        restored.calendars[0].holidays[date(2026, 1, 6)] = "mutated"
+
+
+def test_direct_calendar_serialization_matches_loaded_schedule(tmp_path: Path) -> None:
+    loaded_registry = write_registry(
+        tmp_path,
+        calendar_entry(
+            start="2026-01-05",
+            end="2026-01-09",
+            holidays=[{"date": "2026-01-06", "reason": "verified closure"}],
+            special_sessions=[
+                {
+                    "date": "2026-01-08",
+                    "reason": "verified exceptional closure",
+                    "closed": True,
+                },
+                {
+                    "date": "2026-01-07",
+                    "reason": "verified special trading",
+                    "sessions": [{"open": "09:15", "close": "10:00"}],
+                },
+            ],
+        ),
+    )
+    loaded_calendar = loaded_registry.resolve("NSE", "NSE")
+    assert loaded_calendar is not None
+    direct = direct_calendar(
+        exchange=loaded_calendar.exchange,
+        segment=loaded_calendar.segment,
+        timezone_name=loaded_calendar.timezone_name,
+        confidence=loaded_calendar.confidence,
+        coverage_start=loaded_calendar.coverage_start,
+        coverage_end=loaded_calendar.coverage_end,
+        source=loaded_calendar.source,
+        weekdays=loaded_calendar.weekdays,
+        sessions=loaded_calendar.sessions,
+        holidays=dict(loaded_calendar.holidays),
+        special_sessions=dict(loaded_calendar.special_sessions),
+    )
+    direct_registry = CalendarRegistry(
+        [direct],
+        loaded_registry.staleness_policy,
+        loaded_registry.configuration_sha256,
+        loaded_registry.configuration_path,
+    )
+
+    assert portfolio_qualification._registry_document(direct_registry) == (
+        portfolio_qualification._registry_document(loaded_registry)
+    )
+    assert direct.sessions_for(date(2026, 1, 6)) == loaded_calendar.sessions_for(date(2026, 1, 6))
+    assert direct.sessions_for(date(2026, 1, 7)) == loaded_calendar.sessions_for(date(2026, 1, 7))
+    assert direct.sessions_for(date(2026, 1, 8)) == loaded_calendar.sessions_for(date(2026, 1, 8))
+    assert calculate_expected_candles(
+        direct,
+        "1m",
+        date(2026, 1, 5),
+        date(2026, 1, 5),
+        as_of=datetime(2026, 1, 5, 10, 0, tzinfo=UTC),
+    ) == calculate_expected_candles(
+        loaded_calendar,
+        "1m",
+        date(2026, 1, 5),
+        date(2026, 1, 5),
+        as_of=datetime(2026, 1, 5, 10, 0, tzinfo=UTC),
+    )
+
+
 def test_json_loading_rejects_empty_regular_and_special_sessions(tmp_path: Path) -> None:
     with pytest.raises(CalendarConfigError, match="at least one session window"):
         write_registry(tmp_path, calendar_entry(sessions=[]))
@@ -427,6 +583,110 @@ def test_json_loading_rejects_empty_regular_and_special_sessions(tmp_path: Path)
 def test_calendar_json_loader_rejects_missing_file(tmp_path: Path) -> None:
     with pytest.raises(CalendarConfigError, match="does not exist"):
         load_calendar_registry(tmp_path / "missing.json")
+
+
+def test_json_closed_special_entry_preserves_exceptional_closure_identity(
+    tmp_path: Path,
+) -> None:
+    registry = write_registry(
+        tmp_path,
+        calendar_entry(
+            start="2026-01-05",
+            end="2026-01-09",
+            special_sessions=[
+                {
+                    "date": "2026-01-06",
+                    "reason": "verified exceptional closure",
+                    "closed": True,
+                }
+            ],
+        ),
+    )
+    calendar = registry.resolve("NSE", "NSE")
+    assert calendar is not None
+    closure = calendar.special_sessions[date(2026, 1, 6)]
+    assert type(closure) is SpecialSessionClosure
+    assert closure.reason == "verified exceptional closure"
+    assert date(2026, 1, 6) not in calendar.holidays
+    assert calendar.sessions_for(date(2026, 1, 6)) == ()
+    assert portfolio_qualification._registry_document(registry)["calendars"][0][
+        "special_sessions"
+    ] == [
+        {
+            "date": "2026-01-06",
+            "reason": "verified exceptional closure",
+            "closed": True,
+        }
+    ]
+    assert _calendar_document(calendar)["special_sessions"] == [
+        {
+            "date": "2026-01-06",
+            "reason": "verified exceptional closure",
+            "closed": True,
+        }
+    ]
+
+    canonical_calendar = _calendar_document(calendar)
+    serialized_entry = dict(canonical_calendar)
+    serialized_entry["sessions"] = [
+        {
+            "open": time.fromisoformat(str(session["opens"])).isoformat(timespec="minutes"),
+            "close": time.fromisoformat(str(session["closes"])).isoformat(timespec="minutes"),
+        }
+        for session in canonical_calendar["sessions"]
+    ]
+    serialized_specials: list[dict[str, object]] = []
+    for special in canonical_calendar["special_sessions"]:
+        if special.get("closed") is True:
+            serialized_specials.append(
+                {
+                    "date": special["date"],
+                    "reason": special["reason"],
+                    "closed": True,
+                }
+            )
+        else:
+            serialized_specials.append(
+                {
+                    "date": special["date"],
+                    "reason": special["reason"],
+                    "sessions": [
+                        {
+                            "open": time.fromisoformat(str(session["opens"])).isoformat(
+                                timespec="minutes"
+                            ),
+                            "close": time.fromisoformat(str(session["closes"])).isoformat(
+                                timespec="minutes"
+                            ),
+                        }
+                        for session in special["sessions"]
+                    ],
+                }
+            )
+    serialized_entry["special_sessions"] = serialized_specials
+    round_trip_registry = write_registry(tmp_path, serialized_entry)
+    round_trip_calendar = round_trip_registry.resolve("NSE", "NSE")
+
+    assert round_trip_calendar is not None
+    assert _calendar_document(round_trip_calendar) == canonical_calendar
+
+
+def test_closure_and_holiday_have_distinct_canonical_fingerprints() -> None:
+    closure_calendar = direct_calendar(
+        special_sessions={
+            date(2026, 1, 6): SpecialSessionClosure("verified closure"),
+        }
+    )
+    holiday_calendar = direct_calendar(
+        holidays={date(2026, 1, 6): "verified closure"},
+    )
+    closure_registry = CalendarRegistry([closure_calendar])
+    holiday_registry = CalendarRegistry([holiday_calendar])
+
+    assert _calendar_registry_hash(closure_registry) != _calendar_registry_hash(holiday_registry)
+    assert portfolio_qualification._registry_document(closure_registry) != (
+        portfolio_qualification._registry_document(holiday_registry)
+    )
 
 
 def test_special_sessions_keep_precedence_over_holidays() -> None:
@@ -502,6 +762,33 @@ def test_valid_calendar_entry_points_preserve_schedule_and_fingerprints(tmp_path
     assert _calendar_registry_hash(CalendarRegistry((direct,))) == (
         _calendar_registry_hash(CalendarRegistry((loaded,)))
     )
+
+
+def test_forward_calendar_resolution_reloads_only_the_approved_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    approved_dir = tmp_path / "approved"
+    alternate_dir = tmp_path / "alternate"
+    approved_dir.mkdir()
+    alternate_dir.mkdir()
+    approved = write_registry(approved_dir, calendar_entry())
+    alternate = write_registry(
+        alternate_dir,
+        calendar_entry(source="Caller-selected calendar; not application-approved"),
+    )
+    assert approved.configuration_path is not None
+    monkeypatch.setenv("AEGIS_CALENDAR_CONFIG_PATH", str(approved.configuration_path))
+
+    resolved = _resolve_calendar_registry(approved)
+    assert resolved.configuration_sha256 == approved.configuration_sha256
+    assert resolved.configuration_path == approved.configuration_path
+
+    forged = replace(approved, calendars=alternate.calendars)
+    assert _resolve_calendar_registry(forged).calendars == approved.calendars
+    assert load_approved_calendar_registry(expected_registry=forged).calendars == approved.calendars
+
+    with pytest.raises(ForwardTradingError, match="administrator-approved application path"):
+        _resolve_calendar_registry(alternate)
 
 
 @pytest.mark.parametrize(

@@ -26,9 +26,10 @@ from aegis.forward_paper_trading import (
     DecisionAction,
     DecisionProposal,
     ForwardPaperTradingEngine,
+    ForwardTradingError,
     MarketEvidence,
     ProposalExecutionResult,
-    ProposalValidationError,
+    ProposalValidationError,  # noqa: F401 -- retain the existing module-level export
     _proposal_canonical_json,
     _proposal_sha256,
 )
@@ -2045,7 +2046,7 @@ class ForwardRuntimeService:
                 event_id=event_id,
                 proposal_id=proposal.proposal_id,
             )
-        except (ForwardRuntimeError, ProposalValidationError) as exc:
+        except (ForwardRuntimeError, ForwardTradingError) as exc:
             result = ProposalExecutionResult(proposal.proposal_id, "REJECTED", reason=str(exc))
             evidence = None
         snapshot_reason = (
@@ -2078,7 +2079,7 @@ class ForwardRuntimeService:
                         snapshot.as_of if snapshot is not None else str(event["decision_timestamp"])
                     ),
                 )
-            except (ProposalValidationError, PaperTradingError) as exc:
+            except (ForwardTradingError, PaperTradingError) as exc:
                 result = ProposalExecutionResult(proposal.proposal_id, "REJECTED", reason=str(exc))
         result_json = _canonical_json(
             {
