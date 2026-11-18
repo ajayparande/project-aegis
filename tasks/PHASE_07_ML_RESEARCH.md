@@ -33,10 +33,10 @@ quality/calendar-unready data, uses chronological purged partitions, and reports
 classifier diagnostics. `tests/test_ml_research.py` uses explicitly synthetic fixtures to
 verify these code paths. The harness does not write to SQLite or persist fitted models.
 
-Phase 7 acceptance remains pending. The local database currently has no historical-candle
-table or imports, and the checked-in exchange calendar is empty. Therefore there is no
-permitted, quality-gated dataset with which to evaluate strategy returns after realistic
-costs, perform a credible untouched out-of-sample comparison, or establish robust ML value.
+Phase 7 acceptance remains pending. The normal database contents are unknown and were
+not inspected. The checked-in source-backed calendar candidate is CONFIGURED, not
+independently CONFIRMED. Suitable permitted, quality-gated data and a frozen holdout
+workflow remain prerequisites for cost-aware strategy evaluation and robust ML claims.
 Synthetic results are implementation tests only, not evidence of predictive performance.
 No market-data permissions or calendar completeness are inferred. The remaining unchecked
 criteria above require an appropriately verified dataset and explicit cost assumptions;
