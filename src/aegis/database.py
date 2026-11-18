@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 PHASE_1_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -710,6 +710,114 @@ ON data_imports (file_sha256, requested_exchange, requested_trading_symbol, inte
         """,
     ),
 }
+
+
+# Additive journal migration; prior migration definitions remain unchanged.
+MIGRATIONS[15] = (
+    """
+    CREATE TABLE decision_journal_events (
+        decision_id TEXT PRIMARY KEY NOT NULL CHECK(length(decision_id) = 64 AND decision_id NOT GLOB '*[^0-9a-f]*'),
+        logical_key TEXT NOT NULL UNIQUE CHECK(logical_key = decision_id),
+        run_id TEXT NOT NULL CHECK(length(run_id) BETWEEN 1 AND 256),
+        event_id TEXT NOT NULL CHECK(length(event_id) BETWEEN 1 AND 256),
+        strategy_id TEXT NOT NULL CHECK(length(strategy_id) BETWEEN 1 AND 256),
+        strategy_version TEXT NOT NULL CHECK(length(strategy_version) BETWEEN 1 AND 256),
+        instrument_id INTEGER NOT NULL CHECK(instrument_id > 0),
+        paper_account_id INTEGER,
+        state TEXT NOT NULL CHECK(state IN ('BUY','SELL','HOLD','BLOCKED','NO_DECISION')),
+        role TEXT NOT NULL CHECK(role IN ('ACTIVE','SHADOW')),
+        decision_at TEXT NOT NULL CHECK(length(decision_at) = 27 AND substr(decision_at,-1) = 'Z'),
+        payload_json TEXT NOT NULL CHECK(length(payload_json) BETWEEN 2 AND 16384 AND json_valid(payload_json)),
+        payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256) = 64),
+        created_at TEXT NOT NULL,
+        CHECK(json_extract(payload_json, '$.schema_version') IS 1
+          AND json_extract(payload_json, '$.run_id') IS run_id
+          AND json_extract(payload_json, '$.event_id') IS event_id
+          AND json_extract(payload_json, '$.instrument_id') IS instrument_id
+          AND json_extract(payload_json, '$.strategy_id') IS strategy_id
+          AND json_extract(payload_json, '$.strategy_version') IS strategy_version
+          AND json_extract(payload_json, '$.state') IS state
+          AND json_extract(payload_json, '$.role') IS role
+          AND json_extract(payload_json, '$.decision_at') IS decision_at
+          AND json_extract(payload_json, '$.created_at') IS created_at),
+        FOREIGN KEY(instrument_id) REFERENCES instruments(id),
+        FOREIGN KEY(paper_account_id) REFERENCES paper_accounts(id)
+    )
+    """,
+    "CREATE INDEX idx_journal_run_time ON decision_journal_events(run_id, decision_at, decision_id)",
+    """
+    CREATE TABLE decision_journal_audits (
+        audit_id TEXT PRIMARY KEY NOT NULL CHECK(length(audit_id) = 64),
+        decision_id TEXT NOT NULL,
+        stage TEXT NOT NULL CHECK(stage IN ('PERSISTED','VALIDATION','EXECUTION','TIMING','RECOVERY')),
+        attempt_key TEXT NOT NULL DEFAULT '' CHECK(length(attempt_key) <= 64),
+        status TEXT NOT NULL CHECK(status IN ('PENDING','ALLOWED','FILLED','REJECTED','HOLD','BLOCKED','NO_DECISION')),
+        order_id TEXT,
+        fill_id TEXT,
+        payload_json TEXT NOT NULL CHECK(length(payload_json) BETWEEN 2 AND 16384),
+        payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256) = 64),
+        created_at TEXT NOT NULL,
+        UNIQUE(decision_id, stage, attempt_key),
+        FOREIGN KEY(decision_id) REFERENCES decision_journal_events(decision_id),
+        FOREIGN KEY(order_id) REFERENCES paper_orders(order_id),
+        FOREIGN KEY(fill_id) REFERENCES paper_fills(fill_id)
+    )
+    """,
+    """
+    CREATE TABLE decision_journal_outcomes (
+        outcome_id TEXT PRIMARY KEY NOT NULL CHECK(length(outcome_id) = 64),
+        decision_id TEXT NOT NULL,
+        horizon_minutes INTEGER NOT NULL CHECK(typeof(horizon_minutes) = 'integer' AND horizon_minutes BETWEEN 1 AND 1440),
+        horizon_kind TEXT NOT NULL CHECK(horizon_kind IN ('TRADING_MINUTES','WALL_MINUTES')),
+        evaluation_version TEXT NOT NULL CHECK(length(evaluation_version) BETWEEN 1 AND 128),
+        coverage_status TEXT NOT NULL CHECK(coverage_status IN ('COMPLETE','INCOMPLETE','UNAVAILABLE')),
+        as_of_end TEXT NOT NULL,
+        evaluated_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL CHECK(length(payload_json) BETWEEN 2 AND 16384),
+        payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256) = 64),
+        supersedes_outcome_id TEXT,
+        FOREIGN KEY(decision_id) REFERENCES decision_journal_events(decision_id),
+        FOREIGN KEY(supersedes_outcome_id) REFERENCES decision_journal_outcomes(outcome_id)
+    )
+    """,
+    """
+    CREATE TABLE decision_journal_health (
+        event_id TEXT PRIMARY KEY NOT NULL CHECK(length(event_id) = 64),
+        run_id TEXT NOT NULL CHECK(length(run_id) BETWEEN 1 AND 256),
+        kind TEXT NOT NULL CHECK(length(kind) BETWEEN 1 AND 64),
+        payload_json TEXT NOT NULL CHECK(length(payload_json) BETWEEN 2 AND 16384),
+        payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256) = 64),
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE decision_journal_manifests (
+        run_id TEXT PRIMARY KEY NOT NULL CHECK(length(run_id) BETWEEN 1 AND 256),
+        payload_json TEXT NOT NULL CHECK(length(payload_json) BETWEEN 2 AND 16384),
+        payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256) = 64),
+        created_at TEXT NOT NULL
+    )
+    """,
+    *(
+        statement
+        for table, key in (
+            ("decision_journal_events", "decision_id"),
+            ("decision_journal_audits", "audit_id"),
+            ("decision_journal_outcomes", "outcome_id"),
+            ("decision_journal_health", "event_id"),
+            ("decision_journal_manifests", "run_id"),
+        )
+        for statement in (
+            f"""CREATE TRIGGER {table}_no_update BEFORE UPDATE ON {table}
+                BEGIN SELECT RAISE(ABORT, 'journal records are immutable'); END""",
+            f"""CREATE TRIGGER {table}_no_delete BEFORE DELETE ON {table}
+                BEGIN SELECT RAISE(ABORT, 'journal records are append-only'); END""",
+            f"""CREATE TRIGGER {table}_no_replace BEFORE INSERT ON {table}
+                WHEN EXISTS(SELECT 1 FROM {table} WHERE {key} = NEW.{key})
+                BEGIN SELECT RAISE(ABORT, 'journal identity already exists'); END""",
+        )
+    ),
+)
 
 
 def _execute_statements(connection: sqlite3.Connection, script: str) -> None:

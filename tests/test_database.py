@@ -42,6 +42,11 @@ ALL_TABLES = {
     "forward_execution_authorizations",
     "forward_trade_controls",
     "paper_execution_snapshot_uses",
+    "decision_journal_events",
+    "decision_journal_audits",
+    "decision_journal_outcomes",
+    "decision_journal_health",
+    "decision_journal_manifests",
 }
 
 
@@ -1502,7 +1507,7 @@ def test_version_15_migration_installs_event_insert_guards_idempotently(tmp_path
                    )"""
             )
         }
-    assert first_status["schema_version"] == 15
+    assert first_status["schema_version"] == database.SCHEMA_VERSION
     assert triggers == {
         "authorize_forward_scheduler_event_insert",
         "consume_forward_scheduler_event_insert",
@@ -1561,7 +1566,7 @@ def test_version_15_migration_failure_rolls_back_insert_guards_and_marker(tmp_pa
         connection.execute("DROP TRIGGER reject_schema_version_15")
         connection.commit()
     initialize_database(database_path)
-    assert get_database_status(database_path)["schema_version"] == 15
+    assert get_database_status(database_path)["schema_version"] == database.SCHEMA_VERSION
 
 
 def test_version_13_migration_failure_rolls_back_marker_and_preserves_v12_data(

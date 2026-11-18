@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from collections.abc import Generator, Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 from zoneinfo import ZoneInfo
 
+from aegis import decision_journal
 from aegis.database import (
     _authorize_scheduler_event_write,
     _SchedulerEventWrite,
@@ -28,6 +30,7 @@ from aegis.forward_paper_trading import (
     ProposalExecutionResult,
     ProposalValidationError,
     _proposal_canonical_json,
+    _proposal_sha256,
 )
 from aegis.market_quality import CalendarRegistry, analyze_dataset
 from aegis.paper_trading import (
@@ -237,6 +240,8 @@ class ForwardRuntimeService:
         self.max_execution_price_deviation = max_execution_price_deviation
         self._state = state
         self._scheduler_dirty = False
+        self._journal_recovery_error = False
+        self._proposal_timings: dict[str, tuple[str, int]] = {}
 
     @classmethod
     def create(
@@ -410,6 +415,14 @@ class ForwardRuntimeService:
                            VALUES (?, ?, ?, ?)""",
                         (runtime_id, instrument_id, interval, import_id),
                     )
+            cls._journal_health(
+                connection,
+                runtime_id,
+                "startup",
+                "STARTED",
+                timestamp,
+                {"configuration_fingerprint": config_hash, "mode": "RESEARCH_ONLY"},
+            )
         return cls(
             database_path,
             runtime_id,
@@ -526,7 +539,11 @@ class ForwardRuntimeService:
         try:
             service._recover_exit_controls()
             service.recover_scheduler_events()
-        except (ForwardRuntimeError, PaperTradingError, sqlite3.Error) as exc:
+        except (
+            ForwardRuntimeError,
+            PaperTradingError,
+            sqlite3.Error,
+        ) as exc:
             cls._set_halted(
                 database_path,
                 runtime_id,
@@ -536,6 +553,20 @@ class ForwardRuntimeService:
             raise ForwardRuntimeError(
                 "Forward runtime recovery failed; runtime remains halted."
             ) from exc
+        service._journal_recovery_error = False
+        try:
+            decision_journal.recover_order_links(database_path, runtime_id)
+            decision_journal.record_health(
+                database_path,
+                runtime_id,
+                f"restart:{_timestamp_text(datetime.now(UTC))}",
+                "RESTART_RECONCILED",
+                _timestamp_text(datetime.now(UTC)),
+                {"financial_ledger": "RECONCILED"},
+            )
+        except (decision_journal.JournalError, sqlite3.Error):
+            # Supplemental recovery blocks new entries, never protective exits.
+            service._journal_recovery_error = True
         with _transaction(database_path) as connection:
             connection.execute(
                 "UPDATE forward_runtimes SET status = 'RUNNING', updated_at = ? WHERE runtime_id = ?",
@@ -560,6 +591,26 @@ class ForwardRuntimeService:
         }
 
     @staticmethod
+    def _journal_health(
+        connection: sqlite3.Connection,
+        runtime_id: str,
+        event_id: str,
+        kind: str,
+        timestamp: str,
+        details: dict[str, Any],
+    ) -> None:
+        """Supplemental health recording cannot undo a halt or delay a protective exit."""
+        connection.execute("SAVEPOINT journal_health")
+        try:
+            decision_journal._append_health(
+                connection, runtime_id, event_id, kind, timestamp, details
+            )
+        except (decision_journal.JournalError, sqlite3.Error):
+            connection.execute("ROLLBACK TO journal_health")
+        finally:
+            connection.execute("RELEASE journal_health")
+
+    @staticmethod
     def _halt(
         connection: sqlite3.Connection, runtime_id: str, account_id: int, reason: str
     ) -> None:
@@ -579,6 +630,15 @@ class ForwardRuntimeService:
                    halt_class = 'INTEGRITY' WHERE id = ?""",
                 (reason, account_id),
             )
+        timestamp = _timestamp_text(datetime.now(UTC))
+        ForwardRuntimeService._journal_health(
+            connection,
+            runtime_id,
+            f"halt:{timestamp}",
+            "INTEGRITY_HALT",
+            timestamp,
+            {"reason_fingerprint": hashlib.sha256(reason.encode()).hexdigest()},
+        )
 
     @classmethod
     def _set_halted(
@@ -1100,6 +1160,14 @@ class ForwardRuntimeService:
                 self.runtime_id,
             ),
         )
+        self._journal_health(
+            connection,
+            self.runtime_id,
+            _stable_id(f"rejection:{quote.instrument_id}:{quote.event_id}"),
+            "QUOTE_REJECTED",
+            _timestamp_text(received_at),
+            {"reason_fingerprint": hashlib.sha256(reason.encode()).hexdigest()},
+        )
 
     def monitor_feed_health(self, as_of: str | datetime) -> tuple[FeedHealth, ...]:
         """Evaluate per-instrument feed health using configured age thresholds."""
@@ -1182,6 +1250,19 @@ class ForwardRuntimeService:
                 ),
             )
             self._state = state
+            for health in result:
+                if health.status in {"STARTING", "STALE", "DISCONNECTED", "DEGRADED"}:
+                    decision_journal.record_missing_evaluation(
+                        connection,
+                        self.runtime_id,
+                        health.instrument_id,
+                        _stable_id(
+                            f"health:{self.runtime_id}:{health.instrument_id}:{_timestamp_text(current)}"
+                        ),
+                        _timestamp_text(current),
+                        "FEED_UNAVAILABLE",
+                        self.account_id,
+                    )
         return tuple(result)
 
     def select_candidates(self, as_of: str | datetime | None = None) -> tuple[int, ...]:
@@ -1634,6 +1715,7 @@ class ForwardRuntimeService:
         target_price: Decimal | None = None,
     ) -> DecisionProposal:
         """Create a deterministic, non-AI proposal tied to one scheduled event."""
+        started = time.perf_counter_ns()
         with closing(get_connection(self.database_path)) as connection:
             event = connection.execute(
                 "SELECT * FROM forward_scheduler_events WHERE event_id = ? AND runtime_id = ?",
@@ -1656,7 +1738,7 @@ class ForwardRuntimeService:
             )
         if event is None or candle is None:
             raise ForwardRuntimeError("Mock proposal requires a persisted scheduler event.")
-        return DecisionProposal(
+        proposal = DecisionProposal(
             proposal_id=str(event["proposal_id"]),
             instrument_id=int(event["instrument_id"]),
             action=DecisionAction(action),
@@ -1675,8 +1757,111 @@ class ForwardRuntimeService:
                 + timedelta(minutes=_INTERVAL_MINUTES[str(event["interval"])])
             ),
         )
+        # Bounded optional measurements; proposal content and execution authority are unchanged.
+        self._proposal_timings[event_id] = (
+            _proposal_sha256(proposal),
+            min(time.perf_counter_ns() - started, decision_journal.MAX_DURATION_NS),
+        )
+        if len(self._proposal_timings) > 256:
+            self._proposal_timings.pop(next(iter(self._proposal_timings)))
+        return proposal
 
     def route_event(
+        self,
+        event_id: str,
+        proposal: DecisionProposal,
+        snapshot: ExecutionSnapshot | None,
+    ) -> ProposalExecutionResult:
+        """Journal a bound evaluation without granting execution permission."""
+        if not isinstance(proposal, DecisionProposal):
+            raise ForwardRuntimeError("A persisted scheduler event requires a DecisionProposal.")
+        started = time.perf_counter_ns()
+        decision_id = None
+        if proposal.action == DecisionAction.BUY and getattr(
+            self, "_journal_recovery_error", False
+        ):
+            return ProposalExecutionResult(
+                proposal.proposal_id, "REJECTED", reason="Decision journal recovery is unresolved."
+            )
+        # SELL has no additional pre-execution transaction or required analytics write.
+        # Its linkage is attempted inside Phase 8's existing financial transaction.
+        if proposal.action != DecisionAction.SELL:
+            with closing(get_readonly_connection(self.database_path)) as connection:
+                event = connection.execute(
+                    "SELECT * FROM forward_scheduler_events WHERE event_id = ? AND runtime_id = ?",
+                    (event_id, self.runtime_id),
+                ).fetchone()
+            canonical = _proposal_canonical_json(proposal)
+            compatible = event is not None and (
+                event["proposal_id"] == proposal.proposal_id
+                and event["instrument_id"] == proposal.instrument_id
+                and event["interval"] == proposal.timeframe
+                and event["proposal_json"] in (None, canonical)
+                and event["proposal_binding_state"] in ("UNBOUND", "BOUND")
+            )
+            if compatible:
+                try:
+                    measurement = self._proposal_timings.get(event_id)
+                    signal_duration = (
+                        measurement[1]
+                        if measurement and measurement[0] == _proposal_sha256(proposal)
+                        else None
+                    )
+                    decision_id = decision_journal.capture_runtime_decision(
+                        self.database_path,
+                        event_id,
+                        canonical,
+                        signal_generation_ns=signal_duration,
+                    )
+                except (decision_journal.JournalError, sqlite3.Error):
+                    return ProposalExecutionResult(
+                        proposal.proposal_id,
+                        "REJECTED",
+                        reason="Decision journal persistence failed; evaluation blocked.",
+                    )
+            elif event is not None:
+                with _transaction(self.database_path) as connection:
+                    decision_journal.record_missing_evaluation(
+                        connection,
+                        self.runtime_id,
+                        int(event["instrument_id"]),
+                        _stable_id(
+                            f"invalid-evaluation:{event_id}:{hashlib.sha256(canonical.encode()).hexdigest()}"
+                        ),
+                        str(event["decision_timestamp"]),
+                        "INVALID_PROPOSAL_EVIDENCE",
+                        self.account_id,
+                    )
+        result = self._route_event(event_id, proposal, snapshot)
+        if proposal.action == DecisionAction.SELL and result.order_id is None:
+            try:
+                decision_id = decision_journal.capture_runtime_decision(
+                    self.database_path, event_id, _proposal_canonical_json(proposal)
+                )
+            except (decision_journal.JournalError, sqlite3.Error):
+                pass  # Exit routing has already completed; financial controls remain authoritative.
+        if decision_id is not None:
+            try:
+                decision_journal.finish_runtime_decision(
+                    self.database_path,
+                    decision_id,
+                    result.status,
+                    reason=result.reason,
+                    duration_ns=min(
+                        time.perf_counter_ns() - started, decision_journal.MAX_DURATION_NS
+                    ),
+                )
+            except (decision_journal.JournalError, sqlite3.Error):
+                # Mandatory BUY result linkage already committed atomically in Phase 8.
+                if result.status not in {"FILLED", "REJECTED"}:
+                    return ProposalExecutionResult(
+                        proposal.proposal_id,
+                        "REJECTED",
+                        reason="Decision result could not be journaled.",
+                    )
+        return result
+
+    def _route_event(
         self,
         event_id: str,
         proposal: DecisionProposal,
@@ -1843,7 +2028,7 @@ class ForwardRuntimeService:
                 account["halted"],
                 account["halt_class"],
                 account["halt_reason"],
-                proposal.action.value,
+                proposal.action.value if proposal.action != DecisionAction.HOLD else "BUY",
             ):
                 reason = str(account["halt_reason"] or "Paper account is halted.")
                 connection.execute(

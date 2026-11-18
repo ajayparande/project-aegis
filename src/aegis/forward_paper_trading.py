@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
+from aegis import decision_journal
 from aegis.database import get_connection, get_readonly_connection
 from aegis.market_quality import (
     CalendarConfigError,
@@ -904,7 +906,7 @@ class ForwardPaperTradingEngine:
         evaluation_time: str | datetime | None = None,
     ) -> ProposalExecutionResult:
         """Route generic paper proposals; runtime evidence must use route_event()."""
-        return self._route_proposal(
+        result = self._route_proposal(
             proposal,
             evidence,
             execution_snapshot=execution_snapshot,
@@ -912,6 +914,43 @@ class ForwardPaperTradingEngine:
             runtime_id=None,
             forward_event_id=None,
         )
+        if proposal.action == DecisionAction.SELL and result.order_id is None:
+            try:
+                observed = evidence or self.build_market_evidence(
+                    proposal.instrument_id, interval=proposal.timeframe
+                )
+                decision_journal.capture_proposal_decision(
+                    self.database_path,
+                    self.account_id,
+                    _proposal_canonical_json(proposal),
+                    observed,
+                )
+                decision_journal.finish_proposal_decision(
+                    self.database_path,
+                    self.account_id,
+                    proposal.proposal_id,
+                    result.status,
+                    result.reason,
+                )
+            except (ForwardTradingError, decision_journal.JournalError, sqlite3.Error):
+                pass  # Supplemental diagnostics run only after protective routing completes.
+        elif proposal.action != DecisionAction.SELL:
+            try:
+                decision_journal.finish_proposal_decision(
+                    self.database_path,
+                    self.account_id,
+                    proposal.proposal_id,
+                    result.status,
+                    result.reason,
+                )
+            except (decision_journal.JournalError, sqlite3.Error):
+                if result.status == "HOLD":
+                    return ProposalExecutionResult(
+                        proposal.proposal_id,
+                        "REJECTED",
+                        reason="Decision journal persistence failed.",
+                    )
+        return result
 
     def _route_runtime_proposal(
         self,
@@ -1038,6 +1077,18 @@ class ForwardPaperTradingEngine:
                 )
             except ProposalValidationError as exc:
                 return ProposalExecutionResult(proposal.proposal_id, "REJECTED", reason=str(exc))
+        if forward_event_id is None and proposal.action != DecisionAction.SELL:
+            try:
+                decision_journal.capture_proposal_decision(
+                    self.database_path,
+                    self.account_id,
+                    _proposal_canonical_json(proposal),
+                    evidence,
+                )
+            except (decision_journal.JournalError, sqlite3.Error):
+                return ProposalExecutionResult(
+                    proposal.proposal_id, "REJECTED", reason="Decision journal persistence failed."
+                )
         validation = self.validate_decision_proposal(
             proposal, evidence, evaluation_time=evaluation_time
         )

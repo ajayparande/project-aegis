@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
+from aegis import decision_journal
 from aegis.backtesting import (
     BacktestError,
     CostAssumptions,
@@ -620,6 +622,7 @@ def submit_paper_order(
     request_json = _canonical_json(request.canonical())
     request_hash = hashlib.sha256(request_json.encode()).hexdigest()
     order_id = hashlib.sha256(f"{account_id}:{idempotency_key.strip()}".encode()).hexdigest()
+    risk_started = time.perf_counter_ns()
     with _transaction(database_path) as connection:
         existing = connection.execute(
             "SELECT order_id, request_sha256, status, reason FROM paper_orders "
@@ -857,6 +860,23 @@ def submit_paper_order(
                     halt_reason = reason
                     halt_classification = PaperHaltClass.INTEGRITY
 
+        risk_duration_ns = time.perf_counter_ns() - risk_started
+        journal_id = None
+        connection.execute("SAVEPOINT journal_intent")
+        try:
+            journal_id = decision_journal._order_intent(
+                connection, account_id, idempotency_key.strip(), request, snapshot, forward_event_id
+            )
+        except (decision_journal.JournalError, sqlite3.Error):
+            connection.execute("ROLLBACK TO journal_intent")
+            if side == "BUY" and reason is None:
+                raise PaperTradingError(
+                    "Decision journal persistence failed; new entry blocked."
+                ) from None
+            # Rejected entries cannot fill; exits retain their financial-ledger audit.
+        finally:
+            connection.execute("RELEASE journal_intent")
+        execution_started = time.perf_counter_ns()
         status: Literal["FILLED", "REJECTED"] = "REJECTED" if reason else "FILLED"
         execution_timestamp = _timestamp_text(snapshot.timestamp)
         created_at = _timestamp_text(snapshot.as_of)
@@ -1023,6 +1043,26 @@ def submit_paper_order(
             )
         ):
             _set_account_halt(connection, account_id, reason, PaperHaltClass.RISK)
+        if journal_id is not None:
+            connection.execute("SAVEPOINT journal_result")
+            try:
+                decision_journal._order_result(
+                    connection,
+                    journal_id,
+                    order_id,
+                    status,
+                    snapshot,
+                    risk_duration_ns=risk_duration_ns,
+                    execution_duration_ns=time.perf_counter_ns() - execution_started,
+                )
+            except (decision_journal.JournalError, sqlite3.Error):
+                connection.execute("ROLLBACK TO journal_result")
+                if side == "BUY" and status == "FILLED":
+                    raise PaperTradingError(
+                        "Decision journal result failed; new entry rolled back."
+                    ) from None
+            finally:
+                connection.execute("RELEASE journal_result")
         return PaperOrderResult(order_id, status, reason, False)
 
 
