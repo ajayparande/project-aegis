@@ -13,6 +13,7 @@ from aegis.database import (
 )
 
 ALL_TABLES = {
+    "paper_equity_snapshots",
     "sources",
     "hypotheses",
     "strategies",

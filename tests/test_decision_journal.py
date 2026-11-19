@@ -379,6 +379,169 @@ def test_runtime_order_and_hold_journal_linkage_restart_and_replay(tmp_path, act
     assert journal.reconcile_journal(db, runtime.runtime_id)["status"] == "RECONCILED"
 
 
+@pytest.mark.parametrize(
+    ("action", "reject", "crash_before_route"),
+    [("HOLD", False, False), ("HOLD", True, False), ("HOLD", False, True), ("BUY", True, False)],
+)
+def test_runtime_audit_gap_stays_unresolved_until_authenticated_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    reject: bool,
+    crash_before_route: bool,
+) -> None:
+    """A real scheduler result cannot be replaced with the captured requested action."""
+    from aegis.forward_runtime import ForwardRuntimeService
+
+    db, calendars, _, runtime, _, event, proposal, snapshot = _runtime_buy(tmp_path, action=action)
+    if reject:
+        snapshot = replace(snapshot, reference_price=snapshot.reference_price + Decimal(1))
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("F3_FINAL_AUDIT_CRASH")
+
+    with monkeypatch.context() as patch:
+        if crash_before_route:
+            patch.setattr(ForwardRuntimeService, "_route_event", crash)
+        else:
+            patch.setattr(journal, "finish_runtime_decision", crash)
+        with pytest.raises(RuntimeError, match="F3_FINAL_AUDIT_CRASH"):
+            runtime.route_event(event, proposal, snapshot)
+
+    record = journal.list_decisions(db, runtime.runtime_id)[0]
+    identity, original = record["decision_id"], record["decision"]
+    assert original["original_signal"] == action
+    assert [a["stage"] for a in record["audits"]] == ["PERSISTED"]
+    expected = "REJECTED" if reject else "HOLD"
+    with closing(get_readonly_connection(db)) as connection:
+        scheduler = connection.execute(
+            "SELECT status, proposal_binding_state FROM forward_scheduler_events WHERE event_id=?",
+            (event,),
+        ).fetchone()
+        assert scheduler["status"] == ("PENDING" if crash_before_route else expected)
+        assert scheduler["proposal_binding_state"] == ("UNBOUND" if crash_before_route else "BOUND")
+        assert connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0] == 0
+
+    def forbid_write(*args, **kwargs):
+        raise AssertionError("reconciliation attempted to write")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(journal, "get_connection", forbid_write)
+        report = journal.reconcile_journal(db, runtime.runtime_id)
+        assert report == journal.reconcile_journal(db, runtime.runtime_id)
+    assert report["status"] == "UNRESOLVED" and not report["audit_complete"]
+    assert report["complete"]  # All rows inspected; terminal audit evidence is incomplete.
+    assert report["counts"] == {"PENDING": 1}
+    assert report["requested_counts"] == {action: 1}
+    assert report["unresolved_decision_ids"] == [identity]
+    if not crash_before_route:
+        assert report["authoritative_counts"] == {expected: 1}
+
+    for _ in range(2):
+        runtime = ForwardRuntimeService.open(db, runtime.runtime_id, calendars)
+        assert journal.reconcile_journal(db, runtime.runtime_id) == report
+        assert journal.get_decision(db, identity) == record
+    for _ in range(3):
+        assert runtime.route_event(event, proposal, snapshot).status == expected
+    final = journal.get_decision(db, identity)
+    assert final["decision"] == original
+    assert len([a for a in final["audits"] if a["stage"] == "VALIDATION"]) == 1
+    assert not any(a["stage"] == "EXECUTION" for a in final["audits"])
+    report = journal.reconcile_journal(db, runtime.runtime_id)
+    assert report["status"] == "RECONCILED" and report["audit_complete"]
+    assert report["counts"] == {"BLOCKED" if reject else "HOLD": 1}
+    assert report["authoritative_counts"] == {expected: 1}
+    with closing(get_readonly_connection(db)) as connection:
+        for table in ("paper_orders", "paper_fills", "paper_ledger_entries"):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
+def test_runtime_finalization_rejects_false_hold_and_ignores_observation_labels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db, _, _, runtime, _, event, proposal, snapshot = _runtime_buy(tmp_path, action="HOLD")
+    snapshot = replace(snapshot, reference_price=Decimal(101))
+    with monkeypatch.context() as patch:
+        patch.setattr(journal, "finish_runtime_decision", lambda *a, **k: None)
+        assert runtime.route_event(event, proposal, snapshot).status == "REJECTED"
+    identity = journal.list_decisions(db, runtime.runtime_id)[0]["decision_id"]
+    with pytest.raises(journal.JournalConflictError, match="scheduler outcome"):
+        journal.finish_runtime_decision(db, identity, "HOLD")
+    # Public validation labels are observations, not an authenticated final result.
+    journal.append_validation(db, identity, "HOLD")
+    assert journal.reconcile_journal(db, runtime.runtime_id)["counts"] == {"PENDING": 1}
+    assert runtime.route_event(event, proposal, snapshot).status == "REJECTED"
+    report = journal.reconcile_journal(db, runtime.runtime_id)
+    assert report["status"] == "RECONCILED" and report["counts"] == {"BLOCKED": 1}
+
+
+def test_journal_reconciliation_preserves_f1_committed_buy_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aegis.forward_paper_trading import ForwardPaperTradingEngine
+    from aegis.forward_runtime import ForwardRuntimeService
+
+    db, calendars, _, runtime, _, event, proposal, snapshot = _runtime_buy(tmp_path)
+    original = ForwardPaperTradingEngine._route_runtime_proposal
+
+    def after_commit(self, *args, **kwargs):
+        assert original(self, *args, **kwargs).status == "FILLED"
+        raise RuntimeError("F3_AFTER_FINANCIAL_COMMIT")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ForwardPaperTradingEngine, "_route_runtime_proposal", after_commit)
+        with pytest.raises(RuntimeError, match="F3_AFTER_FINANCIAL_COMMIT"):
+            runtime.route_event(event, proposal, snapshot)
+    before = journal.reconcile_journal(db, runtime.runtime_id)
+    assert before["status"] == "UNRESOLVED" and before["counts"] == {"PENDING": 1}
+    with closing(get_readonly_connection(db)) as connection:
+        financial = {
+            table: [
+                tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")
+            ]
+            for table in ("paper_orders", "paper_fills", "paper_positions", "paper_ledger_entries")
+        }
+    for _ in range(2):
+        runtime = ForwardRuntimeService.open(db, runtime.runtime_id, calendars)
+        report = journal.reconcile_journal(db, runtime.runtime_id)
+        assert report["status"] == "RECONCILED" and report["counts"] == {"FILLED": 1}
+        with closing(get_readonly_connection(db)) as connection:
+            for table, rows in financial.items():
+                assert [
+                    tuple(row)
+                    for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")
+                ] == rows
+
+
+@pytest.mark.parametrize("contradictory_status", ["HOLD", "REJECTED"])
+def test_reconciliation_rejects_scheduler_and_terminal_audit_disagreement(
+    tmp_path: Path,
+    contradictory_status: str,
+) -> None:
+    db, _, _, runtime, _, event, proposal, snapshot = _runtime_buy(tmp_path, action="HOLD")
+    assert runtime.route_event(event, proposal, snapshot).status == "HOLD"
+    original = journal.list_decisions(db, runtime.runtime_id)[0]
+    # Corrupt only the disposable scheduler outcome, preserving protected proposal
+    # bindings and the authentic append-only HOLD audit.
+    with closing(get_connection(db)) as connection:
+        connection.execute(
+            "UPDATE forward_scheduler_events SET status=?, result_json=? WHERE event_id=?",
+            (
+                contradictory_status,
+                json.dumps({"status": "REJECTED", "reason": "Synthetic mismatch"}),
+                event,
+            ),
+        )
+        connection.commit()
+    report = journal.reconcile_journal(db, runtime.runtime_id)
+    assert report["status"] == "UNRESOLVED" and not report["audit_complete"]
+    assert report["counts"] == {"PENDING": 1}
+    assert report["unresolved_decision_ids"] == [original["decision_id"]]
+    assert journal.get_decision(db, original["decision_id"]) == original
+
+
 def test_risk_rejection_and_missing_snapshot_are_journaled_as_blocked(tmp_path):
     db, _, _, runtime, _, event, proposal, _ = _runtime_buy(tmp_path)
     result = runtime.route_event(event, proposal, None)

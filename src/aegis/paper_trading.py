@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
-from aegis import decision_journal
+from aegis import decision_journal, paper_equity
 from aegis.backtesting import (
     BacktestError,
     CostAssumptions,
@@ -323,6 +323,82 @@ def _transaction(database_path: Path) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+def _assert_forward_causal_order(
+    connection: sqlite3.Connection,
+    account_id: int,
+    event_id: str,
+    instrument_id: int,
+) -> None:
+    """Reject forward orders whose historical position context is no longer safe.
+
+    Called inside the paper-order BEGIN IMMEDIATE transaction.
+    """
+    current = connection.execute(
+        """SELECT runtime_id, decision_timestamp
+           FROM forward_scheduler_events
+           WHERE event_id = ? AND instrument_id = ?""",
+        (event_id, instrument_id),
+    ).fetchone()
+    if current is None:
+        raise PaperTradingError("Forward causal ordering requires a persisted scheduler event.")
+
+    try:
+        decision_time = _timestamp(
+            current["decision_timestamp"], "current event decision timestamp"
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise PaperTradingError("Forward event decision timestamp is invalid.") from exc
+
+    later_events = connection.execute(
+        """SELECT event_id, decision_timestamp
+           FROM forward_scheduler_events
+           WHERE runtime_id = ?
+             AND instrument_id = ?
+             AND event_id != ?
+             AND status IN ('HOLD', 'FILLED', 'REJECTED')""",
+        (current["runtime_id"], instrument_id, event_id),
+    ).fetchall()
+
+    for later in later_events:
+        try:
+            later_time = _timestamp(later["decision_timestamp"], "other event decision timestamp")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise PaperTradingError(
+                "Forward causal ordering cannot validate scheduler history."
+            ) from exc
+        if later_time > decision_time:
+            raise PaperTradingError(
+                "Forward causal ordering rejected an event after a later "
+                "terminal scheduler decision."
+            )
+
+    filled_orders = connection.execute(
+        """SELECT o.signal_timestamp, f.execution_timestamp
+           FROM paper_orders AS o
+           JOIN paper_fills AS f ON f.order_id = o.order_id
+           WHERE o.account_id = ?
+             AND o.requested_instrument_id = ?
+             AND o.status = 'FILLED'""",
+        (account_id, instrument_id),
+    ).fetchall()
+
+    for filled in filled_orders:
+        try:
+            signal_time = _timestamp(filled["signal_timestamp"], "filled order signal timestamp")
+            execution_time = _timestamp(
+                filled["execution_timestamp"], "filled order execution timestamp"
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise PaperTradingError(
+                "Forward causal ordering cannot validate fill history."
+            ) from exc
+        if signal_time > decision_time or execution_time > decision_time:
+            raise PaperTradingError(
+                "Forward causal ordering rejected an event after a later "
+                "paper fill for this account and instrument."
+            )
+
+
 def _forward_context_error(
     connection: sqlite3.Connection,
     account_id: int,
@@ -592,7 +668,9 @@ def create_paper_account(
             ) from exc
         if cursor.lastrowid is None:
             raise PaperTradingError("SQLite did not return the created account identifier.")
-        return int(cursor.lastrowid)
+        account_id = int(cursor.lastrowid)
+        paper_equity.capture(connection, account_id, timestamp, "INITIAL", "account-inception")
+        return account_id
 
 
 def submit_paper_order(
@@ -689,6 +767,12 @@ def submit_paper_order(
             )
             if forward_error is not None:
                 raise PaperTradingError(forward_error)
+            _assert_forward_causal_order(
+                connection,
+                account_id,
+                forward_event_id,
+                request.instrument_id,
+            )
             forward_authorization = connection.execute(
                 """SELECT runtime_id, event_id, proposal_id
                    FROM forward_execution_authorizations WHERE event_id = ?""",
@@ -1063,6 +1147,10 @@ def submit_paper_order(
                     ) from None
             finally:
                 connection.execute("RELEASE journal_result")
+        if status == "FILLED":
+            paper_equity.capture(
+                connection, account_id, created_at, "FILL", f"fill:{order_id}", source_id=order_id
+            )
         return PaperOrderResult(order_id, status, reason, False)
 
 
@@ -1073,6 +1161,9 @@ def record_paper_mark(
     mark_price: Decimal,
     observed_at: str,
     source_import_id: int,
+    *,
+    as_of: str | None = None,
+    quote_event_id: str | None = None,
 ) -> bool:
     """Update an open position's last-trade mark inside the caller's transaction."""
     if not isinstance(mark_price, Decimal) or not mark_price.is_finite() or mark_price <= 0:
@@ -1134,6 +1225,14 @@ def record_paper_mark(
              mark_price = excluded.mark_price, observed_at = excluded.observed_at,
              source_import_id = excluded.source_import_id""",
         (account_id, instrument_id, _decimal_text(mark_price), timestamp, source_import_id),
+    )
+    paper_equity.capture(
+        connection,
+        account_id,
+        as_of or timestamp,
+        "MARK",
+        f"mark:{instrument_id}:{quote_event_id or timestamp}",
+        source_id=quote_event_id,
     )
     return True
 

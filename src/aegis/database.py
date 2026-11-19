@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 PHASE_1_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -817,6 +817,49 @@ MIGRATIONS[15] = (
                 BEGIN SELECT RAISE(ABORT, 'journal identity already exists'); END""",
         )
     ),
+)
+
+
+# Evidence only: no backfill or changes to financial authority/projections.
+MIGRATIONS[16] = (
+    """CREATE TABLE paper_equity_snapshots (
+        snapshot_id TEXT PRIMARY KEY NOT NULL CHECK(length(snapshot_id)=64),
+        account_id INTEGER NOT NULL REFERENCES paper_accounts(id),
+        session_id TEXT NOT NULL CHECK(length(session_id) BETWEEN 1 AND 256),
+        sequence INTEGER NOT NULL CHECK(sequence>0),
+        event_key TEXT NOT NULL CHECK(length(event_key) BETWEEN 1 AND 256),
+        kind TEXT NOT NULL CHECK(kind IN ('INITIAL','FILL','MARK','CHECKPOINT','SESSION_CLOSE')),
+        observed_at TEXT NOT NULL CHECK(length(observed_at)=27 AND substr(observed_at,-1)='Z'),
+        observed_us INTEGER NOT NULL,
+        local_date TEXT NOT NULL,
+        valuation_status TEXT NOT NULL CHECK(valuation_status IN ('COMPLETE','INCOMPLETE')),
+        reconciliation_status TEXT NOT NULL CHECK(reconciliation_status IN ('RECONCILED','FAILED')),
+        previous_sha256 TEXT,
+        payload_json TEXT NOT NULL CHECK(json_valid(payload_json) AND length(payload_json)<=1048576),
+        payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64),
+        UNIQUE(account_id,session_id,sequence),
+        UNIQUE(account_id,session_id,event_key),
+        CHECK(json_extract(payload_json,'$.account_id') IS account_id
+          AND json_extract(payload_json,'$.session_id') IS session_id
+          AND json_extract(payload_json,'$.sequence') IS sequence
+          AND json_extract(payload_json,'$.event_key') IS event_key
+          AND json_extract(payload_json,'$.kind') IS kind
+          AND json_extract(payload_json,'$.timestamp') IS observed_at
+          AND json_extract(payload_json,'$.local_date') IS local_date
+          AND json_extract(payload_json,'$.valuation_status') IS valuation_status
+          AND json_extract(payload_json,'$.reconciliation_status') IS reconciliation_status
+          AND json_extract(payload_json,'$.previous_sha256') IS previous_sha256)
+    )""",
+    "CREATE INDEX idx_equity_scope_time ON paper_equity_snapshots(account_id,session_id,observed_us,sequence)",
+    """CREATE TRIGGER equity_no_update BEFORE UPDATE ON paper_equity_snapshots
+        BEGIN SELECT RAISE(ABORT,'equity evidence is immutable'); END""",
+    """CREATE TRIGGER equity_no_delete BEFORE DELETE ON paper_equity_snapshots
+        BEGIN SELECT RAISE(ABORT,'equity evidence is append-only'); END""",
+    """CREATE TRIGGER equity_no_replace BEFORE INSERT ON paper_equity_snapshots
+        WHEN EXISTS(SELECT 1 FROM paper_equity_snapshots WHERE snapshot_id=NEW.snapshot_id
+            OR (account_id=NEW.account_id AND session_id=NEW.session_id
+                AND (sequence=NEW.sequence OR event_key=NEW.event_key)))
+        BEGIN SELECT RAISE(ABORT,'equity snapshot identity already exists'); END""",
 )
 
 

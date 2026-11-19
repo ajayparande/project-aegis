@@ -731,22 +731,37 @@ def get_decision(database_path: Path, decision_id: str) -> dict[str, Any]:
     """Return detached evidence and append-only observations through a query-only connection."""
     _identifier(decision_id, "decision_id")
     with closing(get_readonly_connection(database_path)) as connection:
-        row = connection.execute(
-            "SELECT * FROM decision_journal_events WHERE decision_id = ?", (decision_id,)
-        ).fetchone()
-        if row is None:
-            raise JournalError("Decision does not exist.")
-        if _digest(row["payload_json"]) != row["payload_sha256"]:
-            raise JournalError("Persisted decision fingerprint is inconsistent.")
-        audits = connection.execute(
-            "SELECT payload_json, payload_sha256 FROM decision_journal_audits WHERE decision_id = ? ORDER BY rowid",
-            (decision_id,),
-        ).fetchall()
-        if any(_digest(a["payload_json"]) != a["payload_sha256"] for a in audits):
-            raise JournalError("Persisted audit fingerprint is inconsistent.")
+        return _read_decision(connection, decision_id)
+
+
+def _read_decision(connection: sqlite3.Connection, decision_id: str) -> dict[str, Any]:
+    """Read verified journal records using the caller's existing snapshot."""
+    row = connection.execute(
+        "SELECT * FROM decision_journal_events WHERE decision_id = ?", (decision_id,)
+    ).fetchone()
+    if row is None:
+        raise JournalError("Decision does not exist.")
+    decision = json.loads(row["payload_json"])
+    if _digest(row["payload_json"]) != row["payload_sha256"] or not isinstance(decision, dict):
+        raise JournalError("Persisted decision fingerprint is inconsistent.")
+    audits = connection.execute(
+        "SELECT * FROM decision_journal_audits WHERE decision_id = ? ORDER BY rowid",
+        (decision_id,),
+    ).fetchall()
+    for audit in audits:
+        payload = json.loads(audit["payload_json"])
+        if (
+            not isinstance(payload, dict)
+            or _digest(audit["payload_json"]) != audit["payload_sha256"]
+            or any(
+                payload.get(field) != audit[field]
+                for field in ("stage", "status", "order_id", "fill_id", "attempt_key")
+            )
+        ):
+            raise JournalError("Persisted audit fingerprint or identity is inconsistent.")
     return {
         "decision_id": decision_id,
-        "decision": json.loads(row["payload_json"]),
+        "decision": decision,
         "audits": [json.loads(a["payload_json"]) for a in audits],
     }
 
@@ -919,18 +934,25 @@ def finish_runtime_decision(
 ) -> None:
     """Record an evaluation that did not reach an order, or its existing atomic order result."""
     with _transaction(database_path) as connection:
+        item = _read_decision(connection, decision_id)
+        context = _runtime_outcome(connection, item["decision"])
+        if context is not None:
+            event, _, result = context
+            if event["status"] != status or status == "PENDING":
+                raise JournalConflictError(
+                    "Journal finalization differs from the scheduler outcome."
+                )
+            reason = result.get("reason")
         existing = connection.execute(
-            "SELECT 1 FROM decision_journal_audits WHERE decision_id = ? AND stage = 'EXECUTION'",
+            "SELECT status FROM decision_journal_audits WHERE decision_id = ? AND stage = 'EXECUTION'",
             (decision_id,),
         ).fetchone()
+        if existing is not None and existing["status"] != status:
+            raise JournalConflictError("Journal finalization differs from the financial audit.")
         if existing is None:
             if status == "FILLED":
                 raise JournalError("A filled result requires an atomic execution audit.")
-            outcome = "HOLD" if status == "HOLD" else "BLOCKED"
-            if reason and any(
-                part in reason.lower() for part in ("no completed", "evidence is missing")
-            ):
-                outcome = "NO_DECISION"
+            outcome = _non_order_outcome(status, reason)
             _append_audit(
                 connection,
                 decision_id,
@@ -1201,6 +1223,8 @@ def record_missing_evaluation(
     timestamp: str,
     reason_code: str,
     account_id: int | None = None,
+    *,
+    interval: str = "1m",
 ) -> str:
     event = DecisionEvent(
         run_id=runtime_id,
@@ -1209,6 +1233,7 @@ def record_missing_evaluation(
         strategy_id="runtime-health",
         strategy_version="v1",
         decision_at=timestamp,
+        interval=interval,
         state="NO_DECISION",
         reason_codes=(reason_code,),
         paper_account_id=account_id,
@@ -1225,34 +1250,261 @@ def record_missing_evaluation(
     return identity
 
 
+def _non_order_outcome(status: str, reason: str | None) -> str:
+    """Map an actual routing result to the existing non-order audit vocabulary."""
+    if status == "HOLD":
+        return "HOLD"
+    if reason and any(part in reason.lower() for part in ("no completed", "evidence is missing")):
+        return "NO_DECISION"
+    return "BLOCKED"
+
+
+def _runtime_outcome(
+    connection: sqlite3.Connection, decision: Mapping[str, Any]
+) -> tuple[sqlite3.Row, dict[str, Any], dict[str, Any]] | None:
+    """Resolve only an exact bound runtime decision, never a nearest event or requested action."""
+    if decision["strategy_id"] != "runtime-explicit-proposal":
+        return None
+    event = connection.execute(
+        """SELECT e.*, r.account_id FROM forward_scheduler_events e
+           JOIN forward_runtimes r USING(runtime_id)
+           WHERE e.event_id = ? AND e.runtime_id = ?""",
+        (decision["event_id"], decision["run_id"]),
+    ).fetchone()
+    if event is None or (
+        decision["role"] != "ACTIVE"
+        or decision["strategy_version"] != "v1"
+        or event["account_id"] != decision["paper_account_id"]
+        or event["instrument_id"] != decision["instrument_id"]
+        or event["interval"] != decision["interval"]
+        or event["proposal_id"] != decision["proposal_id"]
+        or event["proposal_binding_state"] != "BOUND"
+        or event["proposal_sha256"] != decision["proposal_fingerprint"]
+        or not isinstance(event["proposal_json"], str)
+        or _digest(event["proposal_json"]) != event["proposal_sha256"]
+        or _time(event["decision_timestamp"], "scheduler decision")
+        != _time(decision["decision_at"], "journal decision")
+    ):
+        raise JournalError("Runtime decision has no exact authenticated scheduler binding.")
+    proposal = json.loads(event["proposal_json"])
+    if not isinstance(proposal, dict) or (
+        json.dumps(proposal, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        != event["proposal_json"]
+        or proposal.get("proposal_id") != decision["proposal_id"]
+        or proposal.get("instrument_id") != decision["instrument_id"]
+        or proposal.get("action") != decision["original_signal"]
+        or _time(proposal.get("decision_timestamp"), "proposal decision")
+        != _time(decision["decision_at"], "journal decision")
+        or decision["quantity"] is not None
+        and proposal.get("quantity") != decision["quantity"]
+    ):
+        raise JournalError("Runtime outcome does not match the captured proposal.")
+    version = proposal.get("canonicalization_version")
+    if version == "aegis.decision-proposal/v1":
+        if proposal.get("timeframe") != event["interval"]:
+            raise JournalError("Runtime proposal interval differs from its scheduler event.")
+    elif version != "aegis.forward-exit/v1" or (
+        proposal.get("runtime_id") != decision["run_id"]
+        or proposal.get("event_id") != decision["event_id"]
+        or proposal.get("action") != "SELL"
+    ):
+        raise JournalError("Unsupported runtime proposal binding.")
+    result = json.loads(event["result_json"]) if event["result_json"] is not None else {}
+    if (
+        not isinstance(result, dict)
+        or (event["status"] != "PENDING" and result.get("status") != event["status"])
+        or result.get("reason") is not None
+        and not isinstance(result["reason"], str)
+    ):
+        raise JournalError("Scheduler terminal result is missing or contradictory.")
+    return event, proposal, result
+
+
+def _validate_execution_link(
+    connection: sqlite3.Connection,
+    decision: Mapping[str, Any],
+    audit: Mapping[str, Any],
+    context: tuple[sqlite3.Row, dict[str, Any], dict[str, Any]] | None,
+) -> None:
+    """Check journal linkage against Phase 8 facts without executing or repairing anything."""
+    order = connection.execute(
+        "SELECT * FROM paper_orders WHERE order_id = ?", (audit["order_id"],)
+    ).fetchone()
+    if order is None or (
+        order["status"] != audit["status"]
+        or order["account_id"] != decision["paper_account_id"]
+        or order["requested_instrument_id"] != decision["instrument_id"]
+        or decision["original_signal"] is not None
+        and order["side"] != decision["original_signal"]
+        or decision["quantity"] is not None
+        and order["quantity"] != decision["quantity"]
+    ):
+        raise JournalError("Journal execution differs from its Phase 8 order.")
+    fill = connection.execute(
+        "SELECT * FROM paper_fills WHERE order_id = ?", (order["order_id"],)
+    ).fetchone()
+    if order["status"] == "FILLED":
+        if (
+            fill is None
+            or audit["fill_id"] != fill["fill_id"]
+            or any(
+                fill[field] != order[field]
+                for field in ("instrument_id", "quantity", "fill_price", "execution_timestamp")
+            )
+        ):
+            raise JournalError("Journal execution differs from its Phase 8 fill.")
+    elif fill is not None or audit["fill_id"] is not None:
+        raise JournalError("Rejected execution cannot identify a fill.")
+    if context is None:
+        return
+    event, proposal, result = context
+    from aegis.paper_trading import PaperOrderRequest
+
+    protective = proposal["canonicalization_version"] == "aegis.forward-exit/v1"
+    key = event["event_id"] if protective else event["proposal_id"]
+    request = PaperOrderRequest(
+        proposal["instrument_id"],
+        proposal["action"],
+        proposal["quantity"],
+        proposal["decision_timestamp"],
+        proposal["submitted_at"],
+    )
+    authorization = connection.execute(
+        "SELECT * FROM forward_execution_authorizations WHERE event_id = ?", (event["event_id"],)
+    ).fetchone()
+    if (
+        result.get("order_id") != order["order_id"]
+        or order["idempotency_key"] != key
+        or order["order_id"] != _digest(f"{decision['paper_account_id']}:{key}")
+        or order["request_sha256"] != _digest(_json(request.canonical()))
+        or any(order[field] != value for field, value in request.canonical().items())
+    ) or (
+        authorization is None
+        or any(
+            authorization[field] != expected
+            for field, expected in (
+                ("runtime_id", decision["run_id"]),
+                ("account_id", decision["paper_account_id"]),
+                ("instrument_id", decision["instrument_id"]),
+                ("interval", decision["interval"]),
+                ("proposal_id", decision["proposal_id"]),
+                ("proposal_sha256", decision["proposal_fingerprint"]),
+                ("status", "CONSUMED" if fill is not None else "REVOKED"),
+                ("consumed_order_id", order["order_id"] if fill is not None else None),
+                ("snapshot_sha256", audit.get("snapshot_fingerprint")),
+            )
+        )
+    ):
+        raise JournalError("Journal execution has no matching runtime authorization.")
+    use = connection.execute(
+        "SELECT * FROM paper_execution_snapshot_uses WHERE order_id = ?", (order["order_id"],)
+    ).fetchone()
+    if (
+        fill is not None
+        and use is None
+        or use is not None
+        and any(
+            use[field] != authorization[field]
+            for field in (
+                "runtime_id",
+                "event_id",
+                "account_id",
+                "instrument_id",
+                "proposal_id",
+                "import_id",
+                "snapshot_id",
+                "snapshot_sha256",
+            )
+        )
+    ):
+        raise JournalError("Journal execution has no matching snapshot-use record.")
+
+
+def _reconciled_outcome(
+    connection: sqlite3.Connection,
+    item: Mapping[str, Any],
+    context: tuple[sqlite3.Row, dict[str, Any], dict[str, Any]] | None,
+) -> str:
+    """Return a completed audited outcome, or refuse to infer one from the requested action."""
+    decision, audits = item["decision"], item["audits"]
+    executions = [a for a in audits if a["stage"] == "EXECUTION"]
+    final = [a for a in audits if a["stage"] == "VALIDATION" and a["attempt_key"] == "PRE_ORDER"]
+    if context is not None and context[0]["status"] == "PENDING":
+        raise JournalError("Scheduler evaluation is pending.")
+    if executions:
+        if len(executions) != 1:
+            raise JournalError("Execution audit is ambiguous.")
+        audit = executions[0]
+        _validate_execution_link(connection, decision, audit, context)
+        if context is not None and context[0]["status"] != audit["status"]:
+            raise JournalError("Scheduler and financial outcome disagree.")
+        if final:
+            raise JournalError("Order execution conflicts with a terminal non-order audit.")
+        return str(audit["status"])
+    if context is not None:
+        event, proposal, result = context
+        key = (
+            event["event_id"]
+            if proposal["canonicalization_version"] == "aegis.forward-exit/v1"
+            else event["proposal_id"]
+        )
+        order = connection.execute(
+            "SELECT 1 FROM paper_orders WHERE account_id = ? AND idempotency_key = ?",
+            (decision["paper_account_id"], key),
+        ).fetchone()
+        if event["status"] == "FILLED" or result.get("order_id") is not None or order is not None:
+            raise JournalError("Financial outcome is missing its execution audit.")
+        expected = _non_order_outcome(event["status"], result.get("reason"))
+        if event["status"] == "HOLD" and decision["original_signal"] != "HOLD":
+            raise JournalError("Scheduler HOLD contradicts the requested action.")
+        if len(final) != 1 or final[0]["status"] != expected:
+            raise JournalError("Scheduler outcome has no matching terminal journal audit.")
+        return expected
+    if len(final) == 1 and final[0]["status"] in {"HOLD", "BLOCKED", "NO_DECISION"}:
+        return str(final[0]["status"])
+    # Warm-up/health records explicitly observe that no proposal was produced.
+    # These are completed observations, unlike a captured BUY/SELL/HOLD request.
+    if (
+        decision["original_signal"] is None
+        and decision["proposal_id"] is None
+        and decision["state"] in {"NO_DECISION", "BLOCKED"}
+        and decision["reason_codes"]
+    ):
+        return str(decision["state"])
+    raise JournalError("Decision is missing trustworthy terminal audit evidence.")
+
+
 def reconcile_journal(database_path: Path, run_id: str) -> dict[str, Any]:
-    """Read-only linkage report; never repairs either journal or financial records."""
-    decisions = list_decisions(database_path, run_id, limit=1000)
+    """Read-only outcome report from one snapshot; complete describes coverage, not audit success."""
+    _identifier(run_id, "run_id")
     unresolved = []
     counts: dict[str, int] = {}
+    requested_counts: dict[str, int] = {}
+    authoritative_counts: dict[str, int] = {}
     with closing(get_readonly_connection(database_path)) as connection:
-        for item in decisions:
-            audits = item["audits"]
-            terminal = [a for a in audits if a["stage"] in {"EXECUTION", "VALIDATION"}]
-            state = terminal[-1]["status"] if terminal else item["decision"]["state"]
-            counts[state] = counts.get(state, 0) + 1
-            for audit in audits:
-                if audit["stage"] != "EXECUTION":
-                    continue
-                row = connection.execute(
-                    "SELECT * FROM paper_orders WHERE order_id = ?", (audit["order_id"],)
-                ).fetchone()
-                if (
-                    row is None
-                    or row["status"] != audit["status"]
-                    or (
-                        row["account_id"] != item["decision"]["paper_account_id"]
-                        or row["requested_instrument_id"] != item["decision"]["instrument_id"]
+        connection.execute("BEGIN")
+        decisions = connection.execute(
+            """SELECT decision_id FROM decision_journal_events WHERE run_id = ?
+               ORDER BY decision_at, decision_id LIMIT 1001""",
+            (run_id,),
+        ).fetchall()
+        for row in decisions[:1000]:
+            state = "PENDING"
+            try:
+                item = _read_decision(connection, row["decision_id"])
+                decision = item["decision"]
+                requested = decision["original_signal"] or decision["state"]
+                requested_counts[requested] = requested_counts.get(requested, 0) + 1
+                context = _runtime_outcome(connection, decision)
+                if context is not None:
+                    authoritative = context[0]["status"]
+                    authoritative_counts[authoritative] = (
+                        authoritative_counts.get(authoritative, 0) + 1
                     )
-                ):
-                    unresolved.append(item["decision_id"])
-            if not terminal and item["decision"]["state"] in {"BUY", "SELL"}:
-                unresolved.append(item["decision_id"])
+                state = _reconciled_outcome(connection, item, context)
+            except (JournalError, ValueError, TypeError, KeyError):
+                unresolved.append(row["decision_id"])
+            counts[state] = counts.get(state, 0) + 1
         # A completely missing SELL intent is a gap too, even with a healthy financial ledger.
         missing_orders = connection.execute(
             """SELECT o.order_id FROM paper_orders o
@@ -1266,12 +1518,17 @@ def reconcile_journal(database_path: Path, run_id: str) -> dict[str, Any]:
                ORDER BY o.order_id LIMIT 1001""",
             (run_id, run_id, run_id),
         ).fetchall()
+    complete = len(decisions) <= 1000 and len(missing_orders) <= 1000
+    audit_complete = complete and not unresolved and not missing_orders
     return {
-        "status": "UNRESOLVED" if unresolved or missing_orders else "RECONCILED",
+        "status": "RECONCILED" if audit_complete else "UNRESOLVED",
         "counts": counts,
+        "requested_counts": requested_counts,
+        "authoritative_counts": authoritative_counts,
         "unresolved_decision_ids": sorted(set(unresolved)),
         "unresolved_order_ids": [row["order_id"] for row in missing_orders[:1000]],
-        "complete": len(decisions) < 1000 and len(missing_orders) <= 1000,
+        "complete": complete,
+        "audit_complete": audit_complete,
     }
 
 

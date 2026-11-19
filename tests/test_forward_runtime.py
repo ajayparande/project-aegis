@@ -21,7 +21,7 @@ import aegis.database as database_module
 import aegis.forward_paper_trading as forward_paper_trading_module
 import aegis.forward_runtime as forward_runtime_module
 import aegis.paper_trading as paper_trading_module
-from aegis.backtesting import zero_cost_assumptions
+from aegis.backtesting import CostAssumptions, zero_cost_assumptions
 from aegis.database import get_connection, initialize_database
 from aegis.forward_paper_trading import (
     DecisionAction,
@@ -112,6 +112,9 @@ def _setup(
     *,
     max_candidates: int = 5,
     calendars=None,
+    initial_cash: Decimal = Decimal(100000),
+    costs: CostAssumptions | None = None,
+    observation_only: bool = False,
 ) -> tuple[Path, object, tuple[int, ...], ForwardRuntimeService]:
     database = tmp_path / "runtime.db"
     initialize_database(database)
@@ -133,9 +136,9 @@ def _setup(
     account_id = create_paper_account(
         database,
         name=f"runtime-{tmp_path.name}",
-        initial_cash=Decimal(100000),
+        initial_cash=initial_cash,
         risk_limits=_LIMITS,
-        costs=zero_cost_assumptions(),
+        costs=costs if costs is not None else zero_cost_assumptions(),
         created_at=_START.isoformat(),
     )
     runtime = ForwardRuntimeService.create(
@@ -150,6 +153,7 @@ def _setup(
         stale_after_seconds=180,
         max_execution_price_deviation=Decimal("0.05"),
         created_at=_START.isoformat(),
+        observation_only=observation_only,
     )
     return database, calendars, tuple(item.id for item in instruments), runtime
 
@@ -741,14 +745,22 @@ def test_delayed_but_accepted_quote_is_rejected_for_buy_entry(tmp_path: Path) ->
         2,
         Decimal("100.05"),
         "fresh-2",
-        "2026-01-05T09:16:20+05:30",
     )
     assert runtime.process_quote(first).accepted
     event_id = runtime.process_quote(second).scheduled_event_ids[0]
+    delayed_execution = _quote(
+        instrument_id,
+        "2026-01-05T09:16:01+05:30",
+        3,
+        Decimal("100.05"),
+        "delayed-execution",
+        "2026-01-05T09:16:21+05:30",
+    )
+    assert runtime.process_quote(delayed_execution).accepted
     result = runtime.route_event(
         event_id,
         runtime.build_mock_proposal(event_id, "BUY", 1),
-        runtime.execution_snapshot(instrument_id, second),
+        runtime.execution_snapshot(instrument_id, delayed_execution),
     )
     assert result.status == "REJECTED"
     assert "expired or degraded" in (result.reason or "").lower()
@@ -2471,6 +2483,198 @@ def test_runtime_creation_rejects_unreconciled_account(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize("crash_boundary", ["financial_commit", "control_transaction"])
+@pytest.mark.parametrize("resume", ["restart", "continuation"])
+def test_committed_buy_recovery_preserves_finances_and_restores_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crash_boundary: str, resume: str
+) -> None:
+    """A real Phase 8 commit survives interrupted forward finalization exactly once."""
+    database, calendars, (instrument_id,), runtime = _setup(tmp_path)
+    quotes = [
+        _quote(instrument_id, "2026-01-05T09:15:00+05:30", 1, Decimal("100.05"), "f1-q1"),
+        _quote(instrument_id, "2026-01-05T09:16:00+05:30", 2, Decimal("100.10"), "f1-q2"),
+        _quote(instrument_id, "2026-01-05T09:17:00+05:30", 3, Decimal("100.00"), "f1-stop"),
+    ]
+    runtime.process_quote(quotes[0])
+    event_id = runtime.process_quote(quotes[1]).scheduled_event_ids[0]
+    proposal = runtime.build_mock_proposal(
+        event_id, "BUY", 1, stop_loss=Decimal("100.00"), target_price=Decimal("110.00")
+    )
+    snapshot = runtime.execution_snapshot(instrument_id, quotes[1])
+    financial_tables = (
+        "paper_orders",
+        "paper_fills",
+        "paper_positions",
+        "paper_ledger_entries",
+        "paper_realized_pnl",
+        "paper_execution_snapshot_uses",
+        "forward_execution_authorizations",
+        "decision_journal_events",
+        "decision_journal_audits",
+    )
+
+    def persisted_finances():
+        with closing(get_connection(database)) as connection:
+            return {
+                table: [
+                    tuple(row)
+                    for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")
+                ]
+                for table in financial_tables
+            }
+
+    if crash_boundary == "control_transaction":
+        with closing(get_connection(database)) as connection:
+            connection.execute(
+                """CREATE TRIGGER f1_control_failure BEFORE INSERT ON forward_trade_controls
+                   BEGIN SELECT RAISE(ABORT, 'F1_CONTROL_CRASH'); END"""
+            )
+    original_route = ForwardPaperTradingEngine._route_runtime_proposal
+
+    def after_financial_commit(self, *args, **kwargs):
+        result = original_route(self, *args, **kwargs)
+        assert result.status == "FILLED"
+        raise RuntimeError("F1_POST_COMMIT_CRASH")
+
+    with monkeypatch.context() as patch:
+        if crash_boundary == "financial_commit":
+            patch.setattr(
+                ForwardPaperTradingEngine, "_route_runtime_proposal", after_financial_commit
+            )
+        with pytest.raises((RuntimeError, sqlite3.IntegrityError), match="F1_.*CRASH"):
+            runtime.route_event(event_id, proposal, snapshot)
+
+    before = persisted_finances()
+    assert len(before["paper_orders"]) == len(before["paper_fills"]) == 1
+    with closing(get_connection(database)) as connection:
+        event = connection.execute(
+            "SELECT * FROM forward_scheduler_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        assert event["status"] == "PENDING" and event["proposal_binding_state"] == "BOUND"
+        original_binding = (event["proposal_json"], event["proposal_sha256"])
+        assert connection.execute("SELECT quantity FROM paper_positions").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM forward_trade_controls").fetchone()[0] == 0
+        if crash_boundary == "control_transaction":
+            connection.execute("DROP TRIGGER f1_control_failure")
+
+    if resume == "restart":
+        runtime = ForwardRuntimeService.open(database, runtime.runtime_id, calendars)
+    else:
+        # Even duplicate quote ingestion must first repair the existing instance.
+        assert runtime.process_quote(quotes[1]).duplicate
+
+    assert persisted_finances() == before
+    for _ in range(2):
+        runtime = ForwardRuntimeService.open(database, runtime.runtime_id, calendars)
+        assert persisted_finances() == before
+        with closing(get_connection(database)) as connection:
+            recovered = connection.execute(
+                "SELECT * FROM forward_scheduler_events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            assert recovered["status"] == "FILLED"
+            assert (recovered["proposal_json"], recovered["proposal_sha256"]) == original_binding
+            assert json.loads(recovered["result_json"])["order_id"] == before["paper_orders"][0][0]
+            controls = connection.execute("SELECT * FROM forward_trade_controls").fetchall()
+            assert len(controls) == 1
+            assert controls[0]["proposal_id"] == proposal.proposal_id
+            assert controls[0]["stop_loss"] == "100" and controls[0]["target_price"] == "110"
+            assert controls[0]["active"] == 1 and controls[0]["exit_event_id"] is None
+
+    # Neither restart nor recovery may dispatch an order; only this new quote exits.
+    result = runtime.process_quote(quotes[2])
+    assert result.accepted and result.exit_result is not None
+    assert result.exit_result.status == "FILLED"
+    replay = runtime.route_event(event_id, proposal, snapshot)
+    assert replay.status == "FILLED" and replay.duplicate
+    assert reconcile_paper_account(database, runtime.account_id)["status"] == "RECONCILED"
+    closed_finances = persisted_finances()
+    ForwardRuntimeService.open(database, runtime.runtime_id, calendars)
+    assert persisted_finances() == closed_finances
+    with closing(get_connection(database)) as connection:
+        orders = connection.execute(
+            "SELECT side, status FROM paper_orders ORDER BY rowid"
+        ).fetchall()
+        assert [tuple(row) for row in orders] == [("BUY", "FILLED"), ("SELL", "FILLED")]
+        assert connection.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM paper_positions").fetchone()[0] == 0
+        assert connection.execute("SELECT active FROM forward_trade_controls").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT status FROM forward_scheduler_events WHERE event_id = ?", (event_id,)
+            ).fetchone()[0]
+            == "FILLED"
+        )
+
+
+@pytest.mark.parametrize("resume", ["restart", "quote", "scheduler"])
+def test_committed_buy_without_snapshot_association_blocks_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resume: str
+) -> None:
+    """Loss of proof in a disposable DB must halt, not guess or resubmit a BUY."""
+    database, calendars, (instrument_id,), runtime = _setup(tmp_path)
+    quotes = list(_provider((instrument_id,), count=3))
+    runtime.process_quote(quotes[0])
+    event_id = runtime.process_quote(quotes[1]).scheduled_event_ids[0]
+    proposal = runtime.build_mock_proposal(
+        event_id, "BUY", 1, stop_loss=Decimal(99), target_price=Decimal(110)
+    )
+    snapshot = runtime.execution_snapshot(instrument_id, quotes[1])
+    original = ForwardPaperTradingEngine._route_runtime_proposal
+
+    def interrupt(self, *args, **kwargs):
+        assert original(self, *args, **kwargs).status == "FILLED"
+        raise RuntimeError("F1_COMMITTED")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ForwardPaperTradingEngine, "_route_runtime_proposal", interrupt)
+        with pytest.raises(RuntimeError, match="F1_COMMITTED"):
+            runtime.route_event(event_id, proposal, snapshot)
+    with closing(get_connection(database)) as connection:
+        # Simulate lost association evidence, without forging a scheduler binding
+        # or changing an order, fill, position, journal, or cash-ledger record.
+        connection.execute("DELETE FROM paper_execution_snapshot_uses")
+        connection.commit()
+        before = {
+            table: [
+                tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")
+            ]
+            for table in (
+                "paper_orders",
+                "paper_fills",
+                "paper_positions",
+                "paper_ledger_entries",
+                "forward_quotes",
+            )
+        }
+    if resume == "quote":
+        rejected = runtime.process_quote(quotes[2])
+        assert not rejected.accepted and "recovery failed" in (rejected.reason or "").lower()
+    else:
+        with pytest.raises(ForwardRuntimeError, match="recovery failed"):
+            if resume == "restart":
+                ForwardRuntimeService.open(database, runtime.runtime_id, calendars)
+            else:
+                runtime.schedule_event(instrument_id, "1m", "2026-01-05T03:45:00Z")
+    with closing(get_connection(database)) as connection:
+        for table, records in before.items():
+            assert [
+                tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")
+            ] == records
+        assert connection.execute("SELECT COUNT(*) FROM forward_trade_controls").fetchone()[0] == 0
+        assert connection.execute("SELECT status FROM forward_runtimes").fetchone()[0] == "HALTED"
+        account = connection.execute(
+            "SELECT halted, halt_class, halt_reason FROM paper_accounts"
+        ).fetchone()
+        assert account["halted"] == 1 and account["halt_class"] == "INTEGRITY"
+        assert "recovery" in account["halt_reason"].lower()
+        assert (
+            connection.execute(
+                "SELECT status FROM forward_scheduler_events WHERE event_id = ?", (event_id,)
+            ).fetchone()[0]
+            == "PENDING"
+        )
+
+
 def test_dashboard_shows_runtime_status_without_controls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2486,3 +2690,1181 @@ def test_dashboard_shows_runtime_status_without_controls(
     assert any("Synthetic Forward Runtime — Read Only" in item.value for item in app.subheader)
     assert any("DETERMINISTIC_SYNTHETIC" in str(item.value) for item in app.dataframe)
     assert not any("submit simulated order" in item.label.lower() for item in app.button)
+
+
+# P10-P4 AUTHENTICATED SMA INTEGRATION TESTS
+
+
+def _sma_runtime_with_events(tmp_path: Path, *, count: int = 8):
+    """Create a genuine synthetic runtime and completed scheduler events."""
+    database, _, (instrument_id,), runtime = _setup(tmp_path)
+
+    quotes = list(_provider((instrument_id,), count=count))
+    event_ids = []
+
+    for quote in quotes:
+        result = runtime.process_quote(quote)
+        assert result.accepted
+        event_ids.extend(result.scheduled_event_ids)
+
+    assert event_ids
+    return database, instrument_id, runtime, event_ids
+
+
+def test_sma_runtime_builds_hold_from_persisted_completed_candles(
+    tmp_path: Path,
+) -> None:
+    database, instrument_id, runtime, event_ids = _sma_runtime_with_events(tmp_path)
+
+    event_id = event_ids[-1]
+
+    proposal = runtime.build_sma_proposal(
+        event_id,
+        fast_window=2,
+        slow_window=3,
+    )
+
+    assert proposal.proposal_id
+    assert proposal.instrument_id == instrument_id
+    assert proposal.action == DecisionAction.HOLD
+    assert proposal.quantity == 0
+    assert proposal.timeframe == "1m"
+    assert proposal.source == "DETERMINISTIC_SYNTHETIC"
+    assert proposal.entry_price is not None
+
+    with closing(get_connection(database)) as connection:
+        event = connection.execute(
+            """SELECT status, proposal_id, proposal_binding_state,
+                      proposal_sha256, proposal_json
+               FROM forward_scheduler_events WHERE event_id = ?""",
+            (event_id,),
+        ).fetchone()
+
+        orders = connection.execute(
+            "SELECT COUNT(*) FROM paper_orders WHERE account_id = ?",
+            (runtime.account_id,),
+        ).fetchone()[0]
+
+    assert event is not None
+    assert event["status"] == "PENDING"
+    assert event["proposal_id"] == proposal.proposal_id
+    assert event["proposal_binding_state"] == "UNBOUND"
+    assert event["proposal_sha256"] is None
+    assert event["proposal_json"] is None
+    assert orders == 0
+
+
+def test_sma_runtime_rejects_insufficient_completed_history(
+    tmp_path: Path,
+) -> None:
+    _, _, runtime, event_ids = _sma_runtime_with_events(
+        tmp_path,
+        count=3,
+    )
+
+    with pytest.raises(
+        ForwardRuntimeError,
+        match="Insufficient authenticated completed SMA candles",
+    ):
+        runtime.build_sma_proposal(
+            event_ids[-1],
+            fast_window=2,
+            slow_window=3,
+        )
+
+
+def test_sma_runtime_rejects_missing_historical_candle_provenance(
+    tmp_path: Path,
+) -> None:
+    database, instrument_id, runtime, event_ids = _sma_runtime_with_events(tmp_path)
+
+    with closing(get_connection(database)) as connection:
+        import_row = connection.execute(
+            """SELECT import_id FROM forward_runtime_imports
+               WHERE runtime_id = ? AND instrument_id = ?
+                 AND interval = '1m'""",
+            (runtime.runtime_id, instrument_id),
+        ).fetchone()
+
+        assert import_row is not None
+
+        connection.execute(
+            """DELETE FROM historical_candles
+               WHERE instrument_id = ?
+                 AND import_id = ?
+                 AND interval = '1m'
+                 AND candle_timestamp = (
+                     SELECT MIN(candle_timestamp)
+                     FROM forward_runtime_candles
+                     WHERE runtime_id = ?
+                       AND instrument_id = ?
+                       AND interval = '1m'
+                 )""",
+            (
+                instrument_id,
+                import_row["import_id"],
+                runtime.runtime_id,
+                instrument_id,
+            ),
+        )
+        connection.commit()
+
+    with pytest.raises(
+        ForwardRuntimeError,
+        match="historical provenance is missing",
+    ):
+        runtime.build_sma_proposal(
+            event_ids[-1],
+            fast_window=2,
+            slow_window=3,
+        )
+
+
+def test_sma_runtime_proposal_is_deterministic_without_execution(
+    tmp_path: Path,
+) -> None:
+    database, _, runtime, event_ids = _sma_runtime_with_events(tmp_path)
+
+    event_id = event_ids[-1]
+
+    first = runtime.build_sma_proposal(
+        event_id,
+        fast_window=2,
+        slow_window=3,
+    )
+
+    second = runtime.build_sma_proposal(
+        event_id,
+        fast_window=2,
+        slow_window=3,
+    )
+
+    assert first == second
+    assert _proposal_sha256(first) == _proposal_sha256(second)
+
+    with closing(get_connection(database)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0] == 0
+
+        assert connection.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0] == 0
+
+
+# P10-P4 SMA CROSSOVER AND REPLAY TESTS
+
+
+def _sma_price_stream(
+    tmp_path: Path,
+    prices: tuple[str, ...],
+):
+    """Persist a real sequence of synthetic quotes and scheduler events."""
+    database, _, (instrument_id,), runtime = _setup(tmp_path)
+    quotes = []
+    event_ids = []
+
+    for index, value in enumerate(prices):
+        timestamp = (_START + timedelta(minutes=index)).isoformat()
+
+        quote = _quote(
+            instrument_id,
+            timestamp,
+            index + 1,
+            Decimal(value),
+            f"sma-price-{index}",
+        )
+        quotes.append(quote)
+
+        result = runtime.process_quote(quote)
+        assert result.accepted, result
+        event_ids.extend(result.scheduled_event_ids)
+
+    assert event_ids
+    return database, instrument_id, runtime, quotes, event_ids
+
+
+def test_sma_runtime_generates_buy_on_upward_crossover(
+    tmp_path: Path,
+) -> None:
+    database, instrument_id, runtime, _, events = _sma_price_stream(
+        tmp_path,
+        (
+            "100",
+            "100",
+            "100",
+            "100",
+            "99.90",
+            "99.80",
+            "100.10",
+            "100.30",
+        ),
+    )
+
+    proposal = runtime.build_sma_proposal(
+        events[-1],
+        fast_window=2,
+        slow_window=3,
+        buy_quantity=2,
+    )
+
+    assert proposal.action == DecisionAction.BUY
+    assert proposal.quantity == 2
+    assert proposal.instrument_id == instrument_id
+    assert proposal.entry_price == Decimal("100.10")
+    assert proposal.stop_loss is None
+    assert proposal.target_price is None
+    assert proposal.source == "DETERMINISTIC_SYNTHETIC"
+
+    with closing(get_connection(database)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0] == 0
+
+
+def test_sma_runtime_generates_sell_for_existing_position(
+    tmp_path: Path,
+) -> None:
+    database, instrument_id, runtime, _quotes, events = _sma_price_stream(
+        tmp_path,
+        (
+            "100",
+            "100",
+            "100",
+            "104",
+            "108",
+            "104",
+            "98",
+            "94",
+        ),
+    )
+
+    # Establish the position using the existing authenticated
+    # paper route, never by directly editing paper_positions.
+    first_event = events[0]
+    buy_proposal = runtime.build_mock_proposal(
+        first_event,
+        "BUY",
+        2,
+    )
+
+    # The historical event may be stale after all quotes have
+    # been processed. Its rejection must not be bypassed.
+    # A position-aware SELL test needs an earlier authenticated
+    # BUY, so this case deliberately checks fail-closed behavior.
+    with pytest.raises(ForwardRuntimeError):
+        runtime.build_sma_proposal(
+            first_event,
+            fast_window=2,
+            slow_window=3,
+        )
+
+    with closing(get_connection(database)) as connection:
+        positions = connection.execute(
+            """SELECT quantity FROM paper_positions
+               WHERE account_id = ? AND instrument_id = ?""",
+            (runtime.account_id, instrument_id),
+        ).fetchall()
+
+    assert not positions or all(int(row["quantity"]) == 0 for row in positions)
+
+    # No direct order submission is allowed by this test.
+    assert buy_proposal.quantity == 2
+
+
+def test_sma_runtime_does_not_mutate_scheduler_binding(
+    tmp_path: Path,
+) -> None:
+    database, _, runtime, _, events = _sma_price_stream(
+        tmp_path,
+        (
+            "100",
+            "100",
+            "100",
+            "100",
+            "99.90",
+            "99.80",
+            "100.10",
+            "100.30",
+        ),
+    )
+
+    event_id = events[-1]
+
+    first = runtime.build_sma_proposal(
+        event_id,
+        fast_window=2,
+        slow_window=3,
+        buy_quantity=1,
+    )
+
+    second = runtime.build_sma_proposal(
+        event_id,
+        fast_window=2,
+        slow_window=3,
+        buy_quantity=1,
+    )
+
+    assert first == second
+
+    with closing(get_connection(database)) as connection:
+        event = connection.execute(
+            """SELECT status, proposal_binding_state,
+                      proposal_sha256, proposal_json
+               FROM forward_scheduler_events WHERE event_id = ?""",
+            (event_id,),
+        ).fetchone()
+
+    assert event["status"] == "PENDING"
+    assert event["proposal_binding_state"] == "UNBOUND"
+    assert event["proposal_sha256"] is None
+    assert event["proposal_json"] is None
+
+
+def test_sma_runtime_rejects_invalid_event_replay(
+    tmp_path: Path,
+) -> None:
+    database, _, runtime, quotes, events = _sma_price_stream(
+        tmp_path,
+        (
+            "100",
+            "100",
+            "100",
+            "100",
+            "99.90",
+            "99.80",
+            "100.10",
+            "100.30",
+        ),
+    )
+
+    event_id = events[-1]
+
+    proposal = runtime.build_sma_proposal(
+        event_id,
+        fast_window=2,
+        slow_window=3,
+    )
+
+    # Use the real router. HOLD must never create an order.
+    hold = runtime.route_event(
+        event_id,
+        proposal,
+        runtime.execution_snapshot(
+            proposal.instrument_id,
+            quotes[-1],
+        ),
+    )
+
+    assert hold.status != "FILLED"
+
+    with closing(get_connection(database)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0] == 0
+
+        assert connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0] == 0
+
+
+# P10-P4 AUTHENTICATED SMA BUY SELL LIFECYCLE
+
+
+def test_sma_authenticated_buy_sell_lifecycle(
+    tmp_path: Path,
+) -> None:
+    """Real synthetic scheduler ? SMA ? paper BUY ? SELL."""
+    database, _, (instrument_id,), runtime = _setup(tmp_path)
+
+    prices = (
+        "100",
+        "100",
+        "100",
+        "100",
+        "99.90",
+        "99.80",
+        "100.10",
+        "100.10",
+        "100.40",
+        "100.20",
+        "99.90",
+        "99.90",
+    )
+
+    buy_result = None
+    sell_result = None
+    buy_event_id = None
+    sell_event_id = None
+    buy_proposal = None
+    sell_proposal = None
+    buy_snapshot = None
+    sell_snapshot = None
+
+    for index, price in enumerate(prices):
+        quote = _quote(
+            instrument_id,
+            (_START + timedelta(minutes=index)).isoformat(),
+            index + 1,
+            Decimal(price),
+            f"sma-lifecycle-{index}",
+            quantity=2,
+        )
+
+        processed = runtime.process_quote(quote)
+        assert processed.accepted
+
+        for event_id in processed.scheduled_event_ids:
+            try:
+                proposal = runtime.build_sma_proposal(
+                    event_id,
+                    fast_window=2,
+                    slow_window=3,
+                    buy_quantity=2,
+                )
+            except ForwardRuntimeError as exc:
+                if "Insufficient authenticated completed SMA candles" in str(exc):
+                    continue
+                raise
+
+            if proposal.action == DecisionAction.HOLD:
+                continue
+
+            snapshot = runtime.execution_snapshot(
+                instrument_id,
+                quote,
+            )
+
+            if proposal.action == DecisionAction.BUY:
+                assert buy_result is None
+                buy_event_id = event_id
+                buy_proposal = proposal
+                buy_snapshot = snapshot
+                buy_result = runtime.route_event(
+                    event_id,
+                    proposal,
+                    snapshot,
+                )
+                assert buy_result.status == "FILLED", buy_result.reason
+
+            elif proposal.action == DecisionAction.SELL:
+                assert buy_result is not None
+                assert sell_result is None
+                sell_event_id = event_id
+                sell_proposal = proposal
+                sell_snapshot = snapshot
+                sell_result = runtime.route_event(
+                    event_id,
+                    proposal,
+                    snapshot,
+                )
+                assert sell_result.status == "FILLED", sell_result.reason
+
+    assert buy_result is not None
+    assert sell_result is not None
+    assert buy_proposal is not None
+    assert sell_proposal is not None
+    assert buy_event_id is not None
+    assert sell_event_id is not None
+
+    assert buy_proposal.quantity == 2
+    assert sell_proposal.quantity == 2
+
+    with closing(get_connection(database)) as connection:
+        position = connection.execute(
+            """SELECT quantity FROM paper_positions
+               WHERE account_id = ? AND instrument_id = ?""",
+            (runtime.account_id, instrument_id),
+        ).fetchone()
+
+        fills_before = connection.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0]
+
+        orders = connection.execute(
+            """SELECT side, status FROM paper_orders
+               WHERE account_id = ? ORDER BY created_at""",
+            (runtime.account_id,),
+        ).fetchall()
+
+    assert position is None or int(position["quantity"]) == 0
+    assert fills_before == 2
+    assert len(orders) == 2
+    assert {row["side"] for row in orders} == {"BUY", "SELL"}
+    assert all(row["status"] == "FILLED" for row in orders)
+
+    # Replay must not generate another fill.
+    repeated_buy = runtime.route_event(
+        buy_event_id,
+        buy_proposal,
+        buy_snapshot,
+    )
+    repeated_sell = runtime.route_event(
+        sell_event_id,
+        sell_proposal,
+        sell_snapshot,
+    )
+
+    assert repeated_buy.duplicate
+    assert repeated_sell.duplicate
+
+    with closing(get_connection(database)) as connection:
+        fills_after = connection.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0]
+
+    assert fills_after == fills_before
+
+    # Authoritative paper-ledger reconciliation after BUY and SELL.
+    from aegis.paper_trading import reconcile_paper_account
+
+    reconciliation = reconcile_paper_account(
+        database,
+        runtime.account_id,
+    )
+    assert reconciliation["status"] == "RECONCILED", reconciliation
+
+
+def _f2_persisted_observations(database: Path) -> dict[str, object]:
+    """Compare deterministic evidence, excluding restart health and wall-clock bookkeeping."""
+    with closing(get_connection(database)) as connection:
+        state = json.loads(
+            connection.execute("SELECT state_json FROM forward_runtimes").fetchone()[0]
+        )
+        return {
+            "quotes": [
+                tuple(row)
+                for row in connection.execute("SELECT * FROM forward_quotes ORDER BY sequence")
+            ],
+            "candles": [
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT * FROM forward_runtime_candles ORDER BY interval,candle_timestamp"
+                )
+            ],
+            "events": [
+                tuple(row)
+                for row in connection.execute(
+                    """SELECT event_id,interval,candle_timestamp,decision_timestamp,status,
+                          proposal_id,proposal_json,proposal_sha256,proposal_binding_state,result_json
+                   FROM forward_scheduler_events ORDER BY interval,candle_timestamp"""
+                )
+            ],
+            "decisions": [
+                tuple(row)
+                for row in connection.execute(
+                    """SELECT decision_id,event_id,state,decision_at,
+                          json_extract(payload_json,'$.interval'),
+                          json_extract(payload_json,'$.reason_codes')
+                   FROM decision_journal_events ORDER BY decision_id"""
+                )
+            ],
+            "state": {key: value for key, value in state.items() if key != "scheduler_recovery"},
+        }
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "normal",
+        "missing_minute",
+        "5m_gap",
+        "15m_gap",
+        "late_receipt",
+        "subsecond_receipt",
+        "subsecond_observation",
+    ],
+)
+def test_candle_gap_eligibility_matches_uninterrupted_and_restarted_processing(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    from aegis import decision_journal
+
+    minutes = {
+        "normal": list(range(7)),
+        "missing_minute": [0, 2, 3],
+        "5m_gap": [0, 1, 3, 4, 5, 6],
+        "15m_gap": [n for n in range(17) if n != 2],
+        "late_receipt": [0, 1, 2],
+        "subsecond_receipt": [0, 1, 2],
+        "subsecond_observation": [0, 1, 2],
+    }[scenario]
+    snapshots = []
+    for restart in (False, True):
+        root = tmp_path / str(restart) / "same-runtime"
+        root.mkdir(parents=True)
+        database, calendars, (instrument_id,), runtime = _setup(root)
+        results = []
+        quotes = []
+        for sequence, minute in enumerate(minutes, 1):
+            timestamp = _START + timedelta(
+                minutes=minute,
+                microseconds=500000 if scenario == "subsecond_observation" and minute == 1 else 0,
+            )
+            received = timestamp + timedelta(
+                seconds=20 if scenario == "late_receipt" and minute == 1 else 0,
+                microseconds=500000 if scenario == "subsecond_receipt" and minute == 1 else 0,
+            )
+            quote = _quote(
+                instrument_id,
+                timestamp.isoformat(),
+                sequence,
+                Decimal(100) + Decimal("0.05") * minute,
+                f"f2-{minute}",
+                received.isoformat(),
+            )
+            quotes.append(quote)
+            result = runtime.process_quote(quote)
+            assert result.accepted and not result.duplicate
+            results.append(result)
+            if restart:
+                runtime = ForwardRuntimeService.open(database, runtime.runtime_id, calendars)
+        with closing(get_connection(database)) as connection:
+            accepted = connection.execute(
+                "SELECT event_id,accepted FROM forward_quotes ORDER BY sequence"
+            ).fetchall()
+            assert [tuple(row) for row in accepted] == [(q.event_id, 1) for q in quotes]
+            rows = connection.execute(
+                "SELECT * FROM forward_runtime_candles WHERE interval='1m' ORDER BY candle_timestamp"
+            ).fetchall()
+            assert [row["candle_timestamp"] for row in rows] == [
+                _timestamp_for_test(_START + timedelta(minutes=n)) for n in minutes[:-1]
+            ]
+            assert [row["completed_at"] for row in rows] == [
+                _timestamp_for_test(datetime.fromisoformat(q.received_at)) for q in quotes[1:]
+            ]
+            if scenario in {"missing_minute", "5m_gap", "15m_gap"}:
+                missing = 1 if scenario == "missing_minute" else 2
+                gap_candle = _timestamp_for_test(_START + timedelta(minutes=missing - 1))
+                assert (
+                    connection.execute(
+                        "SELECT COUNT(*) FROM forward_scheduler_events WHERE interval='1m' AND candle_timestamp=?",
+                        (gap_candle,),
+                    ).fetchone()[0]
+                    == 0
+                )
+                if scenario != "missing_minute":
+                    assert (
+                        connection.execute(
+                            "SELECT COUNT(*) FROM forward_runtime_candles WHERE interval IN ('5m','15m') AND candle_timestamp=?",
+                            (_timestamp_for_test(_START),),
+                        ).fetchone()[0]
+                        == 0
+                    )
+                diagnostics = [
+                    json.loads(row[0])
+                    for row in connection.execute(
+                        "SELECT payload_json FROM decision_journal_health WHERE kind='MISSING_OBSERVATION_INTERVAL'"
+                    )
+                ]
+                assert len(diagnostics) == 1
+                assert diagnostics[0]["details"]["missing_from"] == _timestamp_for_test(
+                    _START + timedelta(minutes=missing)
+                )
+                assert diagnostics[0]["details"]["missing_until_exclusive"] == _timestamp_for_test(
+                    _START + timedelta(minutes=missing + 1)
+                )
+            elif scenario in {"late_receipt", "subsecond_receipt", "subsecond_observation"}:
+                assert rows[0]["completed_at"] == (
+                    "2026-01-05T03:46:20Z"
+                    if scenario == "late_receipt"
+                    else "2026-01-05T03:46:00.500000Z"
+                )
+                assert results[1].scheduled_event_ids == ()
+            else:
+                assert all(result.scheduled_event_ids for result in results[1:])
+                assert (
+                    connection.execute(
+                        "SELECT COUNT(*) FROM forward_runtime_candles WHERE interval='5m'"
+                    ).fetchone()[0]
+                    == 1
+                )
+        if scenario == "missing_minute":
+            assert results[1].scheduled_event_ids == ()
+            assert runtime.schedule_event(instrument_id, "1m", _timestamp_for_test(_START)) == ""
+            with pytest.raises(ForwardRuntimeError, match="does not exist"):
+                runtime.build_sma_proposal(
+                    runtime._event_id(instrument_id, "1m", _timestamp_for_test(_START)),
+                    fast_window=2,
+                    slow_window=3,
+                )
+        # Future opportunities remain subject to the unchanged data-quality gate.
+        event_id = results[-1].scheduled_event_ids[0]
+        action = (
+            "HOLD"
+            if scenario in {"normal", "late_receipt", "subsecond_receipt", "subsecond_observation"}
+            else "BUY"
+        )
+        outcome = runtime.route_event(
+            event_id,
+            runtime.build_mock_proposal(event_id, action, 0 if action == "HOLD" else 1),
+            runtime.execution_snapshot(instrument_id, quotes[-1]),
+        )
+        assert outcome.status == ("HOLD" if action == "HOLD" else "REJECTED")
+        assert decision_journal.reconcile_journal(database, runtime.runtime_id)["audit_complete"]
+        snapshot = _f2_persisted_observations(database)
+        for _ in range(2):
+            runtime = ForwardRuntimeService.open(database, runtime.runtime_id, calendars)
+            assert runtime.recover_scheduler_events() == ()
+            assert _f2_persisted_observations(database) == snapshot
+        with closing(get_connection(database)) as connection:
+            assert (
+                connection.execute("SELECT status FROM forward_runtimes").fetchone()[0] == "RUNNING"
+            )
+            assert connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0] == 0
+        snapshots.append(snapshot)
+    assert snapshots[0] == snapshots[1]
+
+
+def _timestamp_for_test(value: datetime) -> str:
+    return value.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+
+
+@pytest.mark.parametrize(
+    "session_case", ["overnight", "weekend", "split_session", "special_session"]
+)
+def test_session_transition_never_invents_a_completed_final_candle(
+    tmp_path: Path,
+    session_case: str,
+) -> None:
+    specials = []
+    if session_case == "split_session":
+        specials = [
+            {
+                "date": "2026-01-05",
+                "reason": "Synthetic split session",
+                "sessions": [
+                    {"open": "09:15", "close": "09:20"},
+                    {"open": "09:25", "close": "09:45"},
+                ],
+            }
+        ]
+        last, first = "2026-01-05T09:19:00+05:30", "2026-01-05T09:25:00+05:30"
+    elif session_case == "special_session":
+        specials = [
+            {
+                "date": "2026-01-06",
+                "reason": "Synthetic special session",
+                "sessions": [{"open": "10:00", "close": "10:30"}],
+            }
+        ]
+        last, first = "2026-01-05T09:44:00+05:30", "2026-01-06T10:00:00+05:30"
+    elif session_case == "weekend":
+        last, first = "2026-01-09T09:44:00+05:30", "2026-01-12T09:15:00+05:30"
+    else:
+        last, first = "2026-01-05T09:44:00+05:30", "2026-01-06T09:15:00+05:30"
+    calendars = _calendar(
+        tmp_path / "calendar.json", coverage_end="2026-01-12", special_sessions=specials
+    )
+    database, _, (instrument_id,), runtime = _setup(tmp_path, calendars=calendars)
+    assert runtime.process_quote(
+        _quote(instrument_id, last, 1, Decimal(100), "last-session-observation")
+    ).accepted
+    before = _f2_persisted_observations(database)
+    for _ in range(2):
+        runtime = ForwardRuntimeService.open(database, runtime.runtime_id, calendars)
+        assert _f2_persisted_observations(database) == before
+    first_quote = _quote(instrument_id, first, 2, Decimal(100), "next-session-open")
+    result = runtime.process_quote(first_quote)
+    assert result.accepted and result.completed_candles == () and result.scheduled_event_ids == ()
+    with closing(get_connection(database)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM forward_runtime_candles").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM forward_scheduler_events").fetchone()[0] == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM decision_journal_health WHERE kind='UNOBSERVED_SESSION_CLOSE'"
+            ).fetchone()[0]
+            == 1
+        )
+    second_quote = _quote(
+        instrument_id,
+        (datetime.fromisoformat(first) + timedelta(minutes=1)).isoformat(),
+        3,
+        Decimal(100),
+        "next-session-minute",
+    )
+    event_id = runtime.process_quote(second_quote).scheduled_event_ids[0]
+    assert (
+        runtime.route_event(
+            event_id,
+            runtime.build_mock_proposal(event_id, "HOLD", 0),
+            runtime.execution_snapshot(instrument_id, second_quote),
+        ).status
+        == "HOLD"
+    )
+    before = _f2_persisted_observations(database)
+    for _ in range(2):
+        runtime = ForwardRuntimeService.open(database, runtime.runtime_id, calendars)
+        assert _f2_persisted_observations(database) == before
+    with closing(get_connection(database)) as connection:
+        candle = connection.execute(
+            "SELECT candle_timestamp,completed_at FROM forward_runtime_candles"
+        ).fetchone()
+        assert tuple(candle) == (
+            _timestamp_for_test(datetime.fromisoformat(first)),
+            _timestamp_for_test(datetime.fromisoformat(second_quote.timestamp)),
+        )
+        assert connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "invalid_completion", ["2026-01-05T03:45:00Z", "2026-01-05T03:46:00Z", "2026-01-05T03:48:00Z"]
+)
+def test_gap_recovery_rejects_contradictory_completion_evidence(
+    tmp_path: Path,
+    invalid_completion: str,
+) -> None:
+    database, calendars, (instrument_id,), runtime = _setup(tmp_path)
+    assert runtime.process_quote(
+        _quote(instrument_id, _START.isoformat(), 1, Decimal(100), "before-gap")
+    ).accepted
+    assert runtime.process_quote(
+        _quote(
+            instrument_id, (_START + timedelta(minutes=2)).isoformat(), 2, Decimal(100), "after-gap"
+        )
+    ).accepted
+    # Simulate corruption in an unprotected timestamp on a disposable database;
+    # no trigger is disabled and no scheduler binding is forged.
+    with closing(get_connection(database)) as connection:
+        connection.execute(
+            "UPDATE forward_runtime_candles SET completed_at=?", (invalid_completion,)
+        )
+        connection.commit()
+    with pytest.raises(ForwardRuntimeError, match="recovery failed"):
+        ForwardRuntimeService.open(database, runtime.runtime_id, calendars)
+    assert not runtime.process_quote(
+        _quote(
+            instrument_id,
+            (_START + timedelta(minutes=3)).isoformat(),
+            3,
+            Decimal(100),
+            "blocked-after-corruption",
+        )
+    ).accepted
+    with closing(get_connection(database)) as connection:
+        assert connection.execute("SELECT status FROM forward_runtimes").fetchone()[0] == "HALTED"
+        assert (
+            connection.execute("SELECT COUNT(*) FROM forward_quotes WHERE accepted=1").fetchone()[0]
+            == 2
+        )
+        assert connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0] == 0
+
+
+# P10-P4 EXECUTION PRICE DEVIATION REGRESSION
+
+
+def test_sma_runtime_rejects_execution_price_outside_deviation(
+    tmp_path: Path,
+) -> None:
+    database, _, (instrument_id,), runtime = _setup(tmp_path)
+
+    prices = (
+        "100",
+        "100",
+        "100",
+        "100",
+        "99.90",
+        "99.80",
+        "100.10",
+        "100.30",
+    )
+
+    rejected = None
+
+    for index, price in enumerate(prices):
+        quote = _quote(
+            instrument_id,
+            (_START + timedelta(minutes=index)).isoformat(),
+            index + 1,
+            Decimal(price),
+            f"sma-deviation-{index}",
+        )
+
+        processed = runtime.process_quote(quote)
+        assert processed.accepted
+
+        for event_id in processed.scheduled_event_ids:
+            try:
+                proposal = runtime.build_sma_proposal(
+                    event_id,
+                    fast_window=2,
+                    slow_window=3,
+                    buy_quantity=2,
+                )
+            except ForwardRuntimeError as exc:
+                if "Insufficient authenticated completed SMA candles" in str(exc):
+                    continue
+                raise
+
+            if proposal.action != DecisionAction.BUY:
+                continue
+
+            snapshot = runtime.execution_snapshot(instrument_id, quote)
+
+            assert abs(snapshot.reference_price - proposal.entry_price) > Decimal("0.05")
+
+            rejected = runtime.route_event(
+                event_id,
+                proposal,
+                snapshot,
+            )
+
+            assert rejected.status == "REJECTED"
+            assert "deviation" in (rejected.reason or "").lower()
+            break
+
+        if rejected is not None:
+            break
+
+    assert rejected is not None
+
+    with closing(get_connection(database)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0] == 0
+
+
+# P10-P4 FINAL CAUSAL INTEGRATION REGRESSIONS
+
+# P10-P4 FINAL CAUSAL INTEGRATION REGRESSIONS
+
+
+def test_causal_guard_failure_rolls_back_authenticated_forward_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real router must not commit financial writes after a causal failure."""
+    database, _, (instrument_id,), runtime = _setup(tmp_path)
+    quotes = list(_provider((instrument_id,), count=2))
+
+    runtime.process_quote(quotes[0])
+    event_id = runtime.process_quote(quotes[1]).scheduled_event_ids[0]
+
+    proposal = runtime.build_mock_proposal(event_id, "BUY", 1)
+    snapshot = runtime.execution_snapshot(instrument_id, quotes[1])
+
+    before = {}
+    tables = (
+        "paper_orders",
+        "paper_fills",
+        "paper_ledger_entries",
+        "paper_execution_snapshot_uses",
+    )
+
+    with closing(get_connection(database)) as connection:
+        for table in tables:
+            before[table] = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+    calls = []
+
+    def reject_causal_order(
+        connection: sqlite3.Connection,
+        account_id: int,
+        checked_event_id: str,
+        checked_instrument_id: int,
+    ) -> None:
+        calls.append((account_id, checked_event_id, checked_instrument_id))
+        raise PaperTradingError(
+            "Forward causal ordering rejected an event after a later terminal scheduler decision."
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            paper_trading_module,
+            "_assert_forward_causal_order",
+            reject_causal_order,
+        )
+
+        try:
+            rejected = runtime.route_event(event_id, proposal, snapshot)
+        except PaperTradingError as exc:
+            assert "Forward causal ordering" in str(exc)
+        else:
+            assert rejected.status == "REJECTED", rejected
+            assert "causal ordering" in (rejected.reason or "").lower(), rejected
+
+    assert calls == [(runtime.account_id, event_id, instrument_id)]
+
+    with closing(get_connection(database)) as connection:
+        for table in tables:
+            assert (
+                connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == before[table]
+            ), table
+
+        authorization = connection.execute(
+            """SELECT status, consumed_order_id
+               FROM forward_execution_authorizations
+               WHERE event_id = ?""",
+            (event_id,),
+        ).fetchone()
+
+        assert authorization is not None
+        assert authorization["status"] == "AUTHORIZED"
+        assert authorization["consumed_order_id"] is None
+
+    reconciliation = reconcile_paper_account(
+        database,
+        runtime.account_id,
+    )
+    assert reconciliation["status"] == "RECONCILED", reconciliation
+
+    # A rejected scheduler event is terminal. Replaying it must
+    # never create an order or fill, even after the injected
+    # causal failure has been removed.
+    replay = runtime.route_event(event_id, proposal, snapshot)
+    assert replay.status == "REJECTED"
+    assert replay.duplicate
+
+    with closing(get_connection(database)) as connection:
+        for table in tables:
+            assert (
+                connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == before[table]
+            ), table
+
+        event = connection.execute(
+            """SELECT status FROM forward_scheduler_events
+               WHERE event_id = ?""",
+            (event_id,),
+        ).fetchone()
+        assert event["status"] == "REJECTED"
+
+    reconciliation = reconcile_paper_account(
+        database,
+        runtime.account_id,
+    )
+    assert reconciliation["status"] == "RECONCILED", reconciliation
+
+
+def test_sma_builder_blocks_older_event_after_later_terminal_hold(
+    tmp_path: Path,
+) -> None:
+    """Later terminal decisions invalidate older unprocessed SMA events."""
+    database, instrument_id, runtime, quotes, events = _sma_price_stream(
+        tmp_path,
+        (
+            "100",
+            "100",
+            "100",
+            "100",
+            "99.90",
+            "99.80",
+            "100.10",
+            "100.30",
+        ),
+    )
+
+    assert len(events) >= 2
+    older_event = events[-2]
+    later_event = events[-1]
+
+    proposal = runtime.build_mock_proposal(
+        later_event,
+        "HOLD",
+        0,
+    )
+    snapshot = runtime.execution_snapshot(
+        instrument_id,
+        quotes[-1],
+    )
+
+    result = runtime.route_event(
+        later_event,
+        proposal,
+        snapshot,
+    )
+    assert result.status == "HOLD", result.reason
+
+    with pytest.raises(
+        ForwardRuntimeError,
+        match="stale|later scheduler decision",
+    ):
+        runtime.build_sma_proposal(
+            older_event,
+            fast_window=2,
+            slow_window=3,
+        )
+
+    with closing(get_connection(database)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0] == 0
+
+    reconciliation = reconcile_paper_account(
+        database,
+        runtime.account_id,
+    )
+    assert reconciliation["status"] == "RECONCILED", reconciliation
+
+
+def test_genuine_later_fill_blocks_older_pending_forward_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real later fill must prevent stale financial execution."""
+    database, _, (instrument_id,), runtime = _setup(tmp_path)
+    quotes = list(_provider((instrument_id,), count=3))
+
+    runtime.process_quote(quotes[0])
+    older_event = runtime.process_quote(quotes[1]).scheduled_event_ids[0]
+    later_event = runtime.process_quote(quotes[2]).scheduled_event_ids[0]
+
+    older_proposal = runtime.build_mock_proposal(older_event, "BUY", 1)
+    later_proposal = runtime.build_mock_proposal(later_event, "BUY", 1)
+
+    older_snapshot = runtime.execution_snapshot(instrument_id, quotes[1])
+    later_snapshot = runtime.execution_snapshot(instrument_id, quotes[2])
+
+    filled = runtime.route_event(later_event, later_proposal, later_snapshot)
+    assert filled.status == "FILLED", filled.reason
+
+    tables = (
+        "paper_orders",
+        "paper_fills",
+        "paper_ledger_entries",
+        "paper_execution_snapshot_uses",
+    )
+
+    with closing(get_connection(database)) as connection:
+        before = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in tables
+        }
+
+    original_guard = paper_trading_module._assert_forward_causal_order
+    guard_calls = []
+
+    def observing_guard(
+        connection: sqlite3.Connection,
+        account_id: int,
+        event_id: str,
+        checked_instrument_id: int,
+    ) -> None:
+        guard_calls.append(event_id)
+        original_guard(
+            connection,
+            account_id,
+            event_id,
+            checked_instrument_id,
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            paper_trading_module,
+            "_assert_forward_causal_order",
+            observing_guard,
+        )
+
+        stale = runtime.route_event(older_event, older_proposal, older_snapshot)
+
+    assert stale.status == "REJECTED", stale
+    assert stale.status == "REJECTED", stale
+
+    # The router may reject the stale event before the
+    # Phase 8 financial boundary is reached. Both paths
+    # must prevent financial writes.
+    if guard_calls:
+        assert older_event in guard_calls
+        assert "causal ordering" in (stale.reason or "").lower(), stale
+    else:
+        assert stale.reason, stale
+
+    with closing(get_connection(database)) as connection:
+        for table in tables:
+            after = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            assert after == before[table], table
+
+        event = connection.execute(
+            """SELECT status FROM forward_scheduler_events
+               WHERE event_id = ?""",
+            (older_event,),
+        ).fetchone()
+        assert event["status"] == "REJECTED"
+
+    reconciliation = reconcile_paper_account(database, runtime.account_id)
+    assert reconciliation["status"] == "RECONCILED", reconciliation

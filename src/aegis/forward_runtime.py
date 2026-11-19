@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from collections.abc import Generator, Iterator, Mapping
@@ -33,6 +34,7 @@ from aegis.forward_paper_trading import (
     _proposal_canonical_json,
     _proposal_sha256,
 )
+from aegis.forward_sma import decide_completed_sma
 from aegis.market_quality import CalendarRegistry, analyze_dataset
 from aegis.paper_trading import (
     ExecutionSnapshot,
@@ -46,6 +48,7 @@ from aegis.paper_trading import (
     record_paper_mark,
     submit_paper_order,
 )
+from aegis.strategy_lab import StrategyCandle, StrategyLabError
 
 _INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15}
 _INDIA = ZoneInfo("Asia/Kolkata")
@@ -54,6 +57,36 @@ FeedStatus = Literal["STARTING", "HEALTHY", "DEGRADED", "STALE", "DISCONNECTED"]
 
 class ForwardRuntimeError(ValueError):
     """Raised when persisted synthetic runtime configuration or state is unsafe."""
+
+
+class SmaWarmupRequired(ForwardRuntimeError):
+    """Authenticated history is too short to evaluate an SMA crossover."""
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationEvidence:
+    """Bounded numeric wire evidence; never credentials or raw provider payloads."""
+
+    frame_sha256: str
+    price_binary64_hex: str
+    provider_emitted_at: str
+    processing_started_at: str
+    transport_mode: Literal["OFFLINE_TEST", "OBSERVE_ONLY"]
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[0-9a-f]{64}", self.frame_sha256) is None:
+            raise ForwardRuntimeError("Invalid observation frame fingerprint.")
+        try:
+            raw = float.fromhex(self.price_binary64_hex)
+            price = Decimal(str(raw))
+        except (TypeError, ValueError, InvalidOperation):
+            raise ForwardRuntimeError("Invalid observation price evidence.") from None
+        if not price.is_finite() or price <= 0 or raw.hex() != self.price_binary64_hex:
+            raise ForwardRuntimeError("Invalid observation price evidence.")
+        _timestamp(self.provider_emitted_at, "provider emission")
+        _timestamp(self.processing_started_at, "processing start")
+        if self.transport_mode not in ("OFFLINE_TEST", "OBSERVE_ONLY"):
+            raise ForwardRuntimeError("Invalid observation transport mode.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +100,7 @@ class Quote:
     quantity: int
     event_id: str
     received_at: str | None = None
+    observation_evidence: ObservationEvidence | None = None
 
 
 class QuoteProvider(Protocol):
@@ -202,7 +236,7 @@ def _timestamp(value: str, label: str) -> datetime:
 
 
 def _timestamp_text(value: datetime) -> str:
-    return value.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _bucket(value: datetime, minutes: int) -> datetime:
@@ -259,8 +293,11 @@ class ForwardRuntimeService:
         stale_after_seconds: int = 30,
         max_execution_price_deviation: Decimal | None = None,
         created_at: str | None = None,
+        observation_only: bool = False,
     ) -> ForwardRuntimeService:
-        """Persist a new immutable runtime configuration and synthetic provenance."""
+        """Persist immutable synthetic or explicitly observation-only provenance."""
+        if type(observation_only) is not bool:
+            raise ForwardRuntimeError("observation_only must be a boolean.")
         if not isinstance(runtime_id, str) or not runtime_id.strip():
             raise ForwardRuntimeError("runtime_id must be non-empty.")
         runtime_id = runtime_id.strip()
@@ -314,6 +351,9 @@ class ForwardRuntimeService:
             "provider": "DETERMINISTIC_SYNTHETIC",
         }
         config_json = _canonical_json(config)
+        if observation_only:
+            config.update(observation_only=True, provider="UPSTOX_V3_OBSERVE_ONLY")
+            config_json = _canonical_json(config)
         config_hash = hashlib.sha256(config_json.encode()).hexdigest()
         state = cls._empty_state(instrument_ids)
         state_json = _canonical_json(state)
@@ -327,6 +367,13 @@ class ForwardRuntimeService:
             ).fetchone()
             if account is None:
                 raise ForwardRuntimeError("A persisted Phase 8 paper account is required.")
+            if (
+                observation_only
+                and connection.execute(
+                    "SELECT 1 FROM paper_orders WHERE account_id = ? LIMIT 1", (account_id,)
+                ).fetchone()
+            ):
+                raise ForwardRuntimeError("Observation-only requires an unused paper account.")
             if halt_blocks_order(
                 account["halted"], account["halt_class"], account["halt_reason"], "SELL"
             ):
@@ -375,24 +422,31 @@ class ForwardRuntimeService:
                             file_sha256, requested_exchange, requested_trading_symbol, interval,
                             total_rows, accepted_rows, rejected_rows, skipped_rows, duplicate_rows,
                             same_file_reimport, source_use_status)
-                           VALUES ('SYNTHETIC_STREAM', 'COMPLETED', ?, ?, 0, 0, ?, ?, ?, ?,
-                                   ?, ?, ?, 0, 0, 0, 0, 0, 0, 'VERIFIED_PERMITTED')""",
+                           VALUES (?, 'COMPLETED', ?, ?, 0, 0, ?, ?, ?, ?,
+                                   ?, ?, ?, 0, 0, 0, 0, 0, 0, ?)""",
                         (
+                            "OBSERVED_STREAM" if observation_only else "SYNTHETIC_STREAM",
                             timestamp,
                             timestamp,
                             _canonical_json(
                                 {
                                     "runtime_id": runtime_id,
-                                    "provider": "DETERMINISTIC_SYNTHETIC",
-                                    "source_use_rationale": "Generated in-process synthetic data.",
+                                    "provider": config["provider"],
+                                    "source_use_rationale": (
+                                        "Observed Upstox V3 data; use rights are unverified."
+                                        if observation_only
+                                        else "Generated in-process synthetic data."
+                                    ),
                                 }
                             ),
                             instrument_id,
-                            f"{runtime_id}-{instrument_id}-{interval}.synthetic",
+                            f"{runtime_id}-{instrument_id}-{interval}."
+                            + ("observed" if observation_only else "synthetic"),
                             import_hash,
                             instrument["exchange"],
                             instrument["trading_symbol"],
                             interval,
+                            "UNVERIFIED" if observation_only else "VERIFIED_PERMITTED",
                         ),
                     )
                     if cursor.lastrowid is None:
@@ -403,11 +457,20 @@ class ForwardRuntimeService:
                     connection.execute(
                         """INSERT INTO import_source_use_history
                            (import_id, previous_status, new_status, declared_by, rationale)
-                           VALUES (?, NULL, 'VERIFIED_PERMITTED', ?, ?)""",
+                           VALUES (?, NULL, ?, ?, ?)""",
                         (
                             import_id,
-                            "Project Aegis deterministic synthetic provider",
-                            "Generated locally by the research-only test/runtime provider.",
+                            "UNVERIFIED" if observation_only else "VERIFIED_PERMITTED",
+                            (
+                                "Project Aegis observe-only runtime"
+                                if observation_only
+                                else "Project Aegis deterministic synthetic provider"
+                            ),
+                            (
+                                "Source-use rights have not been declared."
+                                if observation_only
+                                else "Generated locally by the research-only test/runtime provider."
+                            ),
                         ),
                     )
                     connection.execute(
@@ -416,6 +479,17 @@ class ForwardRuntimeService:
                            VALUES (?, ?, ?, ?)""",
                         (runtime_id, instrument_id, interval, import_id),
                     )
+            from aegis import paper_equity
+
+            if not observation_only:
+                paper_equity.capture(
+                    connection,
+                    account_id,
+                    timestamp,
+                    "INITIAL",
+                    "runtime-inception",
+                    session=runtime_id,
+                )
             cls._journal_health(
                 connection,
                 runtime_id,
@@ -717,6 +791,98 @@ class ForwardRuntimeService:
             raise ForwardRuntimeError(
                 "Paper account has an integrity or unclassified halt; runtime is halted."
             )
+        try:
+            with _transaction(self.database_path) as connection:
+                self._recover_committed_outcomes(connection)
+        except (ForwardRuntimeError, PaperTradingError, sqlite3.Error) as exc:
+            self._set_halted(
+                self.database_path,
+                self.runtime_id,
+                self.account_id,
+                f"Committed financial outcome recovery failed: {exc}",
+            )
+            raise ForwardRuntimeError(
+                "Committed financial outcome recovery failed; runtime is halted."
+            ) from exc
+
+    def _observation_mode(self, connection: sqlite3.Connection) -> bool:
+        row = connection.execute(
+            "SELECT config_json, config_sha256 FROM forward_runtimes WHERE runtime_id = ?",
+            (self.runtime_id,),
+        ).fetchone()
+        if (
+            row is None
+            or hashlib.sha256(row["config_json"].encode()).hexdigest() != row["config_sha256"]
+        ):
+            raise ForwardRuntimeError("Runtime configuration is unavailable or corrupted.")
+        config = json.loads(row["config_json"])
+        value = config.get("observation_only", False)
+        if type(value) is not bool or (
+            value != (config.get("provider") == "UPSTOX_V3_OBSERVE_ONLY")
+        ):
+            raise ForwardRuntimeError("Observation-only runtime configuration is inconsistent.")
+        return value
+
+    @property
+    def observation_only(self) -> bool:
+        """Read the persisted configuration; an adapter cannot promote execution mode."""
+        with closing(get_readonly_connection(self.database_path)) as connection:
+            return self._observation_mode(connection)
+
+    def _require_execution_runtime(self) -> None:
+        if self.observation_only:
+            raise ForwardRuntimeError("Observation-only runtime prohibits decisions and execution.")
+
+    def set_observation_feed_health(self, status: FeedStatus, observed_at: str) -> None:
+        """Persist transport unavailability without manufacturing a strategy decision."""
+        if status not in ("STARTING", "DISCONNECTED", "STALE"):
+            raise ForwardRuntimeError("Unsupported observation feed-health transition.")
+        self._ensure_runtime_ready()
+        timestamp = _timestamp_text(_timestamp(observed_at, "observation health time"))
+        with _transaction(self.database_path) as connection:
+            if not self._observation_mode(connection):
+                raise ForwardRuntimeError("Observation-only runtime is required.")
+            row = connection.execute(
+                "SELECT state_json FROM forward_runtimes WHERE runtime_id = ?", (self.runtime_id,)
+            ).fetchone()
+            state = json.loads(row["state_json"])
+            for feed in state["feed"].values():
+                feed.update(status=status, reason=f"Observe-only transport is {status}.")
+            content = _canonical_json(state)
+            connection.execute(
+                """UPDATE forward_runtimes SET state_json=?, state_sha256=?,
+                   status='DEGRADED', updated_at=? WHERE runtime_id=? AND status != 'HALTED'""",
+                (content, hashlib.sha256(content.encode()).hexdigest(), timestamp, self.runtime_id),
+            )
+            self._journal_health(
+                connection,
+                self.runtime_id,
+                f"observe:{status}:{timestamp}",
+                f"OBSERVE_{status}",
+                timestamp,
+                {},
+            )
+            self._state = state
+
+    def ensure_quote_progression_ready(self) -> None:
+        """Recover committed facts, then refuse continuation past pending decisions.
+
+        Session orchestrators must call this before advancing their quote stream.
+        Recovery never dispatches a pending financial proposal.
+        """
+        self._ensure_runtime_ready()
+        self._ensure_scheduler_recovered()
+        with closing(get_readonly_connection(self.database_path)) as connection:
+            pending = connection.execute(
+                """SELECT event_id FROM forward_scheduler_events
+                   WHERE runtime_id = ? AND status = 'PENDING'
+                   ORDER BY decision_timestamp, event_id LIMIT 1""",
+                (self.runtime_id,),
+            ).fetchone()
+        if pending is not None:
+            raise ForwardRuntimeError(
+                f"Unresolved scheduler event blocks quote progression: {pending['event_id']}."
+            )
 
     def process_quote(self, quote: Quote) -> QuoteResult:
         """Validate one event, persist its cursor, and store only completed candles."""
@@ -826,7 +992,56 @@ class ForwardRuntimeService:
             if reason is not None:
                 self._record_rejection(connection, quote, now, reason)
                 return QuoteResult(False, False, reason)
+            # Serialize recovery with cursor advancement, including when another
+            # caller committed a financial order after the initial readiness check.
+            self._recover_committed_outcomes(connection)
+            observation_only = self._observation_mode(connection)
+            evidence = quote.observation_evidence
+            if observation_only:
+                if not isinstance(evidence, ObservationEvidence) or (
+                    quote.received_at is None
+                    or Decimal(str(float.fromhex(evidence.price_binary64_hex))) != price
+                    or not observed
+                    <= _timestamp(evidence.provider_emitted_at, "provider emission")
+                    <= now
+                    <= _timestamp(evidence.processing_started_at, "processing start")
+                    or _timestamp(evidence.processing_started_at, "processing start")
+                    > datetime.now(UTC)
+                    or _timestamp(evidence.processing_started_at, "processing start") - observed
+                    > timedelta(seconds=self.max_quote_delay_seconds)
+                ):
+                    return QuoteResult(
+                        False, False, "Observation evidence is missing or inconsistent."
+                    )
+                if connection.execute(
+                    "SELECT 1 FROM paper_orders WHERE account_id = ? LIMIT 1", (self.account_id,)
+                ).fetchone():
+                    raise ForwardRuntimeError("Observation-only account has financial activity.")
+            elif evidence is not None:
+                return QuoteResult(
+                    False, False, "Provider observations require an observation-only runtime."
+                )
             completed = self._apply_quote(connection, quote, observed, now, price)
+            if observation_only and evidence is not None:
+                decision_journal._append_health(
+                    connection,
+                    self.runtime_id,
+                    f"observation:{quote.event_id}",
+                    "UPSTOX_V3_OBSERVATION",
+                    evidence.processing_started_at,
+                    {
+                        "instrument_id": quote.instrument_id,
+                        "frame_sha256": evidence.frame_sha256,
+                        "price_binary64_hex": evidence.price_binary64_hex,
+                        "price_conversion": "BINARY64_SHORTEST_REPR_V1",
+                        "provider_event_at": quote.timestamp,
+                        "provider_emitted_at": evidence.provider_emitted_at,
+                        "received_at": quote.received_at,
+                        "processing_started_at": evidence.processing_started_at,
+                        "transport_mode": evidence.transport_mode,
+                        "quantity_policy": "SAMPLED_LTQ_NOT_EXCHANGE_VOLUME",
+                    },
+                )
             state_json = _canonical_json(self._state)
             connection.execute(
                 """UPDATE forward_runtimes SET state_json = ?, state_sha256 = ?,
@@ -841,6 +1056,15 @@ class ForwardRuntimeService:
                 ),
             )
         scheduled_event_ids: list[str] = []
+        if observation_only:
+            # Authenticate completed observations and report F2 gaps, without
+            # creating scheduler opportunities or invoking protective execution.
+            with _transaction(self.database_path) as connection:
+                for candle in completed:
+                    _, unavailable = self._candle_decision_eligibility(connection, candle)
+                    if unavailable:
+                        self._record_unavailable_candle(connection, candle, now, unavailable)
+            return QuoteResult(True, False, None, tuple(completed))
         if completed:
             self._scheduler_dirty = True
         for completed_candle in completed:
@@ -925,14 +1149,17 @@ class ForwardRuntimeService:
         ).fetchone()
         if import_row is None:
             raise ForwardRuntimeError("Synthetic one-minute mark provenance is missing.")
-        record_paper_mark(
-            connection,
-            self.account_id,
-            quote.instrument_id,
-            price,
-            _timestamp_text(observed),
-            int(import_row["import_id"]),
-        )
+        if not self._observation_mode(connection):
+            record_paper_mark(
+                connection,
+                self.account_id,
+                quote.instrument_id,
+                price,
+                _timestamp_text(observed),
+                int(import_row["import_id"]),
+                as_of=_timestamp_text(now),
+                quote_event_id=quote.event_id,
+            )
         completed: list[dict[str, Any]] = []
         quote_bucket = _bucket(observed, 1)
         current = self._state["current_1m"][key]
@@ -946,11 +1173,27 @@ class ForwardRuntimeService:
             prior_bucket = _timestamp(current["candle_timestamp"], "candle timestamp")
             if quote_bucket <= prior_bucket:
                 raise ForwardRuntimeError("Out-of-order quote cannot close the active candle.")
-            completed_1m = dict(current)
-            completed_1m["completed_at"] = _timestamp_text(quote_bucket)
-            self._persist_candle(connection, completed_1m)
-            completed.append(completed_1m)
-            self._aggregate_candle(connection, completed_1m, completed)
+            if self._session_window(connection, quote.instrument_id, prior_bucket) != (
+                self._session_window(connection, quote.instrument_id, observed)
+            ):
+                # Session expiry alone does not establish a completed final bar.
+                # Retain the raw observations, report the unavailable close, and
+                # never carry a partially observed aggregate into another session.
+                self._record_unavailable_candle(
+                    connection, current, now, "UNOBSERVED_SESSION_CLOSE"
+                )
+                for aggregate in self._state["current_aggregates"][key].values():
+                    if aggregate is not None:
+                        self._record_unavailable_candle(
+                            connection, aggregate, now, "INCOMPLETE_AGGREGATE"
+                        )
+                self._state["current_aggregates"][key] = {"5m": None, "15m": None}
+            else:
+                completed_1m = dict(current)
+                completed_1m["completed_at"] = _timestamp_text(now)
+                self._persist_candle(connection, completed_1m)
+                completed.append(completed_1m)
+                self._aggregate_candle(connection, completed_1m, completed)
             self._state["current_1m"][key] = _new_candle(
                 quote.instrument_id, "1m", quote_bucket, price, quote.quantity
             )
@@ -969,12 +1212,12 @@ class ForwardRuntimeService:
             start = _bucket(minute, minutes)
             start_text = _timestamp_text(start)
             if aggregate is not None and aggregate["candle_timestamp"] != start_text:
-                if int(aggregate["component_count"]) == minutes:
-                    result = dict(aggregate)
-                    result.pop("component_count")
-                    result["completed_at"] = str(candle["completed_at"])
-                    self._persist_candle(connection, result)
-                    completed.append(result)
+                self._record_unavailable_candle(
+                    connection,
+                    aggregate,
+                    _timestamp(str(candle["completed_at"]), "aggregate observation"),
+                    "INCOMPLETE_AGGREGATE",
+                )
                 self._state["current_aggregates"][key][interval] = None
                 aggregate = None
             if aggregate is None:
@@ -1007,6 +1250,224 @@ class ForwardRuntimeService:
                 self._persist_candle(connection, result)
                 completed.append(result)
                 self._state["current_aggregates"][key][interval] = None
+            elif _timestamp(str(candle["completed_at"]), "aggregate observation") >= (
+                start + timedelta(minutes=minutes)
+            ):
+                self._record_unavailable_candle(
+                    connection,
+                    aggregate,
+                    _timestamp(str(candle["completed_at"]), "aggregate observation"),
+                    "INCOMPLETE_AGGREGATE",
+                )
+                self._state["current_aggregates"][key][interval] = None
+
+    def _session_window(
+        self, connection: sqlite3.Connection, instrument_id: int, observed: datetime
+    ) -> tuple[datetime, datetime]:
+        """Resolve an observation's actual configured session, including special schedules."""
+        instrument = connection.execute(
+            "SELECT exchange, segment FROM instruments WHERE id = ?", (instrument_id,)
+        ).fetchone()
+        calendar = (
+            self.calendars.resolve(instrument["exchange"], instrument["segment"])
+            if instrument is not None
+            else None
+        )
+        if calendar is None:
+            raise ForwardRuntimeError("Candle session calendar is unavailable.")
+        local = observed.astimezone(ZoneInfo(calendar.timezone_name))
+        sessions = calendar.sessions_for(local.date())
+        if sessions is None:
+            raise ForwardRuntimeError("Candle session calendar does not cover the observation.")
+        for session in sessions:
+            opens = datetime.combine(local.date(), session.opens, local.tzinfo).astimezone(UTC)
+            closes = datetime.combine(local.date(), session.closes, local.tzinfo).astimezone(UTC)
+            if opens <= observed < closes:
+                return opens, closes
+        raise ForwardRuntimeError("Candle observation is outside a configured session.")
+
+    def _candle_decision_eligibility(
+        self, connection: sqlite3.Connection, candle: Mapping[str, Any]
+    ) -> tuple[datetime, str | None]:
+        """Authenticate completion evidence and apply the same causal rule on ingest/restart.
+
+        The interval end is a potential decision cutoff, never a substitute for the
+        actual receipt time of the first accepted quote closing that interval.
+        A late but evidenced observation is unavailable, not corrupt persistence.
+        """
+        interval = str(candle["interval"])
+        if interval not in _INTERVAL_MINUTES:
+            raise ForwardRuntimeError("Completed candle interval is invalid.")
+        instrument_id = int(candle["instrument_id"])
+        start = _timestamp(str(candle["candle_timestamp"]), "candle timestamp")
+        completed = _timestamp(str(candle["completed_at"]), "candle observation time")
+        minutes = _INTERVAL_MINUTES[interval]
+        boundary = start + timedelta(minutes=minutes)
+        if (
+            instrument_id not in self.instrument_ids
+            or _timestamp_text(start) != candle["candle_timestamp"]
+            or _timestamp_text(completed) != candle["completed_at"]
+            or _bucket(start, minutes) != start
+            or completed < boundary
+        ):
+            raise ForwardRuntimeError("Completed candle has an inconsistent completion time.")
+        source = connection.execute(
+            """SELECT h.* FROM forward_runtime_imports i JOIN historical_candles h
+                 ON h.import_id = i.import_id AND h.instrument_id = i.instrument_id
+                AND h.interval = i.interval
+               WHERE i.runtime_id = ? AND i.instrument_id = ? AND i.interval = ?
+                 AND h.candle_timestamp = ?""",
+            (self.runtime_id, instrument_id, interval, candle["candle_timestamp"]),
+        ).fetchone()
+        fields = ("open_decimal", "high_decimal", "low_decimal", "close_decimal", "volume")
+        if source is None or any(source[field] != candle[field] for field in fields):
+            raise ForwardRuntimeError("Completed candle historical provenance is inconsistent.")
+        closing = connection.execute(
+            """SELECT quote_timestamp, received_at FROM forward_quotes
+               WHERE runtime_id = ? AND instrument_id = ? AND accepted = 1
+                 AND substr(quote_timestamp,1,19) >= ? ORDER BY sequence LIMIT 1""",
+            (self.runtime_id, instrument_id, _timestamp_text(boundary)[:19]),
+        ).fetchone()
+        if closing is None or (
+            closing["received_at"] != candle["completed_at"]
+            or _timestamp(closing["quote_timestamp"], "closing quote") > completed
+        ):
+            raise ForwardRuntimeError("Candle completion has no matching accepted quote evidence.")
+        observations = connection.execute(
+            """SELECT quote_timestamp, received_at, price_decimal, quantity
+               FROM forward_quotes WHERE runtime_id = ?
+               AND instrument_id = ? AND accepted = 1 AND substr(quote_timestamp,1,19) >= ?
+               AND substr(quote_timestamp,1,19) < ? ORDER BY sequence""",
+            (
+                self.runtime_id,
+                instrument_id,
+                candle["candle_timestamp"][:19],
+                _timestamp_text(boundary)[:19],
+            ),
+        ).fetchall()
+        if not observations or any(
+            _timestamp(row["received_at"], "candle quote receipt") > completed
+            for row in observations
+        ):
+            raise ForwardRuntimeError("Completed candle has no accepted observations.")
+        session = self._session_window(connection, instrument_id, start)
+        if interval != "1m":
+            components = connection.execute(
+                """SELECT * FROM forward_runtime_candles WHERE runtime_id = ?
+                   AND instrument_id = ? AND interval = '1m' AND candle_timestamp >= ?
+                   AND candle_timestamp < ? ORDER BY candle_timestamp""",
+                (
+                    self.runtime_id,
+                    instrument_id,
+                    candle["candle_timestamp"],
+                    _timestamp_text(boundary),
+                ),
+            ).fetchall()
+            if len(components) != minutes or any(
+                row["candle_timestamp"] != _timestamp_text(start + timedelta(minutes=index))
+                or _timestamp(row["completed_at"], "component observation") > completed
+                for index, row in enumerate(components)
+            ):
+                raise ForwardRuntimeError("Aggregate candle has incomplete component evidence.")
+            expected = (
+                _decimal(components[0]["open_decimal"], "component open"),
+                max(_decimal(row["high_decimal"], "component high") for row in components),
+                min(_decimal(row["low_decimal"], "component low") for row in components),
+                _decimal(components[-1]["close_decimal"], "component close"),
+                sum(row["volume"] for row in components),
+            )
+        else:
+            prices = [_decimal(row["price_decimal"], "observed price") for row in observations]
+            expected = (
+                prices[0],
+                max(prices),
+                min(prices),
+                prices[-1],
+                sum(row["quantity"] for row in observations),
+            )
+        actual = tuple(_decimal(candle[field], field) for field in fields[:4]) + (candle["volume"],)
+        if actual != expected:
+            raise ForwardRuntimeError(
+                "Completed candle values contradict their observed provenance."
+            )
+        if boundary > session[1]:
+            return boundary, "INCOMPLETE_SESSION_INTERVAL"
+        if (
+            self._session_window(
+                connection, instrument_id, _timestamp(closing["quote_timestamp"], "closing quote")
+            )
+            != session
+        ):
+            return boundary, "UNOBSERVED_SESSION_CLOSE"
+        if completed > boundary:
+            return boundary, (
+                "MISSING_OBSERVATION_INTERVAL"
+                if _bucket(_timestamp(closing["quote_timestamp"], "closing quote"), 1) > boundary
+                else "LATE_CANDLE_FINALIZATION"
+            )
+        return boundary, None
+
+    def _record_unavailable_candle(
+        self,
+        connection: sqlite3.Connection,
+        candle: Mapping[str, Any],
+        observed: datetime,
+        reason: str,
+    ) -> None:
+        """Record a bounded, idempotent NO_DECISION observation without execution authority."""
+        interval = str(candle["interval"])
+        start = _timestamp(str(candle["candle_timestamp"]), "unavailable candle")
+        boundary = start + timedelta(minutes=_INTERVAL_MINUTES[interval])
+        event_id = _stable_id(
+            f"unavailable:{self.runtime_id}:{candle['instrument_id']}:{interval}:{candle['candle_timestamp']}:{reason}"
+        )
+        connection.execute("SAVEPOINT unavailable_candle")
+        try:
+            decision_id = decision_journal._append_decision(
+                connection,
+                decision_journal.DecisionEvent(
+                    run_id=self.runtime_id,
+                    event_id=event_id,
+                    instrument_id=int(candle["instrument_id"]),
+                    strategy_id="runtime-health",
+                    strategy_version="v1",
+                    decision_at=_timestamp_text(observed),
+                    interval=interval,
+                    state="NO_DECISION",
+                    reason_codes=(reason,),
+                    paper_account_id=self.account_id,
+                ),
+            )
+            details: dict[str, Any] = {
+                "decision_id": decision_id,
+                "instrument_id": int(candle["instrument_id"]),
+                "interval": interval,
+                "candle_timestamp": candle["candle_timestamp"],
+                "interval_boundary": _timestamp_text(boundary),
+            }
+            if reason == "MISSING_OBSERVATION_INTERVAL":
+                closing = connection.execute(
+                    """SELECT quote_timestamp FROM forward_quotes WHERE runtime_id = ?
+                       AND instrument_id = ? AND accepted = 1 AND substr(quote_timestamp,1,19) >= ?
+                       ORDER BY sequence LIMIT 1""",
+                    (self.runtime_id, candle["instrument_id"], _timestamp_text(boundary)[:19]),
+                ).fetchone()
+                if closing is not None:
+                    details.update(
+                        {
+                            "missing_from": _timestamp_text(boundary),
+                            "missing_until_exclusive": _timestamp_text(
+                                _bucket(_timestamp(closing["quote_timestamp"], "closing quote"), 1)
+                            ),
+                        }
+                    )
+            decision_journal._append_health(
+                connection, self.runtime_id, event_id, reason, _timestamp_text(observed), details
+            )
+        except (decision_journal.JournalError, sqlite3.Error):
+            connection.execute("ROLLBACK TO unavailable_candle")
+        finally:
+            connection.execute("RELEASE unavailable_candle")
 
     def _persist_candle(self, connection: sqlite3.Connection, candle: dict[str, Any]) -> None:
         instrument_id = int(candle["instrument_id"])
@@ -1283,13 +1744,24 @@ class ForwardRuntimeService:
     ) -> tuple[int, ...]:
         scores: list[tuple[Decimal, int]] = []
         for instrument_id in self.instrument_ids:
-            completion_filter = "AND completed_at <= ?" if as_of is not None else ""
+            # Normalize legacy whole-second and fractional receipt timestamps
+            # before comparing cutoffs: a '.' sorts before 'Z' in SQLite TEXT.
+            completion_filter = (
+                "AND (substr(completed_at,1,19) || CASE WHEN length(completed_at)=20 "
+                "THEN '.000000Z' ELSE substr(completed_at,20) END) <= ?"
+                if as_of is not None
+                else ""
+            )
             rows = connection.execute(
                 f"""SELECT close_decimal FROM forward_runtime_candles
                     WHERE runtime_id = ? AND instrument_id = ? AND interval = '1m'
                     {completion_filter}
-                    ORDER BY completed_at DESC, candle_timestamp DESC LIMIT 2""",
-                (self.runtime_id, instrument_id, _timestamp_text(as_of))
+                    ORDER BY candle_timestamp DESC LIMIT 2""",
+                (
+                    self.runtime_id,
+                    instrument_id,
+                    as_of.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                )
                 if as_of is not None
                 else (self.runtime_id, instrument_id),
             ).fetchall()
@@ -1315,6 +1787,7 @@ class ForwardRuntimeService:
         proposal_id: str | None = None,
     ) -> MarketEvidence:
         """Prepare decision evidence only from persisted, completed candles."""
+        self._require_execution_runtime()
         if interval not in _INTERVAL_MINUTES or instrument_id not in self.instrument_ids:
             raise ForwardRuntimeError("Unsupported evidence instrument or interval.")
         if (event_id is None) != (proposal_id is None):
@@ -1408,13 +1881,14 @@ class ForwardRuntimeService:
                     AND h.candle_timestamp = c.candle_timestamp
                     AND h.import_id = ri.import_id
                    WHERE c.runtime_id = ? AND c.instrument_id = ? AND c.interval = ?
-                     AND c.completed_at <= ?
-                   ORDER BY c.completed_at DESC, c.candle_timestamp DESC LIMIT 1""",
+                      AND (substr(c.completed_at,1,19) || CASE WHEN length(c.completed_at)=20
+                           THEN '.000000Z' ELSE substr(c.completed_at,20) END) <= ?
+                    ORDER BY c.candle_timestamp DESC LIMIT 1""",
                 (
                     self.runtime_id,
                     instrument_id,
                     interval,
-                    _timestamp_text(as_of_time),
+                    as_of_time.isoformat(timespec="microseconds").replace("+00:00", "Z"),
                 ),
             ).fetchone()
         if latest is None:
@@ -1475,6 +1949,7 @@ class ForwardRuntimeService:
 
     def _recover_exit_controls(self) -> None:
         with _transaction(self.database_path) as connection:
+            self._recover_committed_outcomes(connection)
             controls = connection.execute(
                 """SELECT instrument_id, exit_event_id FROM forward_trade_controls
                    WHERE runtime_id = ? AND active = 1 AND exit_event_id IS NOT NULL""",
@@ -1519,10 +1994,378 @@ class ForwardRuntimeService:
                             ),
                         )
 
+    def _recover_committed_outcomes(self, connection: sqlite3.Connection) -> None:
+        """Repair forward projections from authenticated Phase 8 facts, never dispatch orders.
+
+        The caller owns one IMMEDIATE transaction. Historical execution evidence is
+        checked at its original cutoff, not requalified as a new execution today.
+        Financial records, proposal bindings and journal records are read-only here.
+        """
+        authorization_schema = connection.execute(
+            """SELECT 1 FROM sqlite_master WHERE type = 'table'
+               AND name = 'forward_execution_authorizations'"""
+        ).fetchone()
+        if authorization_schema is None:
+            # Quote-only legacy runtimes can be migrated without financial repair.
+            # A legacy schema cannot prove a committed order association.
+            if (
+                connection.execute(
+                    "SELECT 1 FROM paper_orders WHERE account_id = ? LIMIT 1", (self.account_id,)
+                ).fetchone()
+                or connection.execute(
+                    """SELECT 1 FROM forward_scheduler_events
+                   WHERE runtime_id = ? AND status = 'FILLED' LIMIT 1""",
+                    (self.runtime_id,),
+                ).fetchone()
+            ):
+                raise ForwardRuntimeError("Legacy schema cannot authenticate committed outcomes.")
+            return
+        events = connection.execute(
+            """SELECT e.* FROM forward_scheduler_events e
+               LEFT JOIN forward_execution_authorizations a ON a.event_id = e.event_id
+               WHERE e.runtime_id = ? OR a.runtime_id = ?""",
+            (self.runtime_id, self.runtime_id),
+        ).fetchall()
+        buys: dict[int, tuple[int, sqlite3.Row, dict[str, Any]]] = {}
+        buy_proposals: dict[tuple[int, str], dict[str, Any]] = {}
+        for event in events:
+            authorization = connection.execute(
+                "SELECT * FROM forward_execution_authorizations WHERE event_id = ?",
+                (event["event_id"],),
+            ).fetchone()
+            protective = str(event["proposal_id"]).startswith("stop-target-")
+            key = str(event["event_id"] if protective else event["proposal_id"])
+            order = connection.execute(
+                """SELECT rowid AS order_sequence, * FROM paper_orders
+                   WHERE account_id = ? AND idempotency_key = ?""",
+                (self.account_id, key),
+            ).fetchone()
+            if order is None:
+                if event["status"] == "FILLED" or (
+                    authorization is not None and authorization["status"] == "CONSUMED"
+                ):
+                    raise ForwardRuntimeError("Committed event has no matching Phase 8 order.")
+                continue
+            payload = self._authenticate_committed_outcome(
+                connection, event, authorization, order, protective
+            )
+            if order["status"] == "FILLED" and order["side"] == "BUY":
+                instrument_id = int(order["requested_instrument_id"])
+                buy_proposals[instrument_id, str(event["proposal_id"])] = payload
+                previous = buys.get(instrument_id)
+                if previous is None or order["order_sequence"] > previous[0]:
+                    buys[instrument_id] = (int(order["order_sequence"]), event, payload)
+            if event["status"] != order["status"]:
+                result = _canonical_json(
+                    {
+                        "status": order["status"],
+                        "order_id": order["order_id"],
+                        "reason": order["reason"],
+                        "fill_price": order["fill_price"],
+                    }
+                )
+                repaired = connection.execute(
+                    "UPDATE forward_scheduler_events SET status = ?, result_json = ? WHERE event_id = ?",
+                    (order["status"], result, event["event_id"]),
+                )
+                if repaired.rowcount != 1:
+                    raise ForwardRuntimeError("Committed scheduler outcome could not be restored.")
+            else:
+                try:
+                    result_document = json.loads(event["result_json"])
+                except (TypeError, ValueError) as exc:
+                    raise ForwardRuntimeError("Terminal financial result is malformed.") from exc
+                if (
+                    not isinstance(result_document, dict)
+                    or result_document.get("status") != order["status"]
+                    or result_document.get("order_id") != order["order_id"]
+                ):
+                    raise ForwardRuntimeError(
+                        "Terminal event does not identify its committed order."
+                    )
+
+        for instrument_id, (order_sequence, event, payload) in buys.items():
+            position = connection.execute(
+                "SELECT quantity FROM paper_positions WHERE account_id = ? AND instrument_id = ?",
+                (self.account_id, instrument_id),
+            ).fetchone()
+            control = connection.execute(
+                "SELECT * FROM forward_trade_controls WHERE runtime_id = ? AND instrument_id = ?",
+                (self.runtime_id, instrument_id),
+            ).fetchone()
+            if position is None:
+                connection.execute(
+                    """UPDATE forward_trade_controls SET active = 0, exit_event_id = NULL
+                       WHERE runtime_id = ? AND instrument_id = ?""",
+                    (self.runtime_id, instrument_id),
+                )
+                continue
+            # A later BUY from another producer makes ownership of this position
+            # ambiguous. Never attach an older runtime's protection by guessing.
+            later_buy = connection.execute(
+                """SELECT 1 FROM paper_orders WHERE account_id = ?
+                   AND requested_instrument_id = ? AND side = 'BUY'
+                   AND status = 'FILLED' AND rowid > ? LIMIT 1""",
+                (self.account_id, instrument_id, order_sequence),
+            ).fetchone()
+            if later_buy is not None:
+                raise ForwardRuntimeError(
+                    "Open position has ambiguous forward protection ownership."
+                )
+            stop, target = payload["stop_loss"], payload["target_price"]
+            if control is not None and control["proposal_id"] == event["proposal_id"]:
+                if control["stop_loss"] != stop or control["target_price"] != target:
+                    raise ForwardRuntimeError(
+                        "Protection differs from its authenticated BUY proposal."
+                    )
+                if not control["active"]:
+                    connection.execute(
+                        """UPDATE forward_trade_controls SET active = 1
+                           WHERE runtime_id = ? AND instrument_id = ?""",
+                        (self.runtime_id, instrument_id),
+                    )
+            else:
+                if control is not None:
+                    original = buy_proposals.get((instrument_id, str(control["proposal_id"])))
+                    if original is None or (
+                        control["stop_loss"] != original["stop_loss"]
+                        or control["target_price"] != original["target_price"]
+                    ):
+                        raise ForwardRuntimeError(
+                            "Existing protection has an unverifiable proposal owner."
+                        )
+                connection.execute(
+                    """INSERT INTO forward_trade_controls
+                       (runtime_id, instrument_id, proposal_id, stop_loss, target_price, active)
+                       VALUES (?, ?, ?, ?, ?, 1)
+                       ON CONFLICT(runtime_id, instrument_id) DO UPDATE SET
+                         proposal_id = excluded.proposal_id, stop_loss = excluded.stop_loss,
+                         target_price = excluded.target_price, active = 1, exit_event_id = NULL""",
+                    (self.runtime_id, instrument_id, event["proposal_id"], stop, target),
+                )
+            verified = connection.execute(
+                "SELECT * FROM forward_trade_controls WHERE runtime_id = ? AND instrument_id = ?",
+                (self.runtime_id, instrument_id),
+            ).fetchone()
+            if verified is None or (
+                verified["proposal_id"] != event["proposal_id"]
+                or verified["stop_loss"] != stop
+                or verified["target_price"] != target
+                or verified["active"] != 1
+            ):
+                raise ForwardRuntimeError("Authenticated BUY protection could not be restored.")
+
+    def _authenticate_committed_outcome(
+        self,
+        connection: sqlite3.Connection,
+        event: sqlite3.Row,
+        authorization: sqlite3.Row | None,
+        order: sqlite3.Row,
+        protective: bool,
+    ) -> dict[str, Any]:
+        """Require the original binding, authorization and execution-use chain."""
+        try:
+            document = event["proposal_json"]
+            if not isinstance(document, str):
+                raise TypeError("Missing proposal document.")
+            payload = json.loads(document)
+            if not isinstance(payload, dict) or _canonical_json(payload) != document:
+                raise ForwardRuntimeError("Noncanonical proposal document.")
+            if (
+                event["runtime_id"] != self.runtime_id
+                or event["proposal_binding_state"] != "BOUND"
+                or _stable_id(document) != event["proposal_sha256"]
+                or authorization is None
+                or any(
+                    authorization[field] != expected
+                    for field, expected in (
+                        ("runtime_id", self.runtime_id),
+                        ("account_id", self.account_id),
+                        ("proposal_id", event["proposal_id"]),
+                        ("proposal_sha256", event["proposal_sha256"]),
+                        ("instrument_id", event["instrument_id"]),
+                        ("interval", event["interval"]),
+                        ("authorization_kind", "STOP_TARGET_EXIT" if protective else "PROPOSAL"),
+                    )
+                )
+            ):
+                raise ForwardRuntimeError("Unverifiable proposal or execution authorization.")
+            if protective:
+                if (
+                    payload["canonicalization_version"] != "aegis.forward-exit/v1"
+                    or payload["runtime_id"] != self.runtime_id
+                    or payload["event_id"] != event["event_id"]
+                    or payload["action"] != "SELL"
+                    or event["proposal_id"] != f"stop-target-{event['event_id']}"
+                ):
+                    raise ForwardRuntimeError("Invalid protective-exit binding.")
+            else:
+                values = dict(payload)
+                if values.pop("canonicalization_version") != "aegis.decision-proposal/v1":
+                    raise ForwardRuntimeError("Unsupported proposal version.")
+                proposal = DecisionProposal(**values)
+                if (
+                    _proposal_canonical_json(proposal) != document
+                    or proposal.timeframe != event["interval"]
+                    or event["interval"] not in _INTERVAL_MINUTES
+                    or event["event_id"]
+                    != self._event_id(
+                        int(event["instrument_id"]), event["interval"], event["candle_timestamp"]
+                    )
+                    or event["proposal_id"] != f"synthetic-{event['event_id'][:40]}"
+                ):
+                    raise ForwardRuntimeError("Invalid scheduler proposal identity.")
+                if _timestamp(event["decision_timestamp"], "scheduler decision") != (
+                    _timestamp(event["candle_timestamp"], "scheduler candle")
+                    + timedelta(minutes=_INTERVAL_MINUTES[event["interval"]])
+                ):
+                    raise ForwardRuntimeError("Invalid scheduler decision cutoff.")
+            request = PaperOrderRequest(
+                payload["instrument_id"],
+                payload["action"],
+                payload["quantity"],
+                payload["decision_timestamp"],
+                payload["submitted_at"],
+            )
+            if (
+                payload["proposal_id"] != event["proposal_id"]
+                or request.instrument_id != event["instrument_id"]
+                or order["requested_instrument_id"] != request.instrument_id
+                or order["order_id"] != _stable_id(f"{self.account_id}:{order['idempotency_key']}")
+                or order["request_sha256"] != _stable_id(_canonical_json(request.canonical()))
+                or any(order[field] != value for field, value in request.canonical().items())
+                or _timestamp(payload["decision_timestamp"], "proposal decision")
+                != _timestamp(event["decision_timestamp"], "scheduler decision")
+                or not (
+                    _timestamp(payload["submitted_at"], "proposal submission")
+                    <= _timestamp(order["execution_timestamp"], "committed execution")
+                    < _timestamp(payload["expires_at"], "proposal expiry")
+                )
+            ):
+                raise ForwardRuntimeError("Committed order differs from its original proposal.")
+            filled = order["status"] == "FILLED"
+            if authorization["status"] != ("CONSUMED" if filled else "REVOKED") or (
+                authorization["consumed_order_id"] != (order["order_id"] if filled else None)
+            ):
+                raise ForwardRuntimeError("Committed outcome differs from its authorization.")
+            use = connection.execute(
+                "SELECT * FROM paper_execution_snapshot_uses WHERE order_id = ?",
+                (order["order_id"],),
+            ).fetchone()
+            if filled and use is None:
+                raise ForwardRuntimeError("Committed fill has no authenticated snapshot use.")
+            if use is not None and any(
+                use[field] != authorization[field]
+                for field in (
+                    "runtime_id",
+                    "event_id",
+                    "proposal_id",
+                    "account_id",
+                    "instrument_id",
+                    "import_id",
+                    "snapshot_id",
+                    "snapshot_sha256",
+                )
+            ):
+                raise ForwardRuntimeError("Committed snapshot use differs from its authorization.")
+            quote = connection.execute(
+                """SELECT q.*, i.import_id FROM forward_quotes q
+                   JOIN forward_runtime_imports i ON i.runtime_id = q.runtime_id
+                     AND i.instrument_id = q.instrument_id AND i.interval = ?
+                   WHERE q.runtime_id = ? AND q.instrument_id = ? AND q.event_id = ?
+                     AND q.accepted = 1""",
+                (
+                    event["interval"],
+                    self.runtime_id,
+                    event["instrument_id"],
+                    authorization["quote_event_id"],
+                ),
+            ).fetchone()
+            if quote is None or (
+                quote["import_id"] != authorization["import_id"]
+                or quote["quote_timestamp"] != authorization["quote_timestamp"]
+                or quote["received_at"] != authorization["received_at"]
+                or quote["quote_timestamp"] != order["execution_timestamp"]
+                or _timestamp(quote["received_at"], "quote received")
+                != _timestamp(order["created_at"], "order creation")
+                or not (
+                    _timestamp(order["execution_timestamp"], "committed execution")
+                    <= _timestamp(quote["received_at"], "quote received")
+                    < _timestamp(payload["expires_at"], "proposal expiry")
+                )
+                or use is not None
+                and use["used_at"] != order["execution_timestamp"]
+                or Decimal(quote["price_decimal"]) != Decimal(order["reference_price"])
+                or filled
+                and quote["quantity"] < order["quantity"]
+                or authorization["snapshot_id"]
+                != _stable_id(f"execution-snapshot:{authorization['snapshot_sha256']}")
+            ):
+                raise ForwardRuntimeError("Committed execution has inconsistent quote provenance.")
+            fill = connection.execute(
+                "SELECT * FROM paper_fills WHERE order_id = ?", (order["order_id"],)
+            ).fetchone()
+            if (
+                filled
+                and (
+                    fill is None
+                    or fill["fill_id"] != _stable_id(f"{order['order_id']}:fill:1")
+                    or any(
+                        fill[field] != order[field]
+                        for field in (
+                            "instrument_id",
+                            "quantity",
+                            "fill_price",
+                            "execution_timestamp",
+                        )
+                    )
+                )
+                or not filled
+                and fill is not None
+            ):
+                raise ForwardRuntimeError("Committed order and fill disagree.")
+            audits = connection.execute(
+                """SELECT j.*, a.payload_json AS audit_json, a.payload_sha256 AS audit_sha256,
+                          a.status AS audit_status, a.fill_id
+                   FROM decision_journal_events j JOIN decision_journal_audits a USING(decision_id)
+                   WHERE a.order_id = ? AND a.stage = 'EXECUTION'""",
+                (order["order_id"],),
+            ).fetchall()
+            if filled and request.side == "BUY" and len(audits) != 1:
+                raise ForwardRuntimeError(
+                    "Committed BUY has no unique mandatory journal execution link."
+                )
+            for audit in audits:
+                recorded = json.loads(audit["payload_json"])
+                if (
+                    audit["run_id"] != self.runtime_id
+                    or audit["event_id"] != event["event_id"]
+                    or audit["paper_account_id"] != self.account_id
+                    or audit["instrument_id"] != event["instrument_id"]
+                    or audit["role"] != "ACTIVE"
+                    or _stable_id(audit["payload_json"]) != audit["payload_sha256"]
+                    or recorded["proposal_fingerprint"] != event["proposal_sha256"]
+                    or _stable_id(audit["audit_json"]) != audit["audit_sha256"]
+                    or audit["audit_status"] != order["status"]
+                    or audit["fill_id"] != (fill["fill_id"] if fill is not None else None)
+                    or json.loads(audit["audit_json"])["snapshot_fingerprint"]
+                    != authorization["snapshot_sha256"]
+                ):
+                    raise ForwardRuntimeError(
+                        "Committed outcome conflicts with its journal evidence."
+                    )
+            return payload
+        except ForwardRuntimeError:
+            raise
+        except (KeyError, TypeError, ValueError, InvalidOperation, OverflowError) as exc:
+            raise ForwardRuntimeError("Unauthenticated committed financial outcome.") from exc
+
     def recover_scheduler_events(self) -> tuple[str, ...]:
         """Recover missing events for completed candidate candles without routing proposals."""
+        self._ensure_runtime_ready()
         recovered: list[str] = []
         with _transaction(self.database_path) as connection:
+            self._recover_committed_outcomes(connection)
             runtime = connection.execute(
                 """SELECT state_json, state_sha256, status FROM forward_runtimes
                    WHERE runtime_id = ?""",
@@ -1557,6 +2400,9 @@ class ForwardRuntimeService:
                    WHERE runtime_id = ?""",
                 (self.runtime_id,),
             ).fetchall()
+            observation_only = self._observation_mode(connection)
+            if observation_only and events:
+                raise ForwardRuntimeError("Observation-only runtime has unexpected scheduler work.")
             for event in events:
                 if str(event["proposal_id"]).startswith("stop-target-"):
                     continue
@@ -1579,22 +2425,36 @@ class ForwardRuntimeService:
                         "Scheduler event identity or timestamp is inconsistent."
                     )
             candles = connection.execute(
-                """SELECT instrument_id, interval, candle_timestamp, completed_at
+                """SELECT *
                    FROM forward_runtime_candles WHERE runtime_id = ?
                    ORDER BY completed_at, candle_timestamp, instrument_id, interval""",
                 (self.runtime_id,),
             ).fetchall()
             for candle in candles:
                 interval = str(candle["interval"])
-                if interval not in _INTERVAL_MINUTES:
-                    raise ForwardRuntimeError("Completed candle interval is invalid.")
-                decision_time = _timestamp(
-                    str(candle["candle_timestamp"]), "candle timestamp"
-                ) + timedelta(minutes=_INTERVAL_MINUTES[interval])
-                if _timestamp(candle["completed_at"], "candle completion time") > decision_time:
-                    raise ForwardRuntimeError(
-                        "Completed candle has an inconsistent completion time."
+                decision_time, unavailable = self._candle_decision_eligibility(
+                    connection, dict(candle)
+                )
+                if unavailable is not None:
+                    if any(
+                        event["event_id"]
+                        == self._event_id(
+                            int(candle["instrument_id"]), interval, candle["candle_timestamp"]
+                        )
+                        for event in events
+                    ):
+                        raise ForwardRuntimeError(
+                            "Scheduler event references an ineligible candle."
+                        )
+                    self._record_unavailable_candle(
+                        connection,
+                        dict(candle),
+                        _timestamp(candle["completed_at"], "candle observation"),
+                        unavailable,
                     )
+                    continue
+                if observation_only:
+                    continue
                 if int(candle["instrument_id"]) not in self._select_candidates(
                     connection, decision_time
                 ):
@@ -1659,25 +2519,35 @@ class ForwardRuntimeService:
 
     def schedule_event(self, instrument_id: int, interval: str, candle_timestamp: str) -> str:
         """Create a stable event once per completed candle, using the candidate cap."""
+        self._require_execution_runtime()
+        self._ensure_runtime_ready()
         if interval not in _INTERVAL_MINUTES:
             raise ForwardRuntimeError("Scheduler interval is unsupported.")
         decision_time = _timestamp(candle_timestamp, "candle timestamp") + timedelta(
             minutes=_INTERVAL_MINUTES[interval]
         )
-        if instrument_id not in self.select_candidates(decision_time):
-            return ""
         event_id = self._event_id(instrument_id, interval, candle_timestamp)
         proposal_id = f"synthetic-{event_id[:40]}"
         with _transaction(self.database_path) as connection:
+            self._recover_committed_outcomes(connection)
             candle = connection.execute(
-                """SELECT completed_at FROM forward_runtime_candles WHERE runtime_id = ?
+                """SELECT * FROM forward_runtime_candles WHERE runtime_id = ?
                    AND instrument_id = ? AND interval = ? AND candle_timestamp = ?""",
                 (self.runtime_id, instrument_id, interval, candle_timestamp),
             ).fetchone()
             if candle is None:
                 raise ForwardRuntimeError("Scheduler requires a completed candle.")
-            if _timestamp(candle["completed_at"], "candle completion time") > decision_time:
-                raise ForwardRuntimeError("Scheduler cannot use a future-completed candle.")
+            decision_time, unavailable = self._candle_decision_eligibility(connection, dict(candle))
+            if unavailable is not None:
+                self._record_unavailable_candle(
+                    connection,
+                    dict(candle),
+                    _timestamp(candle["completed_at"], "candle observation"),
+                    unavailable,
+                )
+                return ""
+            if instrument_id not in self._select_candidates(connection, decision_time):
+                return ""
             event_write = _SchedulerEventWrite(
                 event_id=event_id,
                 runtime_id=self.runtime_id,
@@ -1706,6 +2576,362 @@ class ForwardRuntimeService:
                 )
         return event_id
 
+    def build_sma_proposal(
+        self,
+        event_id: str,
+        *,
+        fast_window: int,
+        slow_window: int,
+        buy_quantity: int = 1,
+        record_warmup: bool = False,
+        stop_loss: Decimal | None = None,
+        target_price: Decimal | None = None,
+    ) -> DecisionProposal:
+        """Build a research-only SMA proposal from authenticated completed candles.
+
+        This method never authorizes or submits a paper order.
+        The existing route_event boundary remains mandatory.
+        With record_warmup=True, insufficient authenticated history atomically
+        records NO_DECISION and closes the unbound scheduler event as REJECTED
+        before raising SmaWarmupRequired. No HOLD or proposal is manufactured.
+        Optional entry protection is included only in BUY proposals and in their
+        canonical binding. Existing proposal validation and Phase 8 remain mandatory.
+        """
+        if (
+            isinstance(fast_window, bool)
+            or isinstance(slow_window, bool)
+            or not isinstance(fast_window, int)
+            or not isinstance(slow_window, int)
+            or fast_window < 2
+            or slow_window <= fast_window
+        ):
+            raise ForwardRuntimeError("Require 2 <= fast_window < slow_window.")
+
+        if isinstance(buy_quantity, bool) or not isinstance(buy_quantity, int) or buy_quantity < 1:
+            raise ForwardRuntimeError("buy_quantity must be a positive integer.")
+
+        if type(record_warmup) is not bool:
+            raise ForwardRuntimeError("record_warmup must be a boolean.")
+
+        for name, value in (("stop_loss", stop_loss), ("target_price", target_price)):
+            if value is not None and _decimal(value, name) <= 0:
+                raise ForwardRuntimeError(f"{name} must be positive when supplied.")
+
+        if not isinstance(event_id, str) or not event_id:
+            raise ForwardRuntimeError("A scheduler event ID is required.")
+
+        self._ensure_runtime_ready()
+        self._ensure_scheduler_recovered()
+
+        with closing(get_connection(self.database_path)) as connection:
+            # One snapshot; opt-in warm-up recording reserves the writer so
+            # authentication, journal and scheduler resolution stay atomic.
+            connection.execute("BEGIN IMMEDIATE" if record_warmup else "BEGIN")
+            try:
+                event = connection.execute(
+                    """SELECT * FROM forward_scheduler_events
+                       WHERE event_id = ? AND runtime_id = ?""",
+                    (event_id, self.runtime_id),
+                ).fetchone()
+
+                if event is None:
+                    raise ForwardRuntimeError("Scheduler event does not exist.")
+
+                if self._observation_mode(connection):
+                    raise ForwardRuntimeError("Observation-only runtime prohibits SMA proposals.")
+
+                if event["status"] != "PENDING":
+                    raise ForwardRuntimeError("SMA proposals require a pending scheduler event.")
+
+                if event["proposal_binding_state"] not in ("UNBOUND", "BOUND"):
+                    raise ForwardRuntimeError("Invalid scheduler proposal binding.")
+
+                instrument_id = int(event["instrument_id"])
+                interval = str(event["interval"])
+                candle_timestamp = str(event["candle_timestamp"])
+                decision_timestamp = str(event["decision_timestamp"])
+
+                if interval not in _INTERVAL_MINUTES:
+                    raise ForwardRuntimeError("Unsupported SMA interval.")
+
+                if event_id != self._event_id(instrument_id, interval, candle_timestamp):
+                    raise ForwardRuntimeError("Scheduler event identity mismatch.")
+
+                candle_time = _timestamp(candle_timestamp, "event candle timestamp")
+                decision_time = _timestamp(decision_timestamp, "event decision timestamp")
+
+                if (
+                    _timestamp_text(candle_time) != candle_timestamp
+                    or _timestamp_text(decision_time) != decision_timestamp
+                    or decision_time != candle_time + timedelta(minutes=_INTERVAL_MINUTES[interval])
+                ):
+                    raise ForwardRuntimeError("Scheduler candle or decision timestamp is invalid.")
+
+                if event["proposal_binding_state"] == "UNBOUND" and (
+                    event["proposal_sha256"] is not None or event["proposal_json"] is not None
+                ):
+                    raise ForwardRuntimeError("Unbound scheduler event has proposal content.")
+
+                # Fail closed if a later decision has already advanced
+                # this instrument's runtime state. Pending future events
+                # alone do not invalidate chronological recovery.
+                later_terminal = connection.execute(
+                    """SELECT event_id FROM forward_scheduler_events
+                       WHERE runtime_id = ?
+                         AND instrument_id = ?
+                         AND decision_timestamp > ?
+                         AND status IN ('HOLD', 'FILLED', 'REJECTED')
+                       LIMIT 1""",
+                    (
+                        self.runtime_id,
+                        instrument_id,
+                        decision_timestamp,
+                    ),
+                ).fetchone()
+                if later_terminal is not None:
+                    raise ForwardRuntimeError(
+                        "SMA event is stale: a later scheduler decision "
+                        "has already reached a terminal state."
+                    )
+
+                import_row = connection.execute(
+                    """SELECT import_id FROM forward_runtime_imports
+                       WHERE runtime_id = ? AND instrument_id = ?
+                         AND interval = ?""",
+                    (self.runtime_id, instrument_id, interval),
+                ).fetchone()
+
+                if import_row is None:
+                    raise ForwardRuntimeError("SMA synthetic import provenance is missing.")
+
+                import_id = int(import_row["import_id"])
+
+                # Refuse truncated history: Strategy Lab's signal state
+                # starts flat and cannot safely be reconstructed from
+                # an arbitrary rolling window.
+                rows = connection.execute(
+                    """SELECT c.candle_timestamp, c.open_decimal,
+                              c.high_decimal, c.low_decimal,
+                              c.close_decimal, c.volume, c.completed_at,
+                              h.open_decimal AS hist_open,
+                              h.high_decimal AS hist_high,
+                              h.low_decimal AS hist_low,
+                              h.close_decimal AS hist_close,
+                              h.volume AS hist_volume
+                       FROM forward_runtime_candles AS c
+                       LEFT JOIN historical_candles AS h
+                         ON h.instrument_id = c.instrument_id
+                        AND h.interval = c.interval
+                        AND h.candle_timestamp = c.candle_timestamp
+                        AND h.import_id = ?
+                       WHERE c.runtime_id = ?
+                         AND c.instrument_id = ?
+                         AND c.interval = ?
+                         AND c.candle_timestamp <= ?
+                       ORDER BY c.candle_timestamp ASC
+                       LIMIT 4097""",
+                    (
+                        import_id,
+                        self.runtime_id,
+                        instrument_id,
+                        interval,
+                        candle_timestamp,
+                    ),
+                ).fetchall()
+
+                if len(rows) > 4096:
+                    raise ForwardRuntimeError("SMA history exceeds the bounded research limit.")
+
+                if not rows:
+                    raise ForwardRuntimeError("SMA completed candle evidence is missing.")
+
+                if str(rows[-1]["candle_timestamp"]) != candle_timestamp:
+                    raise ForwardRuntimeError(
+                        "Scheduler event candle is not the latest SMA candle."
+                    )
+
+                candles = []
+                for row in rows:
+                    timestamp = str(row["candle_timestamp"])
+                    completed_at = str(row["completed_at"])
+
+                    candle_start = _timestamp(timestamp, "SMA candle timestamp")
+                    completion = _timestamp(completed_at, "SMA candle completion timestamp")
+
+                    if (
+                        _timestamp_text(candle_start) != timestamp
+                        or _timestamp_text(completion) != completed_at
+                        or completion > decision_time
+                        or completion
+                        < candle_start + timedelta(minutes=_INTERVAL_MINUTES[interval])
+                    ):
+                        raise ForwardRuntimeError("SMA candle has invalid completion timing.")
+
+                    fields = (
+                        ("open_decimal", "hist_open"),
+                        ("high_decimal", "hist_high"),
+                        ("low_decimal", "hist_low"),
+                        ("close_decimal", "hist_close"),
+                    )
+
+                    for runtime_field, history_field in fields:
+                        historical = row[history_field]
+                        if historical is None:
+                            raise ForwardRuntimeError(
+                                "SMA candle historical provenance is missing."
+                            )
+                        try:
+                            same = Decimal(str(row[runtime_field])) == Decimal(str(historical))
+                        except InvalidOperation as exc:
+                            raise ForwardRuntimeError(
+                                "Invalid SMA candle price provenance."
+                            ) from exc
+                        if not same:
+                            raise ForwardRuntimeError("SMA runtime and historical prices differ.")
+
+                    if (
+                        row["hist_volume"] is None
+                        or type(row["volume"]) is not int
+                        or type(row["hist_volume"]) is not int
+                        or row["volume"] != row["hist_volume"]
+                    ):
+                        raise ForwardRuntimeError("SMA candle volume provenance mismatch.")
+
+                    try:
+                        prices = {
+                            field: Decimal(str(row[f"{field}_decimal"]))
+                            for field in ("open", "high", "low", "close")
+                        }
+                        if any(not price.is_finite() or price <= 0 for price in prices.values()):
+                            raise ForwardRuntimeError(
+                                "SMA candle prices must be finite and positive."
+                            )
+                        if (
+                            prices["low"] > prices["high"]
+                            or prices["high"] < max(prices["open"], prices["close"])
+                            or prices["low"] > min(prices["open"], prices["close"])
+                        ):
+                            raise ForwardRuntimeError("SMA candle OHLC relationships are invalid.")
+                        candles.append(
+                            StrategyCandle(
+                                timestamp=timestamp,
+                                open=prices["open"],
+                                high=prices["high"],
+                                low=prices["low"],
+                                close=prices["close"],
+                                volume=int(row["volume"]),
+                            )
+                        )
+                    except (InvalidOperation, ValueError) as exc:
+                        raise ForwardRuntimeError("Invalid persisted SMA candle.") from exc
+
+                if len(candles) < slow_window + 1:
+                    if record_warmup:
+                        if event["proposal_binding_state"] != "UNBOUND":
+                            raise ForwardRuntimeError("Cannot resolve bound SMA work as warm-up.")
+                        decision_id = decision_journal.record_missing_evaluation(
+                            connection,
+                            self.runtime_id,
+                            instrument_id,
+                            event_id,
+                            decision_timestamp,
+                            "SMA_WARMUP",
+                            self.account_id,
+                            interval=interval,
+                        )
+                        connection.execute(
+                            """UPDATE forward_scheduler_events SET status = 'REJECTED',
+                               result_json = ? WHERE event_id = ? AND status = 'PENDING'""",
+                            (
+                                _canonical_json(
+                                    {
+                                        "status": "REJECTED",
+                                        "reason": "SMA_WARMUP",
+                                        "decision_state": "NO_DECISION",
+                                        "decision_id": decision_id,
+                                    }
+                                ),
+                                event_id,
+                            ),
+                        )
+                        connection.commit()
+                    raise SmaWarmupRequired("Insufficient authenticated completed SMA candles.")
+
+                try:
+                    decision = decide_completed_sma(
+                        tuple(candles),
+                        fast_window=fast_window,
+                        slow_window=slow_window,
+                    )
+                except (ValueError, StrategyLabError) as exc:
+                    raise ForwardRuntimeError(
+                        "Persisted SMA history failed strategy validation."
+                    ) from exc
+
+                position = connection.execute(
+                    """SELECT quantity FROM paper_positions
+                       WHERE account_id = ? AND instrument_id = ?""",
+                    (self.account_id, instrument_id),
+                ).fetchone()
+
+                quantity_held = 0
+                if position is not None:
+                    quantity_held = position["quantity"]
+                    if type(quantity_held) is not int or quantity_held <= 0:
+                        raise ForwardRuntimeError("Invalid authoritative paper position quantity.")
+
+                action = decision.action
+                quantity = 0
+
+                if action == "BUY":
+                    if quantity_held == 0:
+                        quantity = buy_quantity
+                    else:
+                        action = "HOLD"
+                elif action == "SELL":
+                    if quantity_held > 0:
+                        quantity = quantity_held
+                    else:
+                        action = "HOLD"
+
+                proposal = DecisionProposal(
+                    proposal_id=str(event["proposal_id"]),
+                    instrument_id=instrument_id,
+                    action=DecisionAction(action),
+                    quantity=quantity,
+                    entry_price=decision.reference_price,
+                    stop_loss=stop_loss if action == "BUY" else None,
+                    target_price=target_price if action == "BUY" else None,
+                    confidence=Decimal(1),
+                    rationale=(
+                        f"Deterministic SMA {action}; "
+                        f"fast_window={fast_window}; "
+                        f"slow_window={slow_window}; "
+                        f"candle={candle_timestamp}; "
+                        f"signal={decision.action}; "
+                        f"{decision.rationale}"
+                    ),
+                    timeframe=interval,
+                    decision_timestamp=decision_timestamp,
+                    submitted_at=decision_timestamp,
+                    source="DETERMINISTIC_SYNTHETIC",
+                    expires_at=_timestamp_text(
+                        decision_time + timedelta(minutes=_INTERVAL_MINUTES[interval])
+                    ),
+                )
+
+                canonical = _proposal_canonical_json(proposal)
+                digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+                if event["proposal_binding_state"] == "BOUND" and (
+                    event["proposal_sha256"] != digest or event["proposal_json"] != canonical
+                ):
+                    raise ForwardRuntimeError("SMA proposal differs from the bound event proposal.")
+
+                return proposal
+            finally:
+                connection.rollback()
+
     def build_mock_proposal(
         self,
         event_id: str,
@@ -1716,6 +2942,7 @@ class ForwardRuntimeService:
         target_price: Decimal | None = None,
     ) -> DecisionProposal:
         """Create a deterministic, non-AI proposal tied to one scheduled event."""
+        self._require_execution_runtime()
         started = time.perf_counter_ns()
         with closing(get_connection(self.database_path)) as connection:
             event = connection.execute(
@@ -1776,6 +3003,7 @@ class ForwardRuntimeService:
         """Journal a bound evaluation without granting execution permission."""
         if not isinstance(proposal, DecisionProposal):
             raise ForwardRuntimeError("A persisted scheduler event requires a DecisionProposal.")
+        self._require_execution_runtime()
         started = time.perf_counter_ns()
         decision_id = None
         if proposal.action == DecisionAction.BUY and getattr(
@@ -2535,6 +3763,7 @@ class ForwardRuntimeService:
         self, instrument_id: int, quote: Quote, *, interval: str = "1m"
     ) -> ExecutionSnapshot:
         """Build a snapshot from an accepted runtime quote and existing quality gate."""
+        self._require_execution_runtime()
         if quote.instrument_id != instrument_id:
             raise ForwardRuntimeError("Execution quote instrument does not match the request.")
         if quote.event_id is None:
