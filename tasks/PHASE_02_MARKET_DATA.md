@@ -29,6 +29,11 @@ Establish a provider-neutral, auditable market-data foundation. External data ma
 - [x] Add explicit-`as_of` staleness checks with configurable completed-candle thresholds.
 - [x] Add deterministic calendar, boundary, quality, staleness, read-only, and dashboard tests.
 
+### Evidence-readiness reporting — implemented
+- [x] Provide a read-only `READY`/`BLOCKED` report that requires an active registered instrument, the administrator-approved `CONFIRMED` calendar, complete expected-candle coverage, and the existing dataset-quality checks.
+- [x] Require complete, matching `VERIFIED_PERMITTED` source-use declaration provenance for every contributing import; omitting `source_import_id` does not bypass this gate or completeness checks.
+- [x] Keep missing, stale, duplicate, invalid, rejected, or untrusted evidence blocked with deterministic reason codes. Synthetic test declarations are not external source-rights evidence.
+
 ### Cross-phase source-permission gate — implemented and verified
 - [x] Strategy Lab (`run_strategy_experiment`): captures and validates every contributing source import before signal generation; `UNVERIFIED`, `PROHIBITED`, missing/null/malformed/unknown statuses, and missing provenance all block via `DataQualityGateError`; blocked runs persist `BLOCKED`/`PARTIAL_BLOCKED` with zero signals; completed runs persist full source-import provenance.
 - [x] Backtesting: every contributing import is checked before simulation; missing provenance blocks explicitly; `UNVERIFIED`/`PROHIBITED` imports block; completed backtests persist `source_imports` provenance.
@@ -49,6 +54,29 @@ Establish a provider-neutral, auditable market-data foundation. External data ma
 - Dataset provenance and source terms are documented; declarations are recorded, not independently verified.
 - Tests use mocks/fixtures and cannot submit broker orders.
 - No external data source is treated as free or permitted without verification.
-- Phase 2 engineering is complete for the local CSV ingestion, calendar engine, quality engine, Instrument Master, and cross-phase source-permission gate. Phase 2 is not fully accepted until the outstanding operational prerequisites above (authoritative calendar coverage, permitted historical dataset, source entitlement evidence, and Phase 4 acceptance) are satisfied.
+- Phase 2 software acceptance is limited to the reviewed implementation scope recorded below. It does not satisfy the outstanding operational prerequisites above (authoritative calendar coverage, permitted historical dataset, source entitlement evidence, and Phase 4 acceptance); operational readiness remains blocked.
 
 Stages 3 and 4 provide local CSV ingestion and a configurable calendar-aware quality engine. They do not provide an approved live market-data feed or complete official calendar coverage.
+
+## Software acceptance closure — 2026-11-20
+
+**Final software verdict: ACCEPT, limited to the reviewed Phase 2 software scope.**
+The initial independent audit returned REJECT because evidence-readiness assessment
+combined separate SQLite snapshots. That sole reported blocker was corrected:
+`assess_evidence_readiness()` now opens one read-only SQLite connection, executes
+explicit `BEGIN`, and uses the same transaction for instrument activity, dataset
+quality, source-import identity and provenance, source-use declarations, and supplied
+import-ID checks.
+
+The deterministic WAL concurrent-update regression failed before the correction and
+passed afterward. Focused Phase 2 verification reported 170 tests passed; Ruff lint and
+formatting passed; MyPy passed for 62 source files; `git diff --check` passed. This is
+implementation verification, not hosted CI evidence. The corrected code was not
+independently re-audited.
+
+Software acceptance does **not** establish operational readiness. Authoritative
+confirmed exchange-calendar coverage, actual permitted historical OHLCV availability,
+independently verified data rights or broker entitlements, and Phase 4 operational
+readiness remain outstanding. A source-use declaration is not independent proof of
+legal rights. Affected workflows must continue to fail closed. No live-trading
+authorization is granted.

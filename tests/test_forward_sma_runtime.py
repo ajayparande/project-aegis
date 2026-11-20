@@ -5,11 +5,15 @@ fixtures. No broker, credentials, or live orders are involved.
 """
 
 import inspect
+import json
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
+from aegis.database import get_readonly_connection
 from aegis.forward_paper_trading import DecisionAction
 from aegis.forward_runtime import (
     ForwardRuntimeError,
@@ -17,13 +21,20 @@ from aegis.forward_runtime import (
 )
 from aegis.forward_sma import decide_completed_sma
 from aegis.strategy_lab import StrategyCandle
+from tests.test_forward_runtime import _setup as runtime_setup
+
+
+def _database_dump(database_path):
+    with closing(get_readonly_connection(database_path)) as connection:
+        return tuple(connection.iterdump())
 
 
 def _candle(index: int, close: str) -> StrategyCandle:
     timestamp = (
-        datetime(2026, 1, 5, 9, 15, tzinfo=UTC)
-        + timedelta(minutes=index)
-    ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        (datetime(2026, 1, 5, 9, 15, tzinfo=UTC) + timedelta(minutes=index))
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
 
     price = Decimal(close)
     return StrategyCandle(
@@ -57,12 +68,10 @@ def test_runtime_exposes_sma_proposal_builder():
         (2, False),
     ],
 )
-def test_invalid_windows_rejected_before_database_access(
-    fast, slow, tmp_path
-):
+def test_invalid_windows_rejected_before_database_access(fast, slow):
     service = object.__new__(ForwardRuntimeService)
 
-    with pytest.raises(ForwardRuntimeError):
+    with pytest.raises(ForwardRuntimeError, match="Require 2 <= fast_window < slow_window"):
         service.build_sma_proposal(
             "synthetic-event",
             fast_window=fast,
@@ -71,12 +80,10 @@ def test_invalid_windows_rejected_before_database_access(
 
 
 @pytest.mark.parametrize("quantity", [0, -1, True, 1.5])
-def test_invalid_buy_quantity_rejected_before_database_access(
-    quantity, tmp_path
-):
+def test_invalid_buy_quantity_rejected_before_database_access(quantity):
     service = object.__new__(ForwardRuntimeService)
 
-    with pytest.raises(ForwardRuntimeError):
+    with pytest.raises(ForwardRuntimeError, match="buy_quantity must be a positive integer"):
         service.build_sma_proposal(
             "synthetic-event",
             fast_window=2,
@@ -87,10 +94,7 @@ def test_invalid_buy_quantity_rejected_before_database_access(
 
 def test_sma_signal_remains_execution_free():
     candles = tuple(
-        _candle(index, str(price))
-        for index, price in enumerate(
-            [10, 10, 10, 10, 9, 8, 11, 13]
-        )
+        _candle(index, str(price)) for index, price in enumerate([10, 10, 10, 10, 9, 8, 11, 13])
     )
 
     result = decide_completed_sma(
@@ -109,47 +113,9 @@ def test_decision_actions_are_supported():
     assert DecisionAction.HOLD.value == "HOLD"
 
 
-def test_missing_scheduler_event_fails_closed(monkeypatch, tmp_path):
+def test_missing_scheduler_event_fails_closed(tmp_path):
     """An unknown event must not produce a proposal."""
-    import sqlite3
-
-    from aegis import forward_runtime
-
-    database_path = tmp_path / "isolated_sma.db"
-
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            """CREATE TABLE forward_scheduler_events (
-                event_id TEXT PRIMARY KEY,
-                runtime_id TEXT NOT NULL
-            )"""
-        )
-
-    service = object.__new__(ForwardRuntimeService)
-    service.database_path = database_path
-    service.runtime_id = "isolated-runtime"
-
-    monkeypatch.setattr(
-        ForwardRuntimeService,
-        "_ensure_runtime_ready",
-        lambda self: None,
-    )
-    monkeypatch.setattr(
-        ForwardRuntimeService,
-        "_ensure_scheduler_recovered",
-        lambda self: None,
-    )
-
-    def isolated_connection(path):
-        connection = sqlite3.connect(path)
-        connection.row_factory = sqlite3.Row
-        return connection
-
-    monkeypatch.setattr(
-        forward_runtime,
-        "get_connection",
-        isolated_connection,
-    )
+    _, _, _, service = runtime_setup(tmp_path)
 
     with pytest.raises(
         ForwardRuntimeError,
@@ -160,3 +126,45 @@ def test_missing_scheduler_event_fails_closed(monkeypatch, tmp_path):
             fast_window=2,
             slow_window=3,
         )
+
+
+def test_forged_service_cannot_bypass_persisted_scheduling_only(tmp_path):
+    database_path, _, _, runtime = runtime_setup(tmp_path, scheduling_only=True)
+    forged = object.__new__(ForwardRuntimeService)
+    forged.database_path = database_path
+    forged.runtime_id = runtime.runtime_id
+    before = _database_dump(database_path)
+
+    with pytest.raises(ForwardRuntimeError, match="Scheduling-only runtime"):
+        forged.build_sma_proposal(
+            "missing-event",
+            fast_window=2,
+            slow_window=3,
+        )
+
+    assert _database_dump(database_path) == before
+
+
+def test_forged_scheduling_only_configuration_fails_closed(tmp_path):
+    database_path, _, _, runtime = runtime_setup(tmp_path, scheduling_only=True)
+    with closing(sqlite3.connect(database_path)) as connection:
+        row = connection.execute(
+            "SELECT config_json FROM forward_runtimes WHERE runtime_id = ?",
+            (runtime.runtime_id,),
+        ).fetchone()
+        config = json.loads(row[0])
+        config["scheduling_only"] = False
+        connection.execute(
+            "UPDATE forward_runtimes SET config_json = ? WHERE runtime_id = ?",
+            (json.dumps(config, sort_keys=True, separators=(",", ":")), runtime.runtime_id),
+        )
+        connection.commit()
+
+    before = _database_dump(database_path)
+    with pytest.raises(ForwardRuntimeError, match="Runtime configuration is corrupted"):
+        runtime.build_sma_proposal(
+            "missing-event",
+            fast_window=2,
+            slow_window=3,
+        )
+    assert _database_dump(database_path) == before

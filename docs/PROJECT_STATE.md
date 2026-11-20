@@ -1,10 +1,78 @@
 # Project Aegis — Current Project State
 
-**Snapshot date:** 2026-11-18
+**Snapshot date:** 2026-11-20
 
 **Mode:** `RESEARCH_ONLY`
 **Purpose:** a point-in-time status record. It does not grant permission to begin a
 planned milestone. Consult the linked task and review record before relying on a status.
+
+## Current-policy addendum — 2026-11-20
+
+This later owner-issued direction supersedes only conflicting active-task and
+future-product descriptions in older snapshots. The historical evidence below remains
+bounded to its original scope and date.
+
+- **Current implementation:** Existing research-only code, bounded M-series modules,
+  and scoped acceptances remain as recorded here and in the phase-gate register; no
+  broader acceptance or operational readiness is inferred.
+- **Approved future product:** The final application is AI/LLM-led, with the agent
+  originating evidence-backed proposals, supporting technical analysis and ML, and
+  deterministic Python retaining authority over validation, risk, authorization,
+  execution gateways, accounting, and reconciliation. Unified PAPER/LIVE gateways and
+  a controlled transition are future requirements, not current implementation or
+  trading authority.
+- **Phase 1 CI closure:** Phase 1 is accepted only for the isolated backport and
+  successful GitHub Actions run recorded below and in the phase-gate register. This
+  does not validate local `main` or its other unpublished and uncommitted work.
+- **Current authorized work:** Phase 2 software acceptance closure is documentation-only;
+  no new Phase 2 implementation is authorized. Phase 3 remains blocked pending
+  independent acceptance of the broader Phase 1 local baseline and a separate Project
+  Manager assignment.
+- **Current safety authority:** The application remains `RESEARCH_ONLY`. Broker access,
+  credentials, live orders, and live execution remain prohibited.
+- **Next implementation:** A later phase requires Phase 1 independent acceptance and a
+  separate Project Manager assignment. Historical proposals do not authorize it.
+
+## Phase 1 CI closure and Phase 2 baseline — 2026-11-20
+
+**Phase 1 status: ACCEPTED for the isolated CI backport only.** GitHub Actions run
+[44764101110](https://github.com/ajayparande/project-aegis/actions/runs/44764101110)
+completed successfully for branch `ci/phase1-foundation`, commit
+`97712ca3eedcce8f3671737f4e76a55030c04ace`, based on
+`7bdd4cfe2c217e0628872affa74d25e4671db950`. The job log reports **420 passed**; the
+workflow checks for Ruff lint/format, MyPy, `pip check`, Gitleaks, and `.gitignore`
+validation also passed.
+
+This is not CI evidence for local `main` at `9b306bdf71a121392cbcc9badbdf6c3767ef2a0c`,
+its other 25 unpublished commits, or the dirty M2–M5, forward-runtime, and research
+changes. No independent review or operational readiness of that wider baseline is
+claimed. The exact Phase 1 boundary and CI record are in the [gate register](./AEGIS_PHASE_GATE_REGISTER.md)
+and [Phase 1 task](../tasks/PHASE_01_FOUNDATION.md).
+
+**Phase 2 software acceptance: ACCEPT for the reviewed software scope only.** The
+initial independent audit returned REJECT for inconsistent SQLite snapshots in
+evidence-readiness assessment. The sole blocker was corrected: `assess_evidence_readiness()`
+uses one read-only SQLite connection and explicit `BEGIN`; instrument, quality,
+provenance, source-use, and import-ID checks share that transaction. A deterministic
+WAL concurrent-update regression failed before correction and passed afterward.
+Focused verification reported 170 tests passed; Ruff lint/format and MyPy for 62 source
+files passed; `git diff --check` passed. The corrected code was not independently
+re-audited, and no hosted CI validation is claimed. See the [phase-gate register](./AEGIS_PHASE_GATE_REGISTER.md)
+and [Phase 2 contract](../tasks/PHASE_02_MARKET_DATA.md).
+
+**Operational readiness remains BLOCKED.** Authoritative confirmed calendar coverage,
+actual permitted historical OHLCV availability, independently verified source rights
+and entitlements, and Phase 4 acceptance/readiness remain outstanding. The checked-in
+NSE cash calendar remains `CONFIGURED` for 2025–2026; source-use declarations record a
+user assertion, not independent proof of legal permission. Affected workflows must
+continue to fail closed. No live-trading authorization is granted. Upstox provider and
+research files exist in unpublished local commits; they were not part of the isolated
+Phase 1 CI backport and were not executed or connected to.
+
+The Phase 3 Strategy Lab task marks its deterministic core complete. Its remaining
+unchecked AI-drafting and generated-code isolation items are explicitly deferred to
+Phase 9. Phase 3 remains blocked by the Phase 1 broader-baseline independent-acceptance
+and Project Manager-assignment gates; this closure does not unlock it.
 
 ## Status vocabulary
 
@@ -87,9 +155,9 @@ liquidation remain separate stages. The approved design remains
 
 | Scope | Implementation status | Review / acceptance status | Readiness and limits |
 |---|---|---|---|
-| Phase 1 foundation | Task file marks foundation work complete. | See [`tasks/PHASE_01_FOUNDATION.md`](../tasks/PHASE_01_FOUNDATION.md). | Local foundation only. |
-| Phase 2 market data | Instrument master, CSV ingestion, quality/calendar engine, and source-use gates are implemented in documented scope. | Full operational prerequisites remain incomplete. | The checked-in NSE cash calendar candidate is `CONFIGURED`, not `CONFIRMED`; real source-use permission and real permitted data remain unresolved. |
-| Phase 3 Strategy Lab | Deterministic, versioned strategy core is implemented. | Do not treat as AI hypothesis-generation acceptance. | AI-assisted drafting and generated-code execution/isolation remain deferred. |
+| Phase 1 foundation | Isolated CI backport accepted for its bounded scope; see the closure record above. | GitHub Actions run 44764101110 succeeded on `ci/phase1-foundation` at `97712ca3eedcce8f3671737f4e76a55030c04ace`. | Does not validate local `main`, its other unpublished commits, or the dirty worktree; no broader acceptance or operational readiness is inferred. |
+| Phase 2 market data | Instrument master, exact-decimal CSV ingestion, quality/calendar engine, evidence readiness, and source-use gates are implemented in reviewed scope. | **Software ACCEPTED for reviewed scope only**; initial audit REJECT blocker corrected. Corrected code was not independently re-audited; hosted CI was not run. | Operational readiness remains blocked by confirmed-calendar, permitted-data, source-rights/entitlement, and Phase 4 evidence. Continue fail-closed behavior; no live authorization. |
+| Phase 3 Strategy Lab | Deterministic, versioned strategy core is implemented. | **BLOCKED** pending broader Phase 1 independent acceptance and a separate Project Manager assignment. | Phase 3's remaining unchecked AI-drafting and generated-code isolation items are explicitly deferred to Phase 9; no missing in-scope increment is identified. |
 | M1B one-instrument execution | Qualified one-instrument execution interface exists. | **Independently accepted** for the bounded M1B interface, per project-owner status supplied for this handover; acceptance record/date is not identified in the repository. | Does not accept all of Phase 4 or establish data readiness, profitability, live readiness, or authorization. See [`tasks/PHASE_04_BACKTESTING.md`](../tasks/PHASE_04_BACKTESTING.md). |
 | Phase 4 backtesting | Deterministic simulator and M1B path are implemented; synthetic regression coverage is documented. | Full Phase 4 acceptance remains pending its documented external/operational blockers. | Synthetic tests are not real-data or performance evidence. |
 | M2-A contracts/allocation | Immutable request/policy contracts and deterministic paise allocation exist in [`src/aegis/portfolio.py`](../src/aegis/portfolio.py). | **Accepted** according to project-owner-supplied history; no dated independent acceptance artifact is identified in the repository. | This does not accept M2-B or M2 v1. |

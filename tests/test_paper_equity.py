@@ -444,7 +444,7 @@ def test_session_close_requires_actual_approved_calendar_boundary(tmp_path):
     assert "confirmed final session close" in documents(db, runtime)[-1]["reason"]
 
 
-@pytest.mark.parametrize("version", range(1, 17))
+@pytest.mark.parametrize("version", range(1, database.SCHEMA_VERSION))
 def test_equity_migration_preserves_every_previously_supported_schema(tmp_path, version):
     db = tmp_path / "migration.db"
     _create_version_1_database(db)
@@ -458,7 +458,10 @@ def test_equity_migration_preserves_every_previously_supported_schema(tmp_path, 
     initialize_database(db)
     initialize_database(db)
     with closing(get_readonly_connection(db)) as conn:
-        assert conn.execute("SELECT MAX(version) FROM schema_metadata").fetchone()[0] == 17
+        assert (
+            conn.execute("SELECT MAX(version) FROM schema_metadata").fetchone()[0]
+            == database.SCHEMA_VERSION
+        )
         assert tuple(conn.execute("SELECT * FROM sources").fetchone()) == source
         assert conn.execute("SELECT COUNT(*) FROM paper_equity_snapshots").fetchone()[0] == 0
 

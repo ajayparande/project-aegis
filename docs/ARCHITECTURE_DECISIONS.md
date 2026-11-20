@@ -183,6 +183,31 @@ decision list.
   project direction supplied for this handover.
 - **Supersession:** None recorded.
 
+### AEGIS-ADR-010 — AI-first future product and phase-gate authority
+
+- **Status:** APPROVED future product requirement; owner/Project Manager direction
+  supplied 2026-11-20. This does not authorize operation or claim implementation.
+- **Decision:** The finished product is AI/LLM-led: the agent originates
+  evidence-backed `BUY` / `SELL` / `HOLD` / `NO_DECISION` proposals; technical
+  analysis, deterministic strategies, and lightweight ML support evidence and research;
+  deterministic Python remains authoritative for data validation, sizing, financial
+  risk, authorization, routing, accounting, and reconciliation. A shared application
+  must support PAPER and LIVE gateways only after their separate acceptance gates and
+  deliberate authorization.
+- **Rationale:** Make the future product's decision-making role explicit while
+  preserving independent deterministic financial and safety controls.
+- **Consequences:** This is a future-state target, not a description of existing code.
+  `RESEARCH_ONLY` remains the current mode; no broker connection, credentials, live
+  orders, or live execution are authorized. Phase 1 Foundation closure is the only
+  active development gate. The next phase requires independent Phase 1 acceptance and
+  a separate Project Manager assignment.
+- **Source:** Project-owner and Project Manager direction supplied 2026-11-20;
+  implementation status and gate evidence remain in
+  [`PROJECT_STATE.md`](./PROJECT_STATE.md) and
+  [`AEGIS_PHASE_GATE_REGISTER.md`](./AEGIS_PHASE_GATE_REGISTER.md).
+- **Supersession:** Resolves earlier future-product framing only; it does not supersede
+  active safety constraints, milestone contracts, or historical acceptance evidence.
+
 ## Deferred and open matters
 
 Deferred capabilities and unresolved choices are not approvals. See

@@ -11,6 +11,7 @@ import time
 from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any
 
 from aegis.ai_agent.models import (
@@ -66,6 +67,9 @@ from aegis.market_quality import (
 _MIN_TRUNCATED_JSON_LENGTH = len('{"status":"TRUNCATED","complete":false}')
 _TOOL_SUCCESS_STATUS = "OK"
 _TOOL_ERROR_FRAME = b'["ERROR","Tool handler failed; internal details are withheld."]'
+_TOOL_READY_FRAME = b"AEGIS_TOOL_READY_V1"
+_MIN_WORKER_STARTUP_TIMEOUT_SECONDS = 2.0
+_MAX_WORKER_STARTUP_TIMEOUT_SECONDS = 10.0
 
 
 def _maximum_tool_frame_bytes(max_output_chars: int) -> int:
@@ -141,6 +145,22 @@ def _tool_worker(
         connection.close()
 
 
+def _tool_worker_entry(
+    connection: Any,
+    worker: Callable[..., None],
+    handler: Callable[..., Any],
+    arguments: dict[str, Any],
+    context: dict[str, Any],
+    max_output_chars: int,
+) -> None:
+    """Signal process readiness before beginning the bounded tool execution."""
+    try:
+        connection.send_bytes(_TOOL_READY_FRAME)
+        worker(connection, handler, arguments, context, max_output_chars)
+    finally:
+        connection.close()
+
+
 class ToolRegistry:
     """Registry managing allowlisted tools with typed validation and strict permission gates."""
 
@@ -194,29 +214,44 @@ class ToolRegistry:
         context: dict[str, Any],
     ) -> str:
         # A readable pipe may contain only a partial frame. Receive on a disposable
-        # reader thread so even an incomplete frame cannot defeat the deadline.
-        deadline = time.monotonic() + self._timeout_seconds
+        # reader thread so even an incomplete frame cannot defeat either deadline.
+        startup_timeout = min(
+            _MAX_WORKER_STARTUP_TIMEOUT_SECONDS,
+            max(
+                _MIN_WORKER_STARTUP_TIMEOUT_SECONDS,
+                self._timeout_seconds * 2,
+            ),
+        )
+        startup_deadline = time.monotonic() + startup_timeout
         max_frame_bytes = _maximum_tool_frame_bytes(self._max_output_chars)
         process_context = multiprocessing.get_context("spawn")
         receiver, sender = process_context.Pipe(duplex=False)
         process = process_context.Process(
-            target=_tool_worker,
-            args=(sender, handler, arguments, context, self._max_output_chars),
+            target=_tool_worker_entry,
+            args=(sender, _tool_worker, handler, arguments, context, self._max_output_chars),
             daemon=True,
         )
         started = False
-        received = threading.Event()
-        messages: list[bytes | Exception] = []
+        messages: Queue[bytes | Exception] = Queue()
         reader: threading.Thread | None = None
 
         def receive() -> None:
             try:
-                # Bound the encoded frame independently of the decoded character limit.
-                messages.append(receiver.recv_bytes(max_frame_bytes))
+                while True:
+                    # Bound each encoded frame independently of the decoded character limit.
+                    messages.put(receiver.recv_bytes(max_frame_bytes))
             except Exception as exc:  # noqa: BLE001
-                messages.append(exc)
-            finally:
-                received.set()
+                messages.put(exc)
+
+        def receive_before(deadline: float, timeout_message: str) -> bytes | Exception:
+            remaining = deadline - time.monotonic()
+            try:
+                message = messages.get(timeout=max(0.0, remaining))
+            except Empty as exc:
+                raise TimeoutError(timeout_message) from exc
+            if time.monotonic() >= deadline:
+                raise TimeoutError(timeout_message)
+            return message
 
         try:
             process.start()
@@ -224,9 +259,19 @@ class ToolRegistry:
             sender.close()
             reader = threading.Thread(target=receive, name="aegis-tool-receiver", daemon=True)
             reader.start()
-            if not received.wait(max(0.0, deadline - time.monotonic())):
-                raise TimeoutError("Tool execution exceeded its time limit.")
-            message = messages[0]
+            message = receive_before(
+                startup_deadline,
+                "Tool worker startup exceeded its time limit.",
+            )
+            if isinstance(message, Exception):
+                raise RuntimeError(  # noqa: TRY004
+                    "Tool worker failed before becoming ready."
+                ) from message
+            if message != _TOOL_READY_FRAME:
+                raise RuntimeError("Tool worker returned an invalid readiness frame.")
+
+            deadline = time.monotonic() + self._timeout_seconds
+            message = receive_before(deadline, "Tool execution exceeded its time limit.")
             if isinstance(message, Exception):
                 raise RuntimeError("Tool worker transport failed.") from message  # noqa: TRY004
             try:

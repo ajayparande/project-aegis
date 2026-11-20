@@ -32,9 +32,7 @@ def candles_from_closes(values: list[int]) -> tuple[StrategyCandle, ...]:
 def test_buy_on_latest_bullish_crossover() -> None:
     candles = candles_from_closes([10, 9, 8, 12])
 
-    result = decide_completed_sma(
-        candles, fast_window=2, slow_window=3
-    )
+    result = decide_completed_sma(candles, fast_window=2, slow_window=3)
 
     assert result.action == "BUY"
     assert result.quantity == 0
@@ -44,9 +42,7 @@ def test_buy_on_latest_bullish_crossover() -> None:
 def test_sell_on_latest_bearish_crossover() -> None:
     candles = candles_from_closes([10, 9, 8, 12, 7, 6])
 
-    result = decide_completed_sma(
-        candles, fast_window=2, slow_window=3
-    )
+    result = decide_completed_sma(candles, fast_window=2, slow_window=3)
 
     assert result.action == "SELL"
     assert result.quantity == 0
@@ -55,9 +51,7 @@ def test_sell_on_latest_bearish_crossover() -> None:
 def test_hold_when_no_latest_crossover() -> None:
     candles = candles_from_closes([10, 9, 8, 12, 13])
 
-    result = decide_completed_sma(
-        candles, fast_window=2, slow_window=3
-    )
+    result = decide_completed_sma(candles, fast_window=2, slow_window=3)
 
     assert result.action == "HOLD"
     assert result.quantity == 0
@@ -67,21 +61,15 @@ def test_insufficient_history_fails_closed() -> None:
     candles = candles_from_closes([10, 9, 8])
 
     with pytest.raises(ValueError, match="Insufficient"):
-        decide_completed_sma(
-            candles, fast_window=2, slow_window=3
-        )
+        decide_completed_sma(candles, fast_window=2, slow_window=3)
 
 
 @pytest.mark.parametrize(
     ("fast", "slow"),
     [(1, 3), (3, 3), (4, 3), (True, 3), (2, False)],
 )
-def test_invalid_windows_rejected(
-    fast: int, slow: int
-) -> None:
+def test_invalid_windows_rejected(fast: int, slow: int) -> None:
     candles = candles_from_closes([10, 9, 8, 12])
 
     with pytest.raises(ValueError):
-        decide_completed_sma(
-            candles, fast_window=fast, slow_window=slow
-        )
+        decide_completed_sma(candles, fast_window=fast, slow_window=slow)

@@ -115,6 +115,7 @@ def _setup(
     initial_cash: Decimal = Decimal(100000),
     costs: CostAssumptions | None = None,
     observation_only: bool = False,
+    scheduling_only: bool = False,
 ) -> tuple[Path, object, tuple[int, ...], ForwardRuntimeService]:
     database = tmp_path / "runtime.db"
     initialize_database(database)
@@ -154,6 +155,7 @@ def _setup(
         max_execution_price_deviation=Decimal("0.05"),
         created_at=_START.isoformat(),
         observation_only=observation_only,
+        scheduling_only=scheduling_only,
     )
     return database, calendars, tuple(item.id for item in instruments), runtime
 

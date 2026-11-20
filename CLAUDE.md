@@ -3,6 +3,38 @@
 
 This file is the mandatory first read for Claude and coding agents. Read `AGENTS.md`, applicable approved decisions, milestone contracts, and the current worktree before making changes. Preserve all existing uncommitted work.
 
+## Current authority addendum — 2026-11-20
+
+This addendum supersedes conflicting active-task and future-product descriptions in
+the 2026-11-18 snapshot below; it does not rewrite historical implementation or
+acceptance evidence.
+
+- **Current implementation:** Existing code remains `RESEARCH_ONLY`, with bounded
+  research and M-series implementations and only the scoped acceptances recorded in
+  `docs/PROJECT_STATE.md` and the phase-gate register. Those records do not imply
+  whole-phase acceptance or operational readiness.
+- **Approved future product:** The finished product is AI/LLM-led: the agent originates
+  evidence-backed proposals, supporting technical analysis and ML provide evidence,
+  and deterministic Python independently controls validation, risk, authorization,
+  routing, accounting, and reconciliation. Shared PAPER/LIVE gateways and a controlled
+  transition are future-state requirements, not claims about current code or permission
+  to trade.
+- **Phase 1 CI closure:** GitHub Actions run
+  [44764101110](https://github.com/ajayparande/project-aegis/actions/runs/44764101110)
+  succeeded for `ci/phase1-foundation` at
+  `97712ca3eedcce8f3671737f4e76a55030c04ace`, an isolated Phase 1 backport only.
+  It does not validate local `main`, its other unpublished commits, or the dirty
+  M2–M5, forward-runtime, and research worktree. See the phase-gate register for the
+  exact acceptance boundary.
+- **Current authorized work:** Phase 2 baseline reconciliation is documentation-only.
+  It does not authorize new Phase 2 implementation or operating activity.
+- **Current safety authority:** `RESEARCH_ONLY` remains mandatory. No broker
+  connectivity, credentials, live orders, forward-paper operation, or live execution
+  is authorized by the future product direction.
+- **Next implementation:** A separate phase assignment is required, and the bounded
+  CI result does not establish independent acceptance of the broader local baseline.
+  The historical Decision Journal proposal below is not the active task or authorization.
+
 ## Authority and source hierarchy
 
 1. Safety/process: `CLAUDE.md`, `AGENTS.md`.

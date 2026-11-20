@@ -5,11 +5,13 @@ import io
 import json
 import multiprocessing
 import os
+import threading
 import time
 from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from queue import Queue
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -777,6 +779,102 @@ def _bad_transport_worker(connection, handler, arguments, context, max_output_ch
             os.write(connection.fileno(), struct.pack("!i", 100) + b"partial")
         time.sleep(30)
     connection.close()
+
+
+def test_slow_worker_startup_does_not_consume_execution_timeout(monkeypatch):
+    from aegis.ai_agent import tools
+
+    frames: Queue[object] = Queue()
+    eof = object()
+
+    class Endpoint:
+        def __init__(self, *, signals_eof: bool = False) -> None:
+            self.closed = False
+            self.signals_eof = signals_eof
+
+        def send_bytes(self, frame: bytes) -> None:
+            if self.closed:
+                raise OSError("pipe endpoint is closed")
+            frames.put(frame)
+
+        def recv_bytes(self, maxlength: int) -> bytes:
+            frame = frames.get(timeout=5)
+            if frame is eof:
+                raise EOFError("worker pipe closed")
+            if not isinstance(frame, bytes):
+                raise OSError("invalid in-memory frame")
+            if len(frame) > maxlength:
+                raise OSError("frame exceeds maximum size")
+            return frame
+
+        def close(self) -> None:
+            if self.closed:
+                return
+            self.closed = True
+            if self.signals_eof:
+                frames.put(eof)
+
+        def duplicate(self):
+            return Endpoint(signals_eof=True)
+
+    class DelayedProcess:
+        def __init__(self, target, args, startup_delay: float) -> None:
+            self.target = target
+            self.args = args
+            self.startup_delay = startup_delay
+            self.thread: threading.Thread | None = None
+            self._exitcode: int | None = None
+
+        def start(self) -> None:
+            child_args = (self.args[0].duplicate(), *self.args[1:])
+
+            def run() -> None:
+                time.sleep(self.startup_delay)
+                self.target(*child_args)
+                self._exitcode = 0
+
+            self.thread = threading.Thread(target=run, daemon=True)
+            self.thread.start()
+
+        def join(self, timeout: float | None = None) -> None:
+            assert self.thread is not None
+            self.thread.join(timeout)
+
+        def is_alive(self) -> bool:
+            return self.thread is not None and self.thread.is_alive()
+
+        @property
+        def exitcode(self) -> int | None:
+            return None if self.is_alive() else self._exitcode
+
+        def close(self) -> None:
+            assert not self.is_alive()
+
+    class DelayedStartContext:
+        def Pipe(self, duplex: bool):
+            assert not duplex
+            return Endpoint(signals_eof=True), Endpoint()
+
+        def Process(self, *, target, args, daemon):
+            assert daemon
+            return DelayedProcess(target, args, startup_delay=0.3)
+
+    monkeypatch.setattr(
+        tools.multiprocessing,
+        "get_context",
+        lambda method: DelayedStartContext(),
+    )
+    started = time.monotonic()
+
+    result = ToolRegistry(timeout_seconds=0.1)._execute_with_timeout(
+        _transport_handler,
+        {},
+        {},
+    )
+
+    assert result == "x" * 100
+    assert time.monotonic() - started >= 0.2
+    assert not any(thread.name == "aegis-tool-receiver" for thread in threading.enumerate())
 
 
 @pytest.mark.parametrize("size", [100, 24000, 30000])

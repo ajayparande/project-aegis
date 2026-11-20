@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 PHASE_1_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -860,6 +860,23 @@ MIGRATIONS[16] = (
             OR (account_id=NEW.account_id AND session_id=NEW.session_id
                 AND (sequence=NEW.sequence OR event_key=NEW.event_key)))
         BEGIN SELECT RAISE(ABORT,'equity snapshot identity already exists'); END""",
+)
+
+
+MIGRATIONS[17] = (
+    """CREATE TRIGGER protect_forward_event_identity
+    BEFORE UPDATE ON forward_scheduler_events
+    WHEN NEW.event_id IS NOT OLD.event_id
+      OR NEW.runtime_id IS NOT OLD.runtime_id
+      OR NEW.instrument_id IS NOT OLD.instrument_id
+      OR NEW.interval IS NOT OLD.interval
+      OR NEW.candle_timestamp IS NOT OLD.candle_timestamp
+      OR NEW.decision_timestamp IS NOT OLD.decision_timestamp
+      OR NEW.proposal_id IS NOT OLD.proposal_id
+      OR NEW.created_at IS NOT OLD.created_at
+    BEGIN
+        SELECT RAISE(ABORT, 'scheduler event identity is immutable');
+    END""",
 )
 
 

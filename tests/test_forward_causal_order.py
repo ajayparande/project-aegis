@@ -93,23 +93,15 @@ def fill(
 
 
 def check(db, event_id="early", account=ACCOUNT):
-    _assert_forward_causal_order(
-        db, account, event_id, INSTRUMENT
-    )
+    _assert_forward_causal_order(db, account, event_id, INSTRUMENT)
 
 
-@pytest.mark.parametrize(
-    "status", ["HOLD", "FILLED", "REJECTED"]
-)
-def test_later_terminal_event_blocks_older_event(
-    connection, status
-):
+@pytest.mark.parametrize("status", ["HOLD", "FILLED", "REJECTED"])
+def test_later_terminal_event_blocks_older_event(connection, status):
     event(connection, "early", EARLY)
     event(connection, "later", LATER, status)
 
-    with pytest.raises(
-        PaperTradingError, match="terminal scheduler decision"
-    ):
+    with pytest.raises(PaperTradingError, match="terminal scheduler decision"):
         check(connection)
 
 
@@ -208,9 +200,7 @@ def test_timestamp_offsets_are_compared_as_instants(connection):
 
 
 def test_missing_event_fails_closed(connection):
-    with pytest.raises(
-        PaperTradingError, match="persisted scheduler event"
-    ):
+    with pytest.raises(PaperTradingError, match="persisted scheduler event"):
         check(connection)
 
 
@@ -224,11 +214,7 @@ def test_causal_rejection_does_not_write_financial_rows(connection):
     with pytest.raises(PaperTradingError):
         check(connection)
 
-    assert connection.execute(
-        "SELECT COUNT(*) FROM paper_orders"
-    ).fetchone()[0] == 0
-    assert connection.execute(
-        "SELECT COUNT(*) FROM paper_fills"
-    ).fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0] == 0
 
     connection.rollback()

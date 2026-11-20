@@ -18,7 +18,13 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from aegis import backtesting, portfolio, portfolio_qualification
-from aegis.database import get_connection, initialize_database
+from aegis.database import (
+    MIGRATIONS,
+    SCHEMA_VERSION,
+    get_connection,
+    get_readonly_connection,
+    initialize_database,
+)
 from aegis.instruments import InstrumentInput, register_instrument
 from aegis.market_data import declare_import_source_use_status, import_ohlcv_csv
 from aegis.portfolio import PortfolioPolicy, PortfolioRequest, SleeveRequest
@@ -737,17 +743,38 @@ def test_direct_lower_level_execution_rejects_an_untrusted_call() -> None:
 def test_latest_schema_version_is_recorded_deterministically_and_readonly(qualification_setup):
     database_path, _, tmp_path = qualification_setup
     _import_symbol(database_path, tmp_path, "TCS")
-    with closing(get_connection(database_path)) as connection:
-        before = tuple(connection.execute("SELECT version FROM schema_metadata ORDER BY version"))
-        assert tuple(row[0] for row in before) == tuple(range(1, 17))
+
+    assert SCHEMA_VERSION == 18
+    assert tuple(sorted(MIGRATIONS)) == tuple(range(1, SCHEMA_VERSION))
+    assert any(
+        "CREATE TRIGGER protect_forward_event_identity" in statement
+        for statement in MIGRATIONS[SCHEMA_VERSION - 1]
+    )
+
+    with closing(get_readonly_connection(database_path)) as connection:
+        assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        before = tuple(
+            row[0]
+            for row in connection.execute("SELECT version FROM schema_metadata ORDER BY version")
+        )
+        triggers = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+        }
+
+    assert before == tuple(range(1, SCHEMA_VERSION + 1))
+    assert "protect_forward_event_identity" in triggers
     first = _qualify_portfolio_request(database_path, _request("TCS")).qualified_batch
     second = _qualify_portfolio_request(database_path, _request("TCS")).qualified_batch
     assert first is not None and second is not None
-    assert first.provenance_document()["database"]["schema_version"] == 16
+    assert first.provenance_document()["database"]["schema_version"] == SCHEMA_VERSION
     assert first.fingerprint_sha256 == second.fingerprint_sha256
-    with closing(get_connection(database_path)) as connection:
-        after = tuple(connection.execute("SELECT version FROM schema_metadata ORDER BY version"))
-    assert tuple(map(tuple, before)) == tuple(map(tuple, after))
+    with closing(get_readonly_connection(database_path)) as connection:
+        after = tuple(
+            row[0]
+            for row in connection.execute("SELECT version FROM schema_metadata ORDER BY version")
+        )
+    assert after == before
 
 
 @pytest.mark.parametrize("version", [None, 0, -1, "invalid", 1.5])

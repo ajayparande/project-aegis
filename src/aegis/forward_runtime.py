@@ -294,8 +294,11 @@ class ForwardRuntimeService:
         max_execution_price_deviation: Decimal | None = None,
         created_at: str | None = None,
         observation_only: bool = False,
+        scheduling_only: bool = False,
     ) -> ForwardRuntimeService:
         """Persist immutable synthetic or explicitly observation-only provenance."""
+        if type(scheduling_only) is not bool or (scheduling_only and observation_only):
+            raise ForwardRuntimeError("Invalid synthetic scheduling-only configuration.")
         if type(observation_only) is not bool:
             raise ForwardRuntimeError("observation_only must be a boolean.")
         if not isinstance(runtime_id, str) or not runtime_id.strip():
@@ -354,6 +357,9 @@ class ForwardRuntimeService:
         if observation_only:
             config.update(observation_only=True, provider="UPSTOX_V3_OBSERVE_ONLY")
             config_json = _canonical_json(config)
+        if scheduling_only:
+            config["scheduling_only"] = True
+            config_json = _canonical_json(config)
         config_hash = hashlib.sha256(config_json.encode()).hexdigest()
         state = cls._empty_state(instrument_ids)
         state_json = _canonical_json(state)
@@ -367,12 +373,9 @@ class ForwardRuntimeService:
             ).fetchone()
             if account is None:
                 raise ForwardRuntimeError("A persisted Phase 8 paper account is required.")
-            if (
-                observation_only
-                and connection.execute(
-                    "SELECT 1 FROM paper_orders WHERE account_id = ? LIMIT 1", (account_id,)
-                ).fetchone()
-            ):
+            if (observation_only or scheduling_only) and connection.execute(
+                "SELECT 1 FROM paper_orders WHERE account_id = ? LIMIT 1", (account_id,)
+            ).fetchone():
                 raise ForwardRuntimeError("Observation-only requires an unused paper account.")
             if halt_blocks_order(
                 account["halted"], account["halt_class"], account["halt_reason"], "SELL"
@@ -829,7 +832,30 @@ class ForwardRuntimeService:
         with closing(get_readonly_connection(self.database_path)) as connection:
             return self._observation_mode(connection)
 
+    @property
+    def scheduling_only(self) -> bool:
+        """Read the immutable synthetic scheduling restriction from persisted config."""
+        with closing(get_readonly_connection(self.database_path)) as connection:
+            row = connection.execute(
+                "SELECT config_json, config_sha256 FROM forward_runtimes WHERE runtime_id = ?",
+                (self.runtime_id,),
+            ).fetchone()
+        if (
+            row is None
+            or hashlib.sha256(row["config_json"].encode()).hexdigest() != row["config_sha256"]
+        ):
+            raise ForwardRuntimeError("Runtime configuration is corrupted.")
+        config = json.loads(row["config_json"])
+        value = config.get("scheduling_only", False)
+        if type(value) is not bool or (
+            value and config.get("provider") != "DETERMINISTIC_SYNTHETIC"
+        ):
+            raise ForwardRuntimeError("Invalid synthetic scheduling restriction.")
+        return value
+
     def _require_execution_runtime(self) -> None:
+        if self.scheduling_only:
+            raise ForwardRuntimeError("Scheduling-only runtime prohibits decisions and execution.")
         if self.observation_only:
             raise ForwardRuntimeError("Observation-only runtime prohibits decisions and execution.")
 
@@ -1076,7 +1102,9 @@ class ForwardRuntimeService:
             if scheduled_id:
                 scheduled_event_ids.append(scheduled_id)
         self._scheduler_dirty = False
-        exit_result = self._monitor_position(quote, observed, now, price)
+        exit_result = (
+            None if self.scheduling_only else self._monitor_position(quote, observed, now, price)
+        )
         return QuoteResult(
             True,
             False,
@@ -1149,7 +1177,7 @@ class ForwardRuntimeService:
         ).fetchone()
         if import_row is None:
             raise ForwardRuntimeError("Synthetic one-minute mark provenance is missing.")
-        if not self._observation_mode(connection):
+        if not self._observation_mode(connection) and not self.scheduling_only:
             record_paper_mark(
                 connection,
                 self.account_id,
@@ -2519,7 +2547,8 @@ class ForwardRuntimeService:
 
     def schedule_event(self, instrument_id: int, interval: str, candle_timestamp: str) -> str:
         """Create a stable event once per completed candle, using the candidate cap."""
-        self._require_execution_runtime()
+        if self.observation_only:
+            raise ForwardRuntimeError("Observation-only runtime prohibits scheduler work.")
         self._ensure_runtime_ready()
         if interval not in _INTERVAL_MINUTES:
             raise ForwardRuntimeError("Scheduler interval is unsupported.")
@@ -2620,6 +2649,7 @@ class ForwardRuntimeService:
         if not isinstance(event_id, str) or not event_id:
             raise ForwardRuntimeError("A scheduler event ID is required.")
 
+        self._require_execution_runtime()
         self._ensure_runtime_ready()
         self._ensure_scheduler_recovered()
 

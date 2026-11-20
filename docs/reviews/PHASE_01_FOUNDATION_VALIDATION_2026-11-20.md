@@ -450,7 +450,7 @@ silently skipped or weakened. The full-suite result is not a Phase 1 pass.
 
 ### 10.8 Final implementation status and next action
 
-Formatting, dependency locking, fresh installation, Phase 1 focused tests, static checks,
+formatting, dependency locking, fresh installation, Phase 1 focused tests, static checks,
 local secret scanning, and governance reconciliation are implemented and verified.
 However, the required broad CI/test gate is not green because of the twelve pre-existing
 later-phase failures, the existing `.venv` refresh could not complete, and hosted CI is
@@ -466,3 +466,21 @@ failures require a separately authorized resolution of the existing forward-runt
 schema-version test conflicts; after that, rerun the full suite, refresh the existing
 environment once its Ruff process releases the executable, run hosted `Tests and Code
 Quality`, and request a distinct read-only Phase 1 audit.
+
+### 11. Subsequent isolated CI acceptance record — 2026-11-20
+
+The later isolated backport was validated by GitHub Actions run
+[44764101110](https://github.com/ajayparande/project-aegis/actions/runs/44764101110),
+which completed successfully on branch `ci/phase1-foundation` at commit
+`97712ca3eedcce8f3671737f4e76a55030c04ace` (base
+`7bdd4cfe2c217e0628872affa74d25e4671db950`). The fetched job log reports **420 passed**.
+The workflow's Ruff lint/format, MyPy, `pip check`, Gitleaks, and `.gitignore` checks
+also passed.
+
+This later result supersedes the earlier hosted-CI-unobserved statement **only for that
+isolated backport**. It does not validate local `main` at
+`9b306bdf71a121392cbcc9badbdf6c3767ef2a0c`, the other 25 unpublished commits, or the
+dirty M2–M5, forward-runtime, and research worktree. It does not establish independent
+acceptance or operational readiness for those changes. No Phase 2 implementation was
+performed or authorized by this acceptance record. The application remains
+`RESEARCH_ONLY`.

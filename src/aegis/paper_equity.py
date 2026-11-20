@@ -553,13 +553,58 @@ def verify_snapshots(
         return _verify_snapshots(conn, account_id, session)
 
 
-def _verify_snapshots(
+def verify_account_inception(
     conn: sqlite3.Connection, account_id: int, session: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Verify unused-account origin and current-session chains in one read snapshot.
+
+    Account inception precedes runtime ownership. The private verifier permits only
+    that origin chain under its authenticated current owner; financial replay,
+    fingerprints and continuity still use the existing M4 validation rules.
+    """
+    with localcontext() as context:
+        context.prec = 50
+        current = _verify_snapshots(conn, account_id, session)
+        origin_session = f"paper-account:{account_id}"
+        origin = _verify_snapshots(conn, account_id, origin_session, inception_owner=session)
+        sessions = {
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT session_id FROM paper_equity_snapshots WHERE account_id=?",
+                (account_id,),
+            )
+        }
+        if sessions != {origin_session, session}:
+            raise EquityEvidenceError("Unexpected account equity session ownership")
+        for chain, key in ((origin, "account-inception"), (current, "runtime-inception")):
+            if (
+                chain[0]["kind"] != "INITIAL"
+                or chain[0]["event_key"] != key
+                or any(
+                    d["valuation_status"] != "COMPLETE"
+                    or d["reconciliation_status"] != "RECONCILED"
+                    for d in chain
+                )
+            ):
+                raise EquityEvidenceError("Missing or incomplete authenticated inception")
+        return origin, current
+
+
+def _verify_snapshots(
+    conn: sqlite3.Connection,
+    account_id: int,
+    session: str,
+    *,
+    inception_owner: str | None = None,
 ) -> list[dict[str, Any]]:
     from aegis.paper_trading import _reconcile
 
     account_row = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
-    if account_row is None or session_for(conn, account_id) != session:
+    owner = session_for(conn, account_id)
+    authenticated_origin = (
+        session == f"paper-account:{account_id}" and inception_owner == owner and owner != session
+    )
+    if account_row is None or (owner != session and not authenticated_origin):
         raise EquityEvidenceError("Session does not exclusively own the selected account")
     account = dict(account_row)
     if _reconcile(conn, account, return_errors=True):

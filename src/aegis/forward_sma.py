@@ -1,4 +1,4 @@
-﻿"""Pure P10-P4 SMA decision adapter; no execution authority."""
+"""Pure P10-P4 SMA decision adapter; no execution authority."""
 
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -46,9 +46,7 @@ def decide_completed_sma(
         raise ValueError("Require 2 <= fast_window < slow_window.")
 
     if len(candles) < slow_window + 1:
-        raise ValueError(
-            "Insufficient completed candles for crossover detection."
-        )
+        raise ValueError("Insufficient completed candles for crossover detection.")
 
     sequence = tuple(candles)
 
@@ -61,11 +59,7 @@ def decide_completed_sma(
     )
 
     latest = sequence[-1]
-    latest_signal = (
-        signals[-1]
-        if signals and signals[-1].timestamp == latest.timestamp
-        else None
-    )
+    latest_signal = signals[-1] if signals and signals[-1].timestamp == latest.timestamp else None
 
     if latest_signal is None:
         return SmaDecision(
@@ -75,9 +69,7 @@ def decide_completed_sma(
             rationale="No new SMA crossover on the latest candle.",
         )
 
-    action: SmaAction = (
-        "BUY" if latest_signal.action == "ENTER_LONG" else "SELL"
-    )
+    action: SmaAction = "BUY" if latest_signal.action == "ENTER_LONG" else "SELL"
 
     return SmaDecision(
         action=action,
