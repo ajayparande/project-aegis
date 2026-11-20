@@ -1,0 +1,15 @@
+title = "Project Aegis Gitleaks configuration"
+
+[[allowlists]]
+description = "The Phase 5 report uses API as ordinary prose, not a credential."
+condition = "AND"
+paths = ['''^docs/reviews/PHASE_05_IMPLEMENTATION_REPORT\.md$''']
+regexTarget = "line"
+regexes = ['''metadata through public API invariance''']
+
+[[allowlists]]
+description = "The AI redaction test contains a synthetic bearer-token fixture."
+condition = "AND"
+paths = ['''^tests/test_ai_agent\.py$''']
+regexTarget = "line"
+regexes = ['''Error in API:.*Authorization: Bearer secret-token-xyz''']

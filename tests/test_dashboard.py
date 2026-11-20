@@ -29,6 +29,7 @@ def isolated_app_paths(monkeypatch, tmp_path):
     log_path = tmp_path / "aegis.log"
     monkeypatch.setenv("AEGIS_DATABASE_PATH", str(database_path))
     monkeypatch.setenv("AEGIS_LOG_FILE", str(log_path))
+    initialize_database(database_path)
     return database_path, log_path
 
 
@@ -47,6 +48,41 @@ def test_dashboard_starts_without_errors(isolated_app_paths) -> None:
 
     assert not app.exception
     assert any("No historical candles are stored yet" in item.value for item in app.info)
+
+
+def test_dashboard_reports_missing_database_without_creating_it(tmp_path, monkeypatch) -> None:
+    database_path = tmp_path / "not-created" / "aegis.db"
+    monkeypatch.setenv("AEGIS_MODE", "RESEARCH_ONLY")
+    monkeypatch.setenv("AEGIS_DATABASE_PATH", str(database_path))
+    monkeypatch.setenv("AEGIS_LOG_FILE", str(tmp_path / "aegis.log"))
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    app = AppTest.from_file(str(APP_FILE)).run(timeout=10)
+
+    metrics = {item.label: item.value for item in app.metric}
+    assert not app.exception
+    assert metrics["Database Status"] == "Unavailable"
+    assert metrics["Schema Version"] == "Not initialized"
+    assert not database_path.exists()
+
+
+def test_dashboard_reports_corrupt_database_without_replacing_it(tmp_path, monkeypatch) -> None:
+    database_path = tmp_path / "corrupt" / "aegis.db"
+    database_path.parent.mkdir()
+    database_contents = b"not a SQLite database"
+    database_path.write_bytes(database_contents)
+    monkeypatch.setenv("AEGIS_MODE", "RESEARCH_ONLY")
+    monkeypatch.setenv("AEGIS_DATABASE_PATH", str(database_path))
+    monkeypatch.setenv("AEGIS_LOG_FILE", str(tmp_path / "aegis.log"))
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    app = AppTest.from_file(str(APP_FILE)).run(timeout=10)
+
+    metrics = {item.label: item.value for item in app.metric}
+    assert not app.exception
+    assert metrics["Database Status"] == "Unavailable"
+    assert metrics["Schema Version"] == "Not initialized"
+    assert database_path.read_bytes() == database_contents
 
 
 def test_dashboard_displays_project_title(isolated_app_paths) -> None:

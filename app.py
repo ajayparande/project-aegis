@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 
 from aegis.config import get_settings
-from aegis.database import get_database_status, initialize_database
+from aegis.database import SCHEMA_VERSION, get_database_status
 from aegis.instruments import list_instruments, search_instruments
 from aegis.logging_config import setup_logging
 from aegis.market_data import (
@@ -48,9 +48,10 @@ st.caption("AI-assisted Quantitative Research Platform")
 st.warning("RESEARCH ONLY — No broker connection, live orders, or automated trading is enabled.")
 
 try:
-    initialize_database(settings.database_path)
     database_status = get_database_status(settings.database_path)
-    database_healthy = database_status["exists"]
+    database_healthy = (
+        database_status["exists"] and database_status["schema_version"] == SCHEMA_VERSION
+    )
     logger.info("Dashboard database check completed")
 except Exception:
     database_healthy = False
@@ -111,7 +112,13 @@ if database_healthy:
     for table in tables:
         st.write(f"• {table}")
 else:
-    st.error("Database is unavailable. Check the application logs.")
+    if database_status["exists"]:
+        st.error(
+            f"Database schema is not current (expected version {SCHEMA_VERSION}). "
+            "The dashboard will not migrate it; use the application maintenance workflow."
+        )
+    else:
+        st.error("Database is unavailable. Check the application logs.")
 
 st.divider()
 

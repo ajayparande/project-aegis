@@ -47,10 +47,10 @@ class Settings:
 
         try:
             mode = AppMode(requested_mode)
-        except ValueError as exc:
+        except ValueError:
             raise ValueError(
                 "Unsupported AEGIS_MODE. Only RESEARCH_ONLY is permitted in Phase 1."
-            ) from exc
+            ) from None
 
         log_level = os.getenv("AEGIS_LOG_LEVEL", "INFO").strip().upper()
         allowed_log_levels = {
@@ -62,7 +62,9 @@ class Settings:
         }
 
         if log_level not in allowed_log_levels:
-            raise ValueError(f"Invalid AEGIS_LOG_LEVEL: {log_level}")
+            raise ValueError(
+                "Invalid AEGIS_LOG_LEVEL. Choose DEBUG, INFO, WARNING, ERROR, or CRITICAL."
+            )
 
         database_path = _resolve_path(os.getenv("AEGIS_DATABASE_PATH", "data/aegis.db"))
 
