@@ -1,6 +1,8 @@
 """Tests for Aegis logging and secret redaction."""
 
 import json
+import logging
+import sys
 
 from aegis.logging_config import StructuredFormatter, redact_secrets
 
@@ -33,8 +35,6 @@ def test_normal_message_is_preserved() -> None:
 
 
 def test_structured_formatter_returns_json() -> None:
-    import logging
-
     record = logging.LogRecord(
         name="aegis",
         level=logging.WARNING,
@@ -52,3 +52,25 @@ def test_structured_formatter_returns_json() -> None:
     assert payload["logger"] == "aegis"
     assert "TEST_SECRET" not in output
     assert "[REDACTED]" in payload["message"]
+
+
+def test_structured_formatter_redacts_secrets_from_exceptions() -> None:
+    try:
+        raise RuntimeError("api_key=PHASE1_FAKE_EXCEPTION_SECRET")
+    except RuntimeError:
+        exception_info = sys.exc_info()
+
+    record = logging.LogRecord(
+        name="aegis",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="Startup failed",
+        args=(),
+        exc_info=exception_info,
+    )
+
+    output = StructuredFormatter().format(record)
+
+    assert "PHASE1_FAKE_EXCEPTION_SECRET" not in output
+    assert "[REDACTED]" in output

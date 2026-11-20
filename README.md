@@ -48,6 +48,31 @@ AI-1C run-level audit, and any future paper or live readiness work.
 
 This folder contains milestone-specific implementation instructions and acceptance criteria. The roadmap and architecture documents elsewhere in the repository remain the broader product-level references.
 
+## Local development setup
+
+On Windows with Python 3.11, create the project environment and install the same
+development extras used by CI:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.lock.txt
+.\.venv\Scripts\python.exe -m pip install --no-build-isolation --no-deps -e .
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+The application starts in `RESEARCH_ONLY`. It does not initialize or migrate a
+database at startup; if the configured database is absent, the dashboard reports it as
+unavailable. The lockfile pins the project and its development, dashboard, and research
+dependencies for Python 3.11. To regenerate it after changing dependency declarations,
+run:
+
+```powershell
+.\.venv\Scripts\python.exe -m piptools compile --resolver=backtracking --strip-extras --allow-unsafe --extra dev --extra dashboard --extra research --output-file requirements.lock.txt pyproject.toml
+```
+
+The lock is version-pinned but does not use hashes; it does not claim cross-platform
+artifact-hash verification.
+
 ## M2 portfolio accounting
 
 The approved M2 v1 design is in
